@@ -259,40 +259,90 @@ def list_values(
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
     limit: int = 500,
+    offset: int = 0,
+    order_by: str = "trade_date",
+    order_dir: str = "desc",
 ) -> list[FactorValueOut]:
     database = settings().clickhouse_database
-    conditions = []
-    params = {"limit": max(1, min(limit, 5000))}
-    if factor_id:
-        conditions.append("factor_id = {factor_id:String}")
-        params["factor_id"] = factor_id
-    if entity_type:
-        conditions.append("entity_type = {entity_type:String}")
-        params["entity_type"] = entity_type
-    if entity_code:
-        conditions.append("entity_code = {entity_code:String}")
-        params["entity_code"] = entity_code
-    if trade_date:
-        conditions.append("trade_date = {trade_date:Date}")
-        params["trade_date"] = trade_date
-    if date_start:
-        conditions.append("trade_date >= {date_start:Date}")
-        params["date_start"] = date_start
-    if date_end:
-        conditions.append("trade_date <= {date_end:Date}")
-        params["date_end"] = date_end
+    conditions, params = _value_conditions(
+        factor_id=factor_id,
+        entity_type=entity_type,
+        entity_code=entity_code,
+        trade_date=trade_date,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    params["limit"] = max(1, min(limit, 5000))
+    params["offset"] = max(0, offset)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    order_column = _value_order_column(order_by)
+    direction = "ASC" if str(order_dir).lower() == "asc" else "DESC"
     rows = client().query(
         f"""
         SELECT *
         FROM {database}.factor_values_daily
         {where}
-        ORDER BY trade_date DESC, factor_id ASC, entity_code ASC
+        ORDER BY {order_column} {direction}, trade_date DESC, entity_code ASC
         LIMIT {{limit:UInt32}}
+        OFFSET {{offset:UInt32}}
         """,
         parameters=params,
     ).result_rows
     return [_value_from_row(row) for row in rows]
+
+
+def count_values(
+    factor_id: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    entity_code: Optional[str] = None,
+    trade_date: Optional[date] = None,
+    date_start: Optional[date] = None,
+    date_end: Optional[date] = None,
+) -> int:
+    database = settings().clickhouse_database
+    conditions, params = _value_conditions(
+        factor_id=factor_id,
+        entity_type=entity_type,
+        entity_code=entity_code,
+        trade_date=trade_date,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = client().query(
+        f"""
+        SELECT count()
+        FROM {database}.factor_values_daily
+        {where}
+        """,
+        parameters=params,
+    ).result_rows
+    return int(rows[0][0] or 0)
+
+
+def latest_value_date(
+    factor_id: str,
+    entity_type: Optional[str] = None,
+    date_start: Optional[date] = None,
+    date_end: Optional[date] = None,
+) -> Optional[date]:
+    database = settings().clickhouse_database
+    conditions, params = _value_conditions(
+        factor_id=factor_id,
+        entity_type=entity_type,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    rows = client().query(
+        f"""
+        SELECT max(trade_date)
+        FROM {database}.factor_values_daily
+        WHERE {' AND '.join(conditions)}
+        """,
+        parameters=params,
+    ).result_rows
+    value = rows[0][0] if rows else None
+    return value or None
 
 
 def coverage(
@@ -329,6 +379,52 @@ def coverage(
         entity_count=int(row[1] or 0),
         trade_date_count=int(row[2] or 0),
     )
+
+
+def _value_conditions(
+    factor_id: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    entity_code: Optional[str] = None,
+    trade_date: Optional[date] = None,
+    date_start: Optional[date] = None,
+    date_end: Optional[date] = None,
+) -> tuple[list[str], dict]:
+    conditions = []
+    params = {}
+    if factor_id:
+        conditions.append("factor_id = {factor_id:String}")
+        params["factor_id"] = factor_id
+    if entity_type:
+        conditions.append("entity_type = {entity_type:String}")
+        params["entity_type"] = entity_type
+    if entity_code:
+        conditions.append("entity_code = {entity_code:String}")
+        params["entity_code"] = entity_code
+    if trade_date:
+        conditions.append("trade_date = {trade_date:Date}")
+        params["trade_date"] = trade_date
+    if date_start:
+        conditions.append("trade_date >= {date_start:Date}")
+        params["date_start"] = date_start
+    if date_end:
+        conditions.append("trade_date <= {date_end:Date}")
+        params["date_end"] = date_end
+    return conditions, params
+
+
+def _value_order_column(value: str) -> str:
+    columns = {
+        "trade_date": "trade_date",
+        "entity_code": "entity_code",
+        "asset_code": "entity_code",
+        "factor_id": "factor_id",
+        "raw_value": "raw_value",
+        "rank_value": "rank_value",
+        "percentile": "percentile",
+        "score": "score",
+        "updated_at": "updated_at",
+    }
+    return columns.get(str(value or "").strip(), "trade_date")
 
 
 def _insert_factor(payload: FactorCreate, version: int, created_at: datetime, updated_at: datetime) -> None:
