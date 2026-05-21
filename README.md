@@ -48,14 +48,9 @@ cd /Users/zhao/Desktop/git/AlphaFactorService
 pm2 start ecosystem.config.js
 ```
 
-会启动两个进程：
+默认只启动 API 服务，和 `AlphaBlocksSyncData` 保持同样的单 PM2 进程模型。前端创建计算任务后会调用 `POST /factor-jobs/run-pending` 触发执行。
 
-```text
-alpha-factor-service  API 服务
-alpha-factor-worker   pending 任务消费进程
-```
-
-API 默认监听：
+默认监听：
 
 ```text
 http://0.0.0.0:8100
@@ -68,6 +63,12 @@ PYTHON_BIN=/path/to/python \
 AB_FACTOR_HOST=0.0.0.0 \
 AB_FACTOR_PORT=8100 \
 pm2 start ecosystem.config.js
+```
+
+如果以后需要独立后台消费 pending 任务，可以单独运行：
+
+```bash
+python -m factor_service.worker --limit 5 --poll-interval 60
 ```
 
 ## ClickHouse 初始化
