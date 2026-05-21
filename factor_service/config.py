@@ -20,6 +20,13 @@ class Settings:
     clickhouse_password: str
     clickhouse_database: str
     clickhouse_secure: bool
+    source_database: str
+    stock_daily_table: str
+    stock_code_column: str
+    stock_date_column: str
+    stock_basic_table: str
+    stock_basic_type_column: str
+    stock_basic_stock_type_value: str
 
 
 def load_settings() -> Settings:
@@ -38,6 +45,13 @@ def load_settings() -> Settings:
         clickhouse_password=_env("AB_FACTOR_CLICKHOUSE_PASSWORD", ""),
         clickhouse_database=_env("AB_FACTOR_CLICKHOUSE_DATABASE", DEFAULT_FACTOR_DATABASE),
         clickhouse_secure=_env_bool("AB_FACTOR_CLICKHOUSE_SECURE", False),
+        source_database=_env("AB_FACTOR_SOURCE_DATABASE", "baostock"),
+        stock_daily_table=_env("AB_FACTOR_STOCK_DAILY_TABLE", "stock_daily_real"),
+        stock_code_column=_env("AB_FACTOR_STOCK_CODE_COLUMN", "code"),
+        stock_date_column=_env("AB_FACTOR_STOCK_DATE_COLUMN", "trade_time"),
+        stock_basic_table=_env("AB_FACTOR_STOCK_BASIC_TABLE", "bs_stock_basic"),
+        stock_basic_type_column=_env("AB_FACTOR_STOCK_BASIC_TYPE_COLUMN", "type"),
+        stock_basic_stock_type_value=_env("AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE", "1"),
     )
 
 

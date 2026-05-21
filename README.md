@@ -17,10 +17,12 @@
 - `DELETE /factors/{factor_id}` 停用因子定义。
 - `POST /factor-jobs` 创建计算任务。
 - `GET /factor-jobs` 查询任务。
+- `POST /factor-jobs/{job_id}/run` 执行指定任务。
+- `POST /factor-jobs/run-pending` 批量执行 pending 任务。
 - `GET /factor-values` 查询因子结果。
 - `GET /factor-values/coverage` 查询覆盖率框架。
 
-计算引擎当前先预留接口，后续接入真实 pandas / polars / SQL 计算逻辑后，由 worker 将结果写入 ClickHouse。
+当前计算引擎先支持默认股票日频因子的 ClickHouse SQL 计算，包括均值、区间涨跌幅、涨停次数、N 日首次涨停。结果由 worker 写入 ClickHouse。
 
 ## 启动
 
@@ -46,7 +48,14 @@ cd /Users/zhao/Desktop/git/AlphaFactorService
 pm2 start ecosystem.config.js
 ```
 
-默认监听：
+会启动两个进程：
+
+```text
+alpha-factor-service  API 服务
+alpha-factor-worker   pending 任务消费进程
+```
+
+API 默认监听：
 
 ```text
 http://0.0.0.0:8100
@@ -75,6 +84,18 @@ AB_FACTOR_CLICKHOUSE_DATABASE
 ```
 
 其中 `AB_FACTOR_CLICKHOUSE_DATABASE` 是因子服务自己的库，默认 `ab_factor`。
+
+因子计算的数据源单独配置，默认读取 `baostock.stock_daily_real`：
+
+```text
+AB_FACTOR_SOURCE_DATABASE
+AB_FACTOR_STOCK_DAILY_TABLE
+AB_FACTOR_STOCK_CODE_COLUMN
+AB_FACTOR_STOCK_DATE_COLUMN
+AB_FACTOR_STOCK_BASIC_TABLE
+AB_FACTOR_STOCK_BASIC_TYPE_COLUMN
+AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE
+```
 
 ```bash
 clickhouse-client < scripts/init_clickhouse.sql

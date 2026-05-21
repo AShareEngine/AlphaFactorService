@@ -191,6 +191,66 @@ def get_job(job_id: str) -> Optional[FactorJobOut]:
     return _job_from_row(rows[0]) if rows else None
 
 
+def update_job_status(
+    job_id: str,
+    status: str,
+    *,
+    error_message: str = "",
+    row_count: Optional[int] = None,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+) -> FactorJobOut:
+    current = get_job(job_id)
+    if not current:
+        raise ValueError(f"任务不存在: {job_id}")
+    now = datetime.now()
+    database = settings().clickhouse_database
+    row = [
+        current.job_id,
+        current.factor_id,
+        current.factor_version,
+        current.entity_type,
+        current.mode,
+        current.universe,
+        current.date_start,
+        current.date_end,
+        json.dumps(current.params, ensure_ascii=False, sort_keys=True),
+        status,
+        error_message,
+        row_count,
+        current.created_at or now,
+        started_at if started_at is not None else current.started_at,
+        finished_at if finished_at is not None else current.finished_at,
+        now,
+    ]
+    client().insert(
+        f"{database}.factor_compute_jobs",
+        [row],
+        column_names=[
+            "job_id",
+            "factor_id",
+            "factor_version",
+            "entity_type",
+            "mode",
+            "universe",
+            "date_start",
+            "date_end",
+            "params_json",
+            "status",
+            "error_message",
+            "row_count",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "updated_at",
+        ],
+    )
+    updated = get_job(job_id)
+    if not updated:
+        raise RuntimeError("任务状态更新后读取失败")
+    return updated
+
+
 def list_values(
     factor_id: Optional[str] = None,
     entity_type: Optional[str] = None,

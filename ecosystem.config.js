@@ -24,5 +24,19 @@ module.exports = {
         AB_FACTOR_PORT: factorPort,
       },
     },
+    {
+      name: 'alpha-factor-worker',
+      cwd: projectRoot,
+      script: pythonBin,
+      args: ['-m', 'factor_service.worker', '--limit', '5', '--poll-interval', '60'],
+      interpreter: 'none',
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      min_uptime: '5s',
+      env: {
+        PYTHONUNBUFFERED: '1',
+      },
+    },
   ],
 }

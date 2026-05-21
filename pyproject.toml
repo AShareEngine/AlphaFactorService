@@ -18,6 +18,7 @@ dev = [
 
 [project.scripts]
 alpha-factor-service = "factor_service.main:main"
+alpha-factor-worker = "factor_service.worker:main"
 
 [build-system]
 requires = ["setuptools>=68"]
