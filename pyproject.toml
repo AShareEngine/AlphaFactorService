@@ -8,6 +8,7 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "pydantic>=2.7",
   "clickhouse-connect>=0.7.8",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

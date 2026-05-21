@@ -90,6 +90,7 @@ def client():
         port=config.clickhouse_port,
         username=config.clickhouse_user,
         password=config.clickhouse_password,
+        secure=config.clickhouse_secure,
     )
 
 

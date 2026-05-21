@@ -41,6 +41,30 @@ http://127.0.0.1:8100
 
 ## ClickHouse 初始化
 
+数据库连接默认复用 `AlphaBlocksSyncData` 的 runtime 配置：
+
+```text
+/Users/zhao/Desktop/git/AlphaBlocksSyncData/config/runtime.local.yaml
+```
+
+读取的是其中的 `datasource.host`、`datasource.port`、`datasource.username`、`datasource.password` 和 `datasource.secure`。
+因子服务自己的目标库名仍然是 `ab_factor`，可通过 `AB_FACTOR_CLICKHOUSE_DATABASE` 覆盖。
+
+如果部署路径不同，可以设置：
+
+```bash
+AB_FACTOR_RUNTIME_CONFIG=/path/to/AlphaBlocksSyncData/config/runtime.local.yaml
+```
+
+也兼容 `AlphaBlocksSyncData` 已经使用的这些环境变量：
+
+```text
+SYNC_DATA_RUNTIME_CONFIG
+ALPHABLOCKS_SYNC_DATA_RUNTIME_CONFIG
+ALPHABLOCKS_RUNTIME_CONFIG
+RUNTIME_CONFIG_PATH
+```
+
 ```bash
 clickhouse-client < scripts/init_clickhouse.sql
 ```
