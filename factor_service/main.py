@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from factor_service import __version__
 from factor_service.api.factors import router as factors_router
 from factor_service.api.jobs import router as jobs_router
+from factor_service.api.metadata import router as metadata_router
 from factor_service.api.values import router as values_router
 from factor_service.clickhouse import init_schema, settings
 
@@ -36,6 +37,7 @@ def create_app() -> FastAPI:
 
     app.include_router(factors_router)
     app.include_router(jobs_router)
+    app.include_router(metadata_router)
     app.include_router(values_router)
     return app
 
