@@ -39,6 +39,29 @@ alpha-factor-service
 http://127.0.0.1:8100
 ```
 
+## PM2 启动
+
+```bash
+cd /Users/zhao/Desktop/git/AlphaFactorService
+pm2 start ecosystem.config.js
+```
+
+默认监听：
+
+```text
+http://0.0.0.0:8100
+```
+
+可通过环境变量覆盖：
+
+```bash
+PYTHON_BIN=/path/to/python \
+AB_FACTOR_HOST=0.0.0.0 \
+AB_FACTOR_PORT=8100 \
+AB_FACTOR_RUNTIME_CONFIG=/path/to/AlphaBlocksSyncData/config/runtime.local.yaml \
+pm2 start ecosystem.config.js
+```
+
 ## ClickHouse 初始化
 
 数据库连接默认复用 `AlphaBlocksSyncData` 的 runtime 配置：
