@@ -58,35 +58,23 @@ http://0.0.0.0:8100
 PYTHON_BIN=/path/to/python \
 AB_FACTOR_HOST=0.0.0.0 \
 AB_FACTOR_PORT=8100 \
-AB_FACTOR_RUNTIME_CONFIG=/path/to/AlphaBlocksSyncData/config/runtime.local.yaml \
 pm2 start ecosystem.config.js
 ```
 
 ## ClickHouse 初始化
 
-数据库连接默认复用 `AlphaBlocksSyncData` 的 runtime 配置：
+ClickHouse 连接信息写在本项目 `.env`，字段和 `AlphaBlocksSyncData` 的 datasource 对齐：
 
 ```text
-/Users/zhao/Desktop/git/AlphaBlocksSyncData/config/runtime.local.yaml
+AB_FACTOR_CLICKHOUSE_HOST
+AB_FACTOR_CLICKHOUSE_PORT
+AB_FACTOR_CLICKHOUSE_USER
+AB_FACTOR_CLICKHOUSE_PASSWORD
+AB_FACTOR_CLICKHOUSE_SECURE
+AB_FACTOR_CLICKHOUSE_DATABASE
 ```
 
-读取的是其中的 `datasource.host`、`datasource.port`、`datasource.username`、`datasource.password` 和 `datasource.secure`。
-因子服务自己的目标库名仍然是 `ab_factor`，可通过 `AB_FACTOR_CLICKHOUSE_DATABASE` 覆盖。
-
-如果部署路径不同，可以设置：
-
-```bash
-AB_FACTOR_RUNTIME_CONFIG=/path/to/AlphaBlocksSyncData/config/runtime.local.yaml
-```
-
-也兼容 `AlphaBlocksSyncData` 已经使用的这些环境变量：
-
-```text
-SYNC_DATA_RUNTIME_CONFIG
-ALPHABLOCKS_SYNC_DATA_RUNTIME_CONFIG
-ALPHABLOCKS_RUNTIME_CONFIG
-RUNTIME_CONFIG_PATH
-```
+其中 `AB_FACTOR_CLICKHOUSE_DATABASE` 是因子服务自己的库，默认 `ab_factor`。
 
 ```bash
 clickhouse-client < scripts/init_clickhouse.sql
