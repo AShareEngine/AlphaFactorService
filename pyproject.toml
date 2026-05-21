@@ -1,0 +1,28 @@
+[project]
+name = "alpha-factor-service"
+version = "0.1.0"
+description = "Standalone factor definition, compute job, and ClickHouse factor value service for AlphaBlocks."
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "clickhouse-connect>=0.7.8",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+alpha-factor-service = "factor_service.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["factor_service", "factor_service.*"]

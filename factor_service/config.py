@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Settings:
+    host: str
+    port: int
+    cors_origins: tuple[str, ...]
+    clickhouse_host: str
+    clickhouse_port: int
+    clickhouse_user: str
+    clickhouse_password: str
+    clickhouse_database: str
+
+
+def load_settings() -> Settings:
+    _load_dotenv()
+    return Settings(
+        host=_env("AB_FACTOR_HOST", "127.0.0.1"),
+        port=int(_env("AB_FACTOR_PORT", "8100")),
+        cors_origins=tuple(
+            item.strip()
+            for item in _env("AB_FACTOR_CORS_ORIGINS", "*").split(",")
+            if item.strip()
+        ),
+        clickhouse_host=_env("AB_FACTOR_CLICKHOUSE_HOST", "127.0.0.1"),
+        clickhouse_port=int(_env("AB_FACTOR_CLICKHOUSE_PORT", "8123")),
+        clickhouse_user=_env("AB_FACTOR_CLICKHOUSE_USER", "default"),
+        clickhouse_password=_env("AB_FACTOR_CLICKHOUSE_PASSWORD", ""),
+        clickhouse_database=_env("AB_FACTOR_CLICKHOUSE_DATABASE", "ab_factor"),
+    )
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def _load_dotenv() -> None:
+    path = Path.cwd() / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
