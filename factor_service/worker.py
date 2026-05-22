@@ -22,6 +22,19 @@ MEAN_EXPR_RE = re.compile(r"^mean\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window
 SUM_EXPR_RE = re.compile(r"^sum\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
 RETURN_EXPR_RE = re.compile(r"^period_return\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
 FIRST_TRUE_EXPR_RE = re.compile(r"^first_true\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
+ROLLING_FORMULA_RE = re.compile(r"^(mean|sum)\((.+),\s*\$window\)$", re.IGNORECASE | re.DOTALL)
+ASSET_FIELD_RE = re.compile(r"\$asset\.([A-Za-z_][A-Za-z0-9_]*)")
+FORMULA_SAFE_CHARS_RE = re.compile(r"^[A-Za-z0-9_.,()+\-*/\s]+$")
+FORMULA_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+FORMULA_FUNCTION_NAMES = {
+    "abs": "abs",
+    "coalesce": "coalesce",
+    "greatest": "greatest",
+    "if": "if",
+    "isnull": "isNull",
+    "least": "least",
+    "nullif": "nullIf",
+}
 
 
 @dataclass(frozen=True)
@@ -268,13 +281,72 @@ def _build_value_sql(
             )
         )
         """
-    raise ValueError(f"暂不支持的因子表达式: {expression}")
+    if match := ROLLING_FORMULA_RE.match(expression.strip()):
+        function_name = match.group(1).lower()
+        compiled_expr = _compile_formula_expr(match.group(2))
+        aggregate = "avg" if function_name == "mean" else "sum"
+        return f"""
+        SELECT
+            {date_column} AS trade_date,
+            {code_column} AS entity_code,
+            {aggregate}({compiled_expr}) OVER (
+                PARTITION BY {code_column}
+                ORDER BY {date_column}
+                ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW
+            ) AS raw_value
+        FROM {source}
+        WHERE {date_column} >= {{source_start:Date}}
+          AND {date_column} <= {{date_end:Date}}
+          {universe_filter}
+        """
+    compiled_expr = _compile_formula_expr(expression)
+    return f"""
+    SELECT
+        {date_column} AS trade_date,
+        {code_column} AS entity_code,
+        {compiled_expr} AS raw_value
+    FROM {source}
+    WHERE {date_column} >= {{source_start:Date}}
+      AND {date_column} <= {{date_end:Date}}
+      {universe_filter}
+    """
 
 
 def _truth_expr(field: str) -> str:
     if field == "high_limited":
         return "if(isNull(high_limited) OR isNull(close), 0, if(close >= high_limited AND high_limited > 0, 1, 0))"
     return f"if(isNull({field}), 0, if({field} != 0, 1, 0))"
+
+
+def _compile_formula_expr(expression: str) -> str:
+    raw = str(expression or "").strip()
+    if not raw:
+        raise ValueError("因子表达式不能为空")
+
+    fields: set[str] = set()
+
+    def replace_field(match: re.Match[str]) -> str:
+        field = _identifier(match.group(1), "factor field")
+        fields.add(field)
+        return field
+
+    compiled = ASSET_FIELD_RE.sub(replace_field, raw)
+    if "$" in compiled:
+        raise ValueError(f"因子表达式存在未识别变量: {expression}")
+    if not FORMULA_SAFE_CHARS_RE.match(compiled):
+        raise ValueError(f"因子表达式存在不支持的字符: {expression}")
+
+    identifiers = FORMULA_IDENTIFIER_RE.findall(compiled)
+    for identifier in identifiers:
+        if identifier in fields:
+            continue
+        if identifier.lower() in FORMULA_FUNCTION_NAMES:
+            continue
+        raise ValueError(f"因子表达式存在未声明字段或函数: {identifier}")
+
+    for raw_name, clickhouse_name in FORMULA_FUNCTION_NAMES.items():
+        compiled = re.sub(rf"\b{raw_name}\s*\(", f"{clickhouse_name}(", compiled, flags=re.IGNORECASE)
+    return compiled
 
 
 def _resolve_date_range(
