@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from factor_service.qlib_formula import compile_qlib_formula
+from factor_service.api.formulas import validate_formula
 from factor_service.repository import _validated_factor_payload
-from factor_service.schemas import FactorCreate
+from factor_service.schemas import FactorCreate, FactorFormulaValidateRequest
 
 
 def compile_sql(expression: str, *, window: int = 20):
@@ -119,3 +120,25 @@ def test_factor_payload_validation_rejects_bad_expression():
 def test_cross_instrument_qlib_functions_are_explicitly_unsupported():
     with pytest.raises(ValueError, match="暂未支持"):
         compile_sql("Mask($close, $is_st)")
+
+
+def test_formula_validate_api_returns_compiled_preview():
+    result = validate_formula(FactorFormulaValidateRequest(
+        expression="Mean($close, $window)",
+        params={"window": 10},
+    ))
+
+    assert result.valid is True
+    assert result.required_fields == ["close"]
+    assert result.max_window == 10
+    assert "avg(close) OVER" in result.compiled_sql
+
+
+def test_formula_validate_api_returns_structured_error():
+    result = validate_formula(FactorFormulaValidateRequest(
+        expression="Mean($close, )",
+        params={"window": 10},
+    ))
+
+    assert result.valid is False
+    assert result.error_message
