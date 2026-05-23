@@ -4,7 +4,7 @@ import pytest
 
 from factor_service.qlib_formula import compile_qlib_formula
 from factor_service.api.formulas import validate_formula
-from factor_service.repository import _validated_factor_payload
+from factor_service.repository import _validated_factor_payload, _value_conditions
 from factor_service.schemas import FactorCreate, FactorFormulaValidateRequest
 
 
@@ -142,3 +142,19 @@ def test_formula_validate_api_returns_structured_error():
 
     assert result.valid is False
     assert result.error_message
+
+
+def test_value_queries_default_to_latest_factor_version():
+    conditions, params = _value_conditions(factor_id="demo")
+
+    assert params["factor_id"] == "demo"
+    assert "factor_id = {factor_id:String}" in conditions
+    assert any("SELECT max(version)" in condition for condition in conditions)
+
+
+def test_value_queries_allow_explicit_factor_version():
+    conditions, params = _value_conditions(factor_id="demo", factor_version=2)
+
+    assert params["factor_version"] == 2
+    assert "factor_version = {factor_version:UInt32}" in conditions
+    assert not any("SELECT max(version)" in condition for condition in conditions)

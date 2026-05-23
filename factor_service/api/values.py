@@ -15,6 +15,7 @@ router = APIRouter(prefix="/factor-values", tags=["factor-values"])
 @router.get("", response_model=list[FactorValueOut])
 def list_values(
     factor_id: Optional[str] = Query(default=None),
+    factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
@@ -27,6 +28,7 @@ def list_values(
 ) -> list[FactorValueOut]:
     return repository.list_values(
         factor_id=factor_id,
+        factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
         trade_date=trade_date,
@@ -42,6 +44,7 @@ def list_values(
 @router.get("/count")
 def count_values(
     factor_id: Optional[str] = Query(default=None),
+    factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
@@ -51,6 +54,7 @@ def count_values(
     return {
         "count": repository.count_values(
             factor_id=factor_id,
+            factor_version=factor_version,
             entity_type=entity_type,
             entity_code=entity_code,
             trade_date=trade_date,
@@ -63,6 +67,7 @@ def count_values(
 @router.get("/latest-date")
 def latest_date(
     factor_id: str = Query(min_length=1),
+    factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
@@ -72,6 +77,7 @@ def latest_date(
         "entity_type": entity_type,
         "trade_date": repository.latest_value_date(
             factor_id=factor_id,
+            factor_version=factor_version,
             entity_type=entity_type,
             date_start=date_start,
             date_end=date_end,
@@ -82,7 +88,13 @@ def latest_date(
 @router.get("/coverage", response_model=CoverageOut)
 def coverage(
     factor_id: str = Query(min_length=1),
+    factor_version: Optional[int] = Query(default=None, ge=1),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
 ) -> CoverageOut:
-    return repository.coverage(factor_id=factor_id, date_start=date_start, date_end=date_end)
+    return repository.coverage(
+        factor_id=factor_id,
+        factor_version=factor_version,
+        date_start=date_start,
+        date_end=date_end,
+    )

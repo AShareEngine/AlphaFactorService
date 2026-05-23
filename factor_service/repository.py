@@ -591,6 +591,7 @@ def list_analysis_turnover(
 
 def list_values(
     factor_id: Optional[str] = None,
+    factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
     trade_date: Optional[date] = None,
@@ -604,6 +605,7 @@ def list_values(
     database = settings().clickhouse_database
     conditions, params = _value_conditions(
         factor_id=factor_id,
+        factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
         trade_date=trade_date,
@@ -631,6 +633,7 @@ def list_values(
 
 def count_values(
     factor_id: Optional[str] = None,
+    factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
     trade_date: Optional[date] = None,
@@ -640,6 +643,7 @@ def count_values(
     database = settings().clickhouse_database
     conditions, params = _value_conditions(
         factor_id=factor_id,
+        factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
         trade_date=trade_date,
@@ -660,6 +664,7 @@ def count_values(
 
 def latest_value_date(
     factor_id: str,
+    factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
@@ -667,6 +672,7 @@ def latest_value_date(
     database = settings().clickhouse_database
     conditions, params = _value_conditions(
         factor_id=factor_id,
+        factor_version=factor_version,
         entity_type=entity_type,
         date_start=date_start,
         date_end=date_end,
@@ -685,18 +691,17 @@ def latest_value_date(
 
 def coverage(
     factor_id: str,
+    factor_version: Optional[int] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
 ) -> CoverageOut:
     database = settings().clickhouse_database
-    conditions = ["factor_id = {factor_id:String}"]
-    params = {"factor_id": factor_id}
-    if date_start:
-        conditions.append("trade_date >= {date_start:Date}")
-        params["date_start"] = date_start
-    if date_end:
-        conditions.append("trade_date <= {date_end:Date}")
-        params["date_end"] = date_end
+    conditions, params = _value_conditions(
+        factor_id=factor_id,
+        factor_version=factor_version,
+        date_start=date_start,
+        date_end=date_end,
+    )
     rows = client().query(
         f"""
         SELECT
@@ -721,6 +726,7 @@ def coverage(
 
 def _value_conditions(
     factor_id: Optional[str] = None,
+    factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
     trade_date: Optional[date] = None,
@@ -732,6 +738,14 @@ def _value_conditions(
     if factor_id:
         conditions.append("factor_id = {factor_id:String}")
         params["factor_id"] = factor_id
+        if factor_version:
+            conditions.append("factor_version = {factor_version:UInt32}")
+            params["factor_version"] = int(factor_version)
+        else:
+            database = settings().clickhouse_database
+            conditions.append(
+                f"factor_version = (SELECT max(version) FROM {database}.factor_definitions WHERE factor_id = {{factor_id:String}})"
+            )
     if entity_type:
         conditions.append("entity_type = {entity_type:String}")
         params["entity_type"] = entity_type
