@@ -21,8 +21,15 @@
 - `POST /factor-jobs/run-pending` 批量执行 pending 任务。
 - `GET /factor-values` 查询因子结果。
 - `GET /factor-values/coverage` 查询覆盖率框架。
+- `POST /factor-analysis/jobs` 创建 Alphalens 标准分析任务。
+- `POST /factor-analysis/jobs/{analysis_job_id}/run` 执行分析任务。
+- `GET /factor-analysis/summary` 查询 IC、分位收益、换手等汇总结果。
+- `GET /factor-analysis/ic` 查询每日 IC 序列。
+- `GET /factor-analysis/quantile-returns` 查询分位收益序列。
+- `GET /factor-analysis/turnover` 查询分位换手和 Rank 自相关序列。
 
 当前计算引擎先支持默认股票日频因子的 ClickHouse SQL 计算，包括均值、区间涨跌幅、涨停次数、N 日首次涨停。结果由 worker 写入 ClickHouse。
+因子分析使用 `alphalens-reloaded` 做标准化计算，分析结果仍落在 ClickHouse。
 
 ## 启动
 
@@ -93,6 +100,7 @@ AB_FACTOR_SOURCE_DATABASE
 AB_FACTOR_STOCK_DAILY_TABLE
 AB_FACTOR_STOCK_CODE_COLUMN
 AB_FACTOR_STOCK_DATE_COLUMN
+AB_FACTOR_STOCK_PRICE_COLUMN
 AB_FACTOR_STOCK_BASIC_TABLE
 AB_FACTOR_STOCK_BASIC_TYPE_COLUMN
 AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE
@@ -118,6 +126,11 @@ clickhouse-client < scripts/seed_default_factors.sql
 ab_factor.factor_definitions
 ab_factor.factor_compute_jobs
 ab_factor.factor_values_daily
+ab_factor.factor_analysis_jobs
+ab_factor.factor_analysis_summary
+ab_factor.factor_analysis_ic_daily
+ab_factor.factor_analysis_quantile_returns
+ab_factor.factor_analysis_turnover_daily
 ```
 
 其中：
@@ -125,6 +138,8 @@ ab_factor.factor_values_daily
 - `factor_definitions` 保存因子定义、版本、参数、表达式。
 - `factor_compute_jobs` 保存计算任务和执行状态。
 - `factor_values_daily` 保存日频因子结果。
+- `factor_analysis_jobs` 保存因子评价任务。
+- `factor_analysis_*` 保存 Alphalens 生成的 IC、分位收益、换手和汇总指标。
 
 后续分钟级结果可以单独增加：
 

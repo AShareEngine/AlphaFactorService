@@ -24,6 +24,7 @@ class Settings:
     stock_daily_table: str
     stock_code_column: str
     stock_date_column: str
+    stock_price_column: str
     stock_basic_table: str
     stock_basic_type_column: str
     stock_basic_stock_type_value: str
@@ -49,6 +50,7 @@ def load_settings() -> Settings:
         stock_daily_table=_env("AB_FACTOR_STOCK_DAILY_TABLE", "stock_daily_real"),
         stock_code_column=_env("AB_FACTOR_STOCK_CODE_COLUMN", "code"),
         stock_date_column=_env("AB_FACTOR_STOCK_DATE_COLUMN", "trade_time"),
+        stock_price_column=_env("AB_FACTOR_STOCK_PRICE_COLUMN", "close"),
         stock_basic_table=_env("AB_FACTOR_STOCK_BASIC_TABLE", "bs_stock_basic"),
         stock_basic_type_column=_env("AB_FACTOR_STOCK_BASIC_TYPE_COLUMN", "type"),
         stock_basic_stock_type_value=_env("AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE", "1"),

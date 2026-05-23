@@ -10,6 +10,7 @@ OutputType = Literal["number", "boolean", "category", "rank"]
 Frequency = Literal["daily", "event", "financial", "intraday"]
 JobMode = Literal["incremental", "backfill", "recompute"]
 JobStatus = Literal["pending", "running", "success", "failed", "cancelled"]
+AnalysisStatus = Literal["pending", "running", "success", "failed", "cancelled"]
 
 
 class FactorBase(BaseModel):
@@ -49,6 +50,22 @@ class FactorOut(FactorBase):
     version: int
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class FactorFormulaValidateRequest(BaseModel):
+    expression: str = Field(min_length=1)
+    params: dict[str, Any] = Field(default_factory=dict)
+    code_column: str = "code"
+    date_column: str = "trade_date"
+
+
+class FactorFormulaValidateOut(BaseModel):
+    valid: bool
+    expression: str
+    required_fields: list[str] = Field(default_factory=list)
+    max_window: int = 1
+    compiled_sql: str = ""
+    error_message: str = ""
 
 
 class FactorJobCreate(BaseModel):
@@ -103,3 +120,75 @@ class CoverageOut(BaseModel):
     rows: int
     entity_count: int
     trade_date_count: int
+
+
+class FactorAnalysisJobCreate(BaseModel):
+    factor_id: str = Field(min_length=1)
+    factor_version: Optional[int] = None
+    entity_type: str = "stock"
+    params_hash: str = ""
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    periods: list[int] = Field(default_factory=lambda: [1, 5, 10])
+    quantiles: int = Field(default=5, ge=2, le=20)
+    price_field: str = "close"
+    cumulative_returns: bool = True
+    max_loss: float = Field(default=0.9, ge=0, le=1)
+
+
+class FactorAnalysisJobOut(BaseModel):
+    analysis_job_id: str
+    factor_id: str
+    factor_version: int
+    entity_type: str
+    params_hash: str = ""
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    periods: list[int] = Field(default_factory=list)
+    quantiles: int
+    price_field: str
+    cumulative_returns: bool
+    max_loss: float
+    status: AnalysisStatus
+    error_message: str = ""
+    row_count: Optional[int] = None
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class FactorAnalysisSummaryOut(BaseModel):
+    analysis_job_id: str
+    metric: str
+    period: str = ""
+    value: Optional[float] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    updated_at: Optional[datetime] = None
+
+
+class FactorAnalysisIcOut(BaseModel):
+    analysis_job_id: str
+    trade_date: date
+    period: str
+    ic: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class FactorAnalysisQuantileReturnOut(BaseModel):
+    analysis_job_id: str
+    trade_date: date
+    period: str
+    quantile: int
+    mean_return: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class FactorAnalysisTurnoverOut(BaseModel):
+    analysis_job_id: str
+    trade_date: date
+    period: str
+    quantile: int
+    turnover: Optional[float] = None
+    rank_autocorrelation: Optional[float] = None
+    updated_at: Optional[datetime] = None

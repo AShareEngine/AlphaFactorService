@@ -12,29 +12,13 @@ from typing import Optional
 
 from factor_service import repository
 from factor_service.clickhouse import client, settings
+from factor_service.qlib_formula import compile_qlib_formula
 from factor_service.schemas import FactorJobOut, FactorOut
 
 
 logger = logging.getLogger(__name__)
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-MEAN_EXPR_RE = re.compile(r"^mean\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
-SUM_EXPR_RE = re.compile(r"^sum\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
-RETURN_EXPR_RE = re.compile(r"^period_return\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
-FIRST_TRUE_EXPR_RE = re.compile(r"^first_true\(\$asset\.([A-Za-z_][A-Za-z0-9_]*),\s*\$window\)$")
-ROLLING_FORMULA_RE = re.compile(r"^(mean|sum)\((.+),\s*\$window\)$", re.IGNORECASE | re.DOTALL)
-ASSET_FIELD_RE = re.compile(r"\$asset\.([A-Za-z_][A-Za-z0-9_]*)")
-FORMULA_SAFE_CHARS_RE = re.compile(r"^[A-Za-z0-9_.,()+\-*/\s]+$")
-FORMULA_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
-FORMULA_FUNCTION_NAMES = {
-    "abs": "abs",
-    "coalesce": "coalesce",
-    "greatest": "greatest",
-    "if": "if",
-    "isnull": "isNull",
-    "least": "least",
-    "nullif": "nullIf",
-}
 
 
 @dataclass(frozen=True)
@@ -44,6 +28,12 @@ class ComputePlan:
     date_start: date
     date_end: date
     params_hash: str
+
+
+@dataclass(frozen=True)
+class ValueSqlPlan:
+    sql: str
+    max_window: int
 
 
 def run_pending_jobs(limit: int = 5) -> list[FactorJobOut]:
@@ -102,8 +92,25 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
     params = dict(factor.params)
     params.update(job.params or {})
     window = _positive_int(params.get("window", 20), "window")
+    source = f"{source_db}.{source_table}"
+    stock_basic = f"{source_db}.{stock_basic_table}"
+    universe_filter = f"""
+        AND {code_column} IN (
+            SELECT {code_column}
+            FROM {stock_basic}
+            WHERE {stock_type_column} = {{stock_type_value:String}}
+        )
+    """
+    value_plan = _build_value_sql(
+        factor.expression,
+        source=source,
+        code_column=code_column,
+        date_column=date_column,
+        params={**params, "window": window},
+        universe_filter=universe_filter,
+    )
     date_start, date_end = _resolve_date_range(job.date_start, job.date_end, source_db, source_table, date_column)
-    lookback_days = max(window * 4 + 20, 90)
+    lookback_days = max(value_plan.max_window * 4 + 20, 90)
     source_start = date_start - timedelta(days=lookback_days)
     params_hash = _params_hash(factor.factor_id, factor.version, params)
     base_params = {
@@ -117,24 +124,6 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         "job_id": job.job_id,
         "stock_type_value": config.stock_basic_stock_type_value,
     }
-    source = f"{source_db}.{source_table}"
-    stock_basic = f"{source_db}.{stock_basic_table}"
-    universe_filter = f"""
-        AND {code_column} IN (
-            SELECT {code_column}
-            FROM {stock_basic}
-            WHERE {stock_type_column} = {{stock_type_value:String}}
-        )
-    """
-
-    value_sql = _build_value_sql(
-        factor.expression,
-        source=source,
-        code_column=code_column,
-        date_column=date_column,
-        window=window,
-        universe_filter=universe_filter,
-    )
     sql = f"""
     INSERT INTO {factor_db}.factor_values_daily
     (
@@ -165,7 +154,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         {{job_id:String}},
         now()
     FROM (
-        {value_sql}
+        {value_plan.sql}
     )
     WHERE trade_date >= {{date_start:Date}}
       AND trade_date <= {{date_end:Date}}
@@ -180,173 +169,25 @@ def _build_value_sql(
     source: str,
     code_column: str,
     date_column: str,
-    window: int,
+    params: dict,
     universe_filter: str,
-) -> str:
-    normalized = expression.replace(" ", "")
-    if match := MEAN_EXPR_RE.match(normalized):
-        field = _identifier(match.group(1), "factor field")
-        return f"""
-        SELECT
-            {date_column} AS trade_date,
-            {code_column} AS entity_code,
-            avg({field}) OVER (
-                PARTITION BY {code_column}
-                ORDER BY {date_column}
-                ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW
-            ) AS raw_value
-        FROM {source}
-        WHERE {date_column} >= {{source_start:Date}}
-          AND {date_column} <= {{date_end:Date}}
-          {universe_filter}
-        """
-    if match := SUM_EXPR_RE.match(normalized):
-        field = _identifier(match.group(1), "factor field")
-        value_expr = _truth_expr(field) if field == "high_limited" else f"coalesce({field}, 0)"
-        return f"""
-        SELECT
-            {date_column} AS trade_date,
-            {code_column} AS entity_code,
-            sum({value_expr}) OVER (
-                PARTITION BY {code_column}
-                ORDER BY {date_column}
-                ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW
-            ) AS raw_value
-        FROM {source}
-        WHERE {date_column} >= {{source_start:Date}}
-          AND {date_column} <= {{date_end:Date}}
-          {universe_filter}
-        """
-    if match := RETURN_EXPR_RE.match(normalized):
-        field = _identifier(match.group(1), "factor field")
-        return f"""
-        SELECT
-            trade_date,
-            entity_code,
-            if(isNull(prev_value) OR prev_value = 0 OR isNull(current_value), NULL, current_value / prev_value - 1) AS raw_value
-        FROM (
-            SELECT
-                {date_column} AS trade_date,
-                {code_column} AS entity_code,
-                {field} AS current_value,
-                lagInFrame({field}, {window}) OVER (
-                    PARTITION BY {code_column}
-                    ORDER BY {date_column}
-                    ROWS BETWEEN {window} PRECEDING AND CURRENT ROW
-                ) AS prev_value
-            FROM {source}
-            WHERE {date_column} >= {{source_start:Date}}
-              AND {date_column} <= {{date_end:Date}}
-              {universe_filter}
-        )
-        """
-    if match := FIRST_TRUE_EXPR_RE.match(normalized):
-        field = _identifier(match.group(1), "factor field")
-        flag_expr = _truth_expr(field)
-        if window <= 1:
-            return f"""
-            SELECT
-                {date_column} AS trade_date,
-                {code_column} AS entity_code,
-                toFloat64({flag_expr}) AS raw_value
-            FROM {source}
-            WHERE {date_column} >= {{source_start:Date}}
-              AND {date_column} <= {{date_end:Date}}
-              {universe_filter}
-            """
-        return f"""
-        SELECT
-            trade_date,
-            entity_code,
-            if(limit_flag = 1 AND coalesce(previous_count, 0) = 0, 1.0, 0.0) AS raw_value
-        FROM (
-            SELECT
-                trade_date,
-                entity_code,
-                limit_flag,
-                sum(limit_flag) OVER (
-                    PARTITION BY entity_code
-                    ORDER BY trade_date
-                    ROWS BETWEEN {window - 1} PRECEDING AND 1 PRECEDING
-                ) AS previous_count
-            FROM (
-                SELECT
-                    {date_column} AS trade_date,
-                    {code_column} AS entity_code,
-                    {flag_expr} AS limit_flag
-                FROM {source}
-                WHERE {date_column} >= {{source_start:Date}}
-                  AND {date_column} <= {{date_end:Date}}
-                  {universe_filter}
-            )
-        )
-        """
-    if match := ROLLING_FORMULA_RE.match(expression.strip()):
-        function_name = match.group(1).lower()
-        compiled_expr = _compile_formula_expr(match.group(2))
-        aggregate = "avg" if function_name == "mean" else "sum"
-        return f"""
-        SELECT
-            {date_column} AS trade_date,
-            {code_column} AS entity_code,
-            {aggregate}({compiled_expr}) OVER (
-                PARTITION BY {code_column}
-                ORDER BY {date_column}
-                ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW
-            ) AS raw_value
-        FROM {source}
-        WHERE {date_column} >= {{source_start:Date}}
-          AND {date_column} <= {{date_end:Date}}
-          {universe_filter}
-        """
-    compiled_expr = _compile_formula_expr(expression)
-    return f"""
+) -> ValueSqlPlan:
+    compiled = compile_qlib_formula(
+        expression,
+        params=params,
+        code_column=code_column,
+        date_column=date_column,
+    )
+    return ValueSqlPlan(sql=f"""
     SELECT
         {date_column} AS trade_date,
         {code_column} AS entity_code,
-        {compiled_expr} AS raw_value
+        {compiled.sql} AS raw_value
     FROM {source}
     WHERE {date_column} >= {{source_start:Date}}
       AND {date_column} <= {{date_end:Date}}
       {universe_filter}
-    """
-
-
-def _truth_expr(field: str) -> str:
-    if field == "high_limited":
-        return "if(isNull(high_limited) OR isNull(close), 0, if(close >= high_limited AND high_limited > 0, 1, 0))"
-    return f"if(isNull({field}), 0, if({field} != 0, 1, 0))"
-
-
-def _compile_formula_expr(expression: str) -> str:
-    raw = str(expression or "").strip()
-    if not raw:
-        raise ValueError("因子表达式不能为空")
-
-    fields: set[str] = set()
-
-    def replace_field(match: re.Match[str]) -> str:
-        field = _identifier(match.group(1), "factor field")
-        fields.add(field)
-        return field
-
-    compiled = ASSET_FIELD_RE.sub(replace_field, raw)
-    if "$" in compiled:
-        raise ValueError(f"因子表达式存在未识别变量: {expression}")
-    if not FORMULA_SAFE_CHARS_RE.match(compiled):
-        raise ValueError(f"因子表达式存在不支持的字符: {expression}")
-
-    identifiers = FORMULA_IDENTIFIER_RE.findall(compiled)
-    for identifier in identifiers:
-        if identifier in fields:
-            continue
-        if identifier.lower() in FORMULA_FUNCTION_NAMES:
-            continue
-        raise ValueError(f"因子表达式存在未声明字段或函数: {identifier}")
-
-    for raw_name, clickhouse_name in FORMULA_FUNCTION_NAMES.items():
-        compiled = re.sub(rf"\b{raw_name}\s*\(", f"{clickhouse_name}(", compiled, flags=re.IGNORECASE)
-    return compiled
+    """, max_window=compiled.max_window)
 
 
 def _resolve_date_range(

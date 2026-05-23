@@ -61,3 +61,76 @@ CREATE TABLE IF NOT EXISTS ab_factor.factor_values_daily
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (factor_id, trade_date, entity_code, params_hash);
+
+CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_jobs
+(
+    analysis_job_id String,
+    factor_id String,
+    factor_version UInt32,
+    entity_type LowCardinality(String),
+    params_hash String,
+    date_start Nullable(Date),
+    date_end Nullable(Date),
+    periods Array(UInt32),
+    quantiles UInt8,
+    price_field String,
+    cumulative_returns UInt8,
+    max_loss Float64,
+    status LowCardinality(String),
+    error_message String,
+    row_count Nullable(UInt64),
+    created_at DateTime DEFAULT now(),
+    started_at Nullable(DateTime),
+    finished_at Nullable(DateTime),
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (analysis_job_id);
+
+CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_summary
+(
+    analysis_job_id String,
+    metric String,
+    period String,
+    value Nullable(Float64),
+    payload_json String,
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (analysis_job_id, metric, period);
+
+CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_ic_daily
+(
+    analysis_job_id String,
+    trade_date Date,
+    period String,
+    ic Nullable(Float64),
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (analysis_job_id, period, trade_date);
+
+CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_quantile_returns
+(
+    analysis_job_id String,
+    trade_date Date,
+    period String,
+    quantile UInt8,
+    mean_return Nullable(Float64),
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (analysis_job_id, period, quantile, trade_date);
+
+CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_turnover_daily
+(
+    analysis_job_id String,
+    trade_date Date,
+    period String,
+    quantile UInt8,
+    turnover Nullable(Float64),
+    rank_autocorrelation Nullable(Float64),
+    updated_at DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (analysis_job_id, period, quantile, trade_date);
