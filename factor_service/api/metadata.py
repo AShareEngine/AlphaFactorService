@@ -23,18 +23,19 @@ def source_range(entity_type: str = Query(default="stock")) -> dict:
 
     rows = client().query(
         f"""
-        SELECT min({date_column}) AS date_start, max({date_column}) AS date_end
+        SELECT count(), min({date_column}) AS date_start, max({date_column}) AS date_end
         FROM {source_database}.{source_table}
         """
     ).result_rows
-    row = rows[0] if rows else (None, None)
+    row = rows[0] if rows else (0, None, None)
+    has_rows = int(row[0] or 0) > 0
     return {
         "entity_type": entity_type,
         "source_database": source_database,
         "source_table": source_table,
         "date_column": date_column,
-        "date_start": row[0],
-        "date_end": row[1],
+        "date_start": row[1] if has_rows else None,
+        "date_end": row[2] if has_rows else None,
     }
 
 

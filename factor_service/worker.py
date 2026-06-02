@@ -34,6 +34,7 @@ class ComputePlan:
 class ValueSqlPlan:
     sql: str
     max_window: int
+    fields: list[str]
 
 
 def run_pending_jobs(limit: int = 5) -> list[FactorJobOut]:
@@ -112,6 +113,8 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
     date_start, date_end = _resolve_date_range(job.date_start, job.date_end, source_db, source_table, date_column)
     lookback_days = max(value_plan.max_window * 4 + 20, 90)
     source_start = date_start - timedelta(days=lookback_days)
+    _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
+    _ensure_source_has_rows(source, date_column, source_start, date_end)
     params_hash = _params_hash(factor.factor_id, factor.version, params)
     base_params = {
         "date_start": date_start,
@@ -187,7 +190,7 @@ def _build_value_sql(
     WHERE {date_column} >= {{source_start:Date}}
       AND {date_column} <= {{date_end:Date}}
       {universe_filter}
-    """, max_window=compiled.max_window)
+    """, max_window=compiled.max_window, fields=compiled.fields)
 
 
 def _resolve_date_range(
@@ -198,8 +201,8 @@ def _resolve_date_range(
     date_column: str,
 ) -> tuple[date, date]:
     if date_end is None:
-        rows = client().query(f"SELECT max({date_column}) FROM {source_db}.{source_table}").result_rows
-        date_end = rows[0][0] if rows else None
+        rows = client().query(f"SELECT count(), max({date_column}) FROM {source_db}.{source_table}").result_rows
+        date_end = rows[0][1] if rows and int(rows[0][0] or 0) > 0 else None
     if date_start is None:
         date_start = date_end
     if date_start is None or date_end is None:
@@ -207,6 +210,28 @@ def _resolve_date_range(
     if date_start > date_end:
         raise ValueError("开始日期不能晚于结束日期")
     return date_start, date_end
+
+
+def _ensure_source_columns(source_db: str, source_table: str, fields: list[str]) -> None:
+    rows = client().query(f"DESCRIBE TABLE {source_db}.{source_table}").result_rows
+    columns = {row[0] for row in rows}
+    missing = sorted({field for field in fields if field not in columns})
+    if missing:
+        raise ValueError(f"源表缺少因子所需字段: {', '.join(missing)}")
+
+
+def _ensure_source_has_rows(source: str, date_column: str, source_start: date, date_end: date) -> None:
+    rows = client().query(
+        f"""
+        SELECT count()
+        FROM {source}
+        WHERE {date_column} >= {{source_start:Date}}
+          AND {date_column} <= {{date_end:Date}}
+        """,
+        parameters={"source_start": source_start, "date_end": date_end},
+    ).result_rows
+    if not rows or int(rows[0][0] or 0) == 0:
+        raise ValueError("源表在计算日期范围内没有可用数据")
 
 
 def _count_job_values(job_id: str) -> int:

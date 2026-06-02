@@ -694,13 +694,15 @@ def latest_value_date(
     )
     rows = client().query(
         f"""
-        SELECT max(trade_date)
+        SELECT count(), max(trade_date)
         FROM {database}.factor_values_daily
         WHERE {' AND '.join(conditions)}
         """,
         parameters=params,
     ).result_rows
-    value = rows[0][0] if rows else None
+    if not rows or int(rows[0][0] or 0) == 0:
+        return None
+    value = rows[0][1]
     return value or None
 
 

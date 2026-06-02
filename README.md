@@ -106,6 +106,28 @@ AB_FACTOR_STOCK_BASIC_TYPE_COLUMN
 AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE
 ```
 
+当前股票日频因子需要从多张实体资产表组合字段：行情来自 `starlight.ad_market_kline_daily`，
+涨跌停和状态来自 `starlight.ad_history_stock_status`，换手率等字段来自 `baostock.bs_daily_kline`。
+先创建因子计算源视图：
+
+```bash
+python - <<'PY'
+from pathlib import Path
+from factor_service.clickhouse import client
+
+for statement in [item.strip() for item in Path("scripts/create_factor_source_views.sql").read_text().split(";") if item.strip()]:
+    client().command(statement)
+PY
+```
+
+然后将计算源指向视图：
+
+```text
+AB_FACTOR_SOURCE_DATABASE=ab_factor
+AB_FACTOR_STOCK_DAILY_TABLE=stock_daily_factor_source
+AB_FACTOR_STOCK_BASIC_TABLE=stock_basic_factor_source
+```
+
 ```bash
 clickhouse-client < scripts/init_clickhouse.sql
 ```
@@ -116,6 +138,17 @@ clickhouse-client < scripts/init_clickhouse.sql
 
 ```bash
 clickhouse-client < scripts/seed_default_factors.sql
+```
+
+## 因子结果校验
+
+可以用脚本检查源表、公式编译、worker dry-run 和已落库结果是否一致：
+
+```bash
+AB_FACTOR_SOURCE_DATABASE=ab_factor \
+AB_FACTOR_STOCK_DAILY_TABLE=stock_daily_factor_source \
+AB_FACTOR_STOCK_BASIC_TABLE=stock_basic_factor_source \
+python scripts/validate_factor_outputs.py
 ```
 
 ## 数据存储
