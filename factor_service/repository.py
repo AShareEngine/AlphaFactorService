@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 from typing import Optional
 from uuid import uuid4
@@ -20,6 +21,8 @@ from factor_service.schemas import (
     FactorJobOut,
     FactorOut,
     FactorUpdate,
+    FactorValueMetricQualityOut,
+    FactorValueQualityOut,
     FactorValueOut,
 )
 
@@ -594,6 +597,8 @@ def list_values(
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
@@ -608,6 +613,8 @@ def list_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        params_hash=params_hash,
+        job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
@@ -636,6 +643,8 @@ def count_values(
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
@@ -646,6 +655,8 @@ def count_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        params_hash=params_hash,
+        job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
@@ -666,6 +677,8 @@ def latest_value_date(
     factor_id: str,
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
 ) -> Optional[date]:
@@ -674,6 +687,8 @@ def latest_value_date(
         factor_id=factor_id,
         factor_version=factor_version,
         entity_type=entity_type,
+        params_hash=params_hash,
+        job_id=job_id,
         date_start=date_start,
         date_end=date_end,
     )
@@ -692,6 +707,9 @@ def latest_value_date(
 def coverage(
     factor_id: str,
     factor_version: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
 ) -> CoverageOut:
@@ -699,6 +717,9 @@ def coverage(
     conditions, params = _value_conditions(
         factor_id=factor_id,
         factor_version=factor_version,
+        entity_type=entity_type,
+        params_hash=params_hash,
+        job_id=job_id,
         date_start=date_start,
         date_end=date_end,
     )
@@ -724,11 +745,128 @@ def coverage(
     )
 
 
+def value_quality(
+    factor_id: str,
+    factor_version: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
+    date_start: Optional[date] = None,
+    date_end: Optional[date] = None,
+) -> FactorValueQualityOut:
+    database = settings().clickhouse_database
+    conditions, params = _value_conditions(
+        factor_id=factor_id,
+        factor_version=factor_version,
+        entity_type=entity_type,
+        params_hash=params_hash,
+        job_id=job_id,
+        date_start=date_start,
+        date_end=date_end,
+    )
+    rows = client().query(
+        f"""
+        SELECT
+            min(trade_date) AS date_start,
+            max(trade_date) AS date_end,
+            count() AS rows,
+            uniqExact(entity_code) AS entity_count,
+            uniqExact(trade_date) AS trade_date_count,
+            max(updated_at) AS latest_updated_at,
+            count(raw_value) AS raw_count,
+            countIf(isNull(raw_value)) AS raw_null_count,
+            countIf(raw_value = 0) AS raw_zero_count,
+            min(raw_value) AS raw_min,
+            max(raw_value) AS raw_max,
+            avg(raw_value) AS raw_avg,
+            stddevPop(raw_value) AS raw_stddev,
+            count(rank_value) AS rank_count,
+            countIf(isNull(rank_value)) AS rank_null_count,
+            countIf(rank_value = 0) AS rank_zero_count,
+            min(rank_value) AS rank_min,
+            max(rank_value) AS rank_max,
+            avg(rank_value) AS rank_avg,
+            stddevPop(rank_value) AS rank_stddev,
+            count(percentile) AS percentile_count,
+            countIf(isNull(percentile)) AS percentile_null_count,
+            countIf(percentile = 0) AS percentile_zero_count,
+            min(percentile) AS percentile_min,
+            max(percentile) AS percentile_max,
+            avg(percentile) AS percentile_avg,
+            stddevPop(percentile) AS percentile_stddev,
+            count(score) AS score_count,
+            countIf(isNull(score)) AS score_null_count,
+            countIf(score = 0) AS score_zero_count,
+            min(score) AS score_min,
+            max(score) AS score_max,
+            avg(score) AS score_avg,
+            stddevPop(score) AS score_stddev
+        FROM {database}.factor_values_daily
+        WHERE {' AND '.join(conditions)}
+        """,
+        parameters=params,
+    ).result_rows
+    row = rows[0] if rows else None
+    total_rows = int(row[2] or 0) if row else 0
+    metric_specs = [
+        ("raw_value", 6),
+        ("rank_value", 13),
+        ("percentile", 20),
+        ("score", 27),
+    ]
+    metrics = {
+        field: _metric_quality_from_row(field, total_rows, row, offset)
+        for field, offset in metric_specs
+    }
+    postprocess_fields = ["rank_value", "percentile", "score"]
+    postprocess_counts = [metrics[field].count for field in postprocess_fields]
+    if not total_rows:
+        postprocess_status = "empty"
+    elif all(count == 0 for count in postprocess_counts):
+        postprocess_status = "not_generated"
+    elif all(count == total_rows for count in postprocess_counts):
+        postprocess_status = "generated"
+    else:
+        postprocess_status = "partial"
+
+    warnings = []
+    raw_metric = metrics["raw_value"]
+    if not total_rows:
+        warnings.append("当前筛选条件下没有因子结果")
+    elif raw_metric.all_null:
+        warnings.append("原始值全部为空，公式或数据源可能没有产出有效值")
+    elif raw_metric.all_zero:
+        warnings.append("原始值全部为 0，需要检查公式逻辑或基础字段")
+    if total_rows and postprocess_status == "not_generated":
+        warnings.append("rank_value / percentile / score 均未生成，去极值、中性化、标准化还没有实际落库")
+    elif postprocess_status == "partial":
+        warnings.append("后处理列只生成了部分数据，需要检查计算任务是否完整")
+
+    return FactorValueQualityOut(
+        factor_id=factor_id,
+        factor_version=factor_version,
+        entity_type=entity_type,
+        params_hash=params_hash or "",
+        job_id=job_id or "",
+        date_start=row[0] if total_rows and row else None,
+        date_end=row[1] if total_rows and row else None,
+        rows=total_rows,
+        entity_count=int(row[3] or 0) if row else 0,
+        trade_date_count=int(row[4] or 0) if row else 0,
+        latest_updated_at=row[5] if total_rows and row else None,
+        metrics=metrics,
+        postprocess_status=postprocess_status,
+        warnings=warnings,
+    )
+
+
 def _value_conditions(
     factor_id: Optional[str] = None,
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    params_hash: Optional[str] = None,
+    job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
@@ -752,6 +890,12 @@ def _value_conditions(
     if entity_code:
         conditions.append("entity_code = {entity_code:String}")
         params["entity_code"] = entity_code
+    if params_hash:
+        conditions.append("params_hash = {params_hash:String}")
+        params["params_hash"] = params_hash
+    if job_id:
+        conditions.append("job_id = {job_id:String}")
+        params["job_id"] = job_id
     if trade_date:
         conditions.append("trade_date = {trade_date:Date}")
         params["trade_date"] = trade_date
@@ -762,6 +906,44 @@ def _value_conditions(
         conditions.append("trade_date <= {date_end:Date}")
         params["date_end"] = date_end
     return conditions, params
+
+
+def _metric_quality_from_row(field: str, total_rows: int, row, offset: int) -> FactorValueMetricQualityOut:
+    if not row:
+        return FactorValueMetricQualityOut(
+            field=field,
+            rows=0,
+            count=0,
+            null_count=0,
+            zero_count=0,
+            all_null=True,
+            all_zero=False,
+        )
+    count_value = int(row[offset] or 0)
+    null_count = int(row[offset + 1] or 0)
+    zero_count = int(row[offset + 2] or 0)
+    return FactorValueMetricQualityOut(
+        field=field,
+        rows=total_rows,
+        count=count_value,
+        null_count=null_count,
+        zero_count=zero_count,
+        null_ratio=(null_count / total_rows) if total_rows else 0,
+        zero_ratio=(zero_count / count_value) if count_value else 0,
+        min=_nullable_float(row[offset + 3]),
+        max=_nullable_float(row[offset + 4]),
+        avg=_nullable_float(row[offset + 5]),
+        stddev=_nullable_float(row[offset + 6]),
+        all_null=total_rows > 0 and null_count == total_rows,
+        all_zero=count_value > 0 and zero_count == count_value,
+    )
+
+
+def _nullable_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _value_order_column(value: str) -> str:

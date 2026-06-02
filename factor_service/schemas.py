@@ -122,6 +122,39 @@ class CoverageOut(BaseModel):
     trade_date_count: int
 
 
+class FactorValueMetricQualityOut(BaseModel):
+    field: str
+    rows: int
+    count: int
+    null_count: int
+    zero_count: int
+    null_ratio: float = 0
+    zero_ratio: float = 0
+    min: Optional[float] = None
+    max: Optional[float] = None
+    avg: Optional[float] = None
+    stddev: Optional[float] = None
+    all_null: bool = False
+    all_zero: bool = False
+
+
+class FactorValueQualityOut(BaseModel):
+    factor_id: str
+    factor_version: Optional[int] = None
+    entity_type: Optional[str] = None
+    params_hash: str = ""
+    job_id: str = ""
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    rows: int
+    entity_count: int
+    trade_date_count: int
+    latest_updated_at: Optional[datetime] = None
+    metrics: dict[str, FactorValueMetricQualityOut] = Field(default_factory=dict)
+    postprocess_status: str = "unknown"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class FactorAnalysisJobCreate(BaseModel):
     factor_id: str = Field(min_length=1)
     factor_version: Optional[int] = None

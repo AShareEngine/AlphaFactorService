@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Query
 
 from factor_service import repository
-from factor_service.schemas import CoverageOut, FactorValueOut
+from factor_service.schemas import CoverageOut, FactorValueOut, FactorValueQualityOut
 
 
 router = APIRouter(prefix="/factor-values", tags=["factor-values"])
@@ -18,6 +18,8 @@ def list_values(
     factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
+    job_id: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
@@ -31,6 +33,8 @@ def list_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        params_hash=params_hash,
+        job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
@@ -47,6 +51,8 @@ def count_values(
     factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
+    job_id: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
@@ -57,6 +63,8 @@ def count_values(
             factor_version=factor_version,
             entity_type=entity_type,
             entity_code=entity_code,
+            params_hash=params_hash,
+            job_id=job_id,
             trade_date=trade_date,
             date_start=date_start,
             date_end=date_end,
@@ -69,6 +77,8 @@ def latest_date(
     factor_id: str = Query(min_length=1),
     factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
+    job_id: Optional[str] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
 ) -> dict[str, object]:
@@ -79,6 +89,8 @@ def latest_date(
             factor_id=factor_id,
             factor_version=factor_version,
             entity_type=entity_type,
+            params_hash=params_hash,
+            job_id=job_id,
             date_start=date_start,
             date_end=date_end,
         ),
@@ -89,12 +101,39 @@ def latest_date(
 def coverage(
     factor_id: str = Query(min_length=1),
     factor_version: Optional[int] = Query(default=None, ge=1),
+    entity_type: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
+    job_id: Optional[str] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
 ) -> CoverageOut:
     return repository.coverage(
         factor_id=factor_id,
         factor_version=factor_version,
+        entity_type=entity_type,
+        params_hash=params_hash,
+        job_id=job_id,
+        date_start=date_start,
+        date_end=date_end,
+    )
+
+
+@router.get("/quality", response_model=FactorValueQualityOut)
+def quality(
+    factor_id: str = Query(min_length=1),
+    factor_version: Optional[int] = Query(default=None, ge=1),
+    entity_type: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
+    job_id: Optional[str] = Query(default=None),
+    date_start: Optional[date] = Query(default=None),
+    date_end: Optional[date] = Query(default=None),
+) -> FactorValueQualityOut:
+    return repository.value_quality(
+        factor_id=factor_id,
+        factor_version=factor_version,
+        entity_type=entity_type,
+        params_hash=params_hash,
+        job_id=job_id,
         date_start=date_start,
         date_end=date_end,
     )
