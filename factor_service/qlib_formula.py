@@ -519,7 +519,7 @@ def compile_ema(expr: SqlExpr, context: CompileContext, window: int) -> SqlExpr:
         weight = alpha * ((1 - alpha) ** offset)
         weighted.append(f"if(isNull({term}), 0, {term} * {weight:.12g})")
         weights.append(f"if(isNull({term}), 0, {weight:.12g})")
-    sql = f"({join_sum(weighted)} / nullIf({join_sum(weights)}, 0))"
+    sql = f"(({join_sum(weighted)}) / nullIf(({join_sum(weights)}), 0))"
     return merge_sql(sql, [expr], max_window=window, has_window=True)
 
 
@@ -531,7 +531,7 @@ def compile_wma(expr: SqlExpr, context: CompileContext, window: int) -> SqlExpr:
         weight = window - offset
         weighted.append(f"if(isNull({term}), 0, {term} * {weight})")
         weights.append(f"if(isNull({term}), 0, {weight})")
-    sql = f"({join_sum(weighted)} / nullIf({join_sum(weights)}, 0))"
+    sql = f"(({join_sum(weighted)}) / nullIf(({join_sum(weights)}), 0))"
     return merge_sql(sql, [expr], max_window=window, has_window=True)
 
 
@@ -539,9 +539,9 @@ def compile_mad(expr: SqlExpr, context: CompileContext, window: int) -> SqlExpr:
     terms = lag_terms(expr.sql, context, window)
     count = join_sum([f"if(isNull({term}), 0, 1)" for term in terms])
     sum_y = join_sum([f"if(isNull({term}), 0, {term})" for term in terms])
-    mean = f"(({sum_y}) / nullIf({count}, 0))"
+    mean = f"(({sum_y}) / nullIf(({count}), 0))"
     abs_dev = [f"if(isNull({term}), 0, abs({term} - ({mean})))" for term in terms]
-    sql = f"({join_sum(abs_dev)} / nullIf({count}, 0))"
+    sql = f"(({join_sum(abs_dev)}) / nullIf(({count}), 0))"
     return merge_sql(sql, [expr], max_window=window, has_window=True)
 
 
@@ -550,7 +550,7 @@ def compile_rank(expr: SqlExpr, context: CompileContext, window: int) -> SqlExpr
     current = nullable_expr(expr.sql)
     numerator = join_sum([f"if(isNull({term}) OR isNull({current}), 0, if({term} <= {current}, 1, 0))" for term in terms])
     denominator = join_sum([f"if(isNull({term}), 0, 1)" for term in terms])
-    sql = f"if(isNull({current}), NULL, {numerator} / nullIf({denominator}, 0))"
+    sql = f"if(isNull({current}), NULL, ({numerator}) / nullIf(({denominator}), 0))"
     return merge_sql(sql, [expr], max_window=window, has_window=True)
 
 
