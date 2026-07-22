@@ -57,6 +57,35 @@ def test_compile_first_true_condition():
     assert "ROWS BETWEEN 19 PRECEDING AND 1 PRECEDING" in compiled.sql
 
 
+def test_compile_stock_fear_proxy_expression():
+    compiled = compile_qlib_formula(
+        "$rv_weight * Std($pct_chg, $vol_window) "
+        "+ $downside_weight * Power(Mean(Power(Less($pct_chg, 0), 2), $vol_window), 0.5) "
+        "+ $loss_weight * Greater(-100 * PeriodReturn($close, $return_window), 0) "
+        "+ $volume_weight * $volume_scale "
+        "* Greater($volume / NullIf(Mean($volume, $volume_window), 0) - 1, 0)",
+        params={
+            "vol_window": 20,
+            "return_window": 5,
+            "volume_window": 20,
+            "rv_weight": 0.35,
+            "downside_weight": 0.3,
+            "loss_weight": 0.2,
+            "volume_weight": 0.15,
+            "volume_scale": 10,
+        },
+        code_column="code",
+        date_column="trade_date",
+    )
+
+    assert compiled.fields == ["close", "pct_chg", "volume"]
+    assert compiled.max_window == 20
+    assert "stddevSamp(pct_chg) OVER" in compiled.sql
+    assert "avg(pow(least(pct_chg, 0), 2)) OVER" in compiled.sql
+    assert "lagInFrame(close, 5)" in compiled.sql
+    assert "avg(volume) OVER" in compiled.sql
+
+
 def test_compile_expanded_window_functions():
     cases = {
         "EMA($close, $window)": "toNullable(close)",
