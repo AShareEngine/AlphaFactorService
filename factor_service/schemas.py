@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 OutputType = Literal["number", "boolean", "category", "rank"]
-Frequency = Literal["daily", "event", "financial", "intraday"]
+Frequency = Literal["daily", "minute"]
 JobMode = Literal["incremental", "backfill", "recompute"]
 JobStatus = Literal["pending", "running", "success", "failed", "cancelled"]
 AnalysisStatus = Literal["pending", "running", "success", "failed", "cancelled"]
@@ -22,8 +22,17 @@ class FactorBase(BaseModel):
     group_name: str = "custom"
     output_type: OutputType = "number"
     frequency: Frequency = "daily"
+    asset_id: str = ""
+    source_node_id: str = ""
     required_fields: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    param_schema: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    availability_policy: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "field": "available_at",
+            "policy": "persisted_timestamp",
+        }
+    )
     expression: str = ""
     enabled: bool = True
 
@@ -40,14 +49,20 @@ class FactorUpdate(BaseModel):
     group_name: Optional[str] = None
     output_type: Optional[OutputType] = None
     frequency: Optional[Frequency] = None
+    asset_id: Optional[str] = None
+    source_node_id: Optional[str] = None
     required_fields: Optional[list[str]] = None
     params: Optional[dict[str, Any]] = None
+    param_schema: Optional[dict[str, dict[str, Any]]] = None
+    availability_policy: Optional[dict[str, Any]] = None
     expression: Optional[str] = None
     enabled: Optional[bool] = None
 
 
 class FactorOut(FactorBase):
     version: int
+    available_versions: list[int] = Field(default_factory=list)
+    definition_hash: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -110,6 +125,7 @@ class FactorValueOut(BaseModel):
     percentile: Optional[float] = None
     score: Optional[float] = None
     job_id: str
+    available_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 

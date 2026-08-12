@@ -4,7 +4,12 @@ import pytest
 
 from factor_service.qlib_formula import compile_qlib_formula
 from factor_service.api.formulas import validate_formula
-from factor_service.repository import _validated_factor_payload, _value_conditions
+from factor_service.repository import (
+    _normalize_factor_params,
+    _validated_factor_payload,
+    _validated_param_schema,
+    _value_conditions,
+)
 from factor_service.schemas import FactorCreate, FactorFormulaValidateRequest
 
 
@@ -127,11 +132,21 @@ def test_factor_payload_validation_syncs_required_fields():
         expression="Mean($turnover_rate, $window)",
         params={"window": 20},
         required_fields=[],
+        asset_id="stock",
+        source_node_id="stock_daily_real",
     )
 
     validated = _validated_factor_payload(payload)
 
     assert validated.required_fields == ["turnover_rate"]
+    assert validated.param_schema == {
+        "window": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "default": 20,
+        }
+    }
 
 
 def test_factor_payload_validation_rejects_bad_expression():
@@ -144,6 +159,47 @@ def test_factor_payload_validation_rejects_bad_expression():
 
     with pytest.raises(ValueError, match="表达式不合法"):
         _validated_factor_payload(payload)
+
+
+def test_factor_parameter_schema_and_job_overrides_are_strict():
+    schema = _validated_param_schema(
+        {
+            "window": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+            }
+        },
+        {"window": 20},
+    )
+
+    assert _normalize_factor_params(
+        schema,
+        {"window": 20},
+        {"window": 30},
+    ) == {"window": 30}
+    with pytest.raises(ValueError, match="未声明参数"):
+        _normalize_factor_params(
+            schema,
+            {"window": 20},
+            {"unknown": 1},
+        )
+    with pytest.raises(ValueError, match="大于 maximum"):
+        _normalize_factor_params(
+            schema,
+            {"window": 20},
+            {"window": 101},
+        )
+    with pytest.raises(ValueError, match="default"):
+        _validated_param_schema(
+            {
+                "window": {
+                    "type": "integer",
+                    "default": 10,
+                }
+            },
+            {"window": 20},
+        )
 
 
 def test_cross_instrument_qlib_functions_are_explicitly_unsupported():

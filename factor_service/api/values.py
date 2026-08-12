@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Query
@@ -18,11 +18,14 @@ def list_values(
     factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
+    entity_codes: Optional[list[str]] = Query(default=None),
     params_hash: Optional[str] = Query(default=None),
     job_id: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
+    date_end_exclusive: Optional[date] = Query(default=None),
+    available_before: Optional[datetime] = Query(default=None),
     limit: int = Query(default=500, ge=1, le=5000),
     offset: int = Query(default=0, ge=0),
     order_by: str = Query(default="trade_date"),
@@ -33,11 +36,14 @@ def list_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        entity_codes=entity_codes,
         params_hash=params_hash,
         job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
+        date_end_exclusive=date_end_exclusive,
+        available_before=available_before,
         limit=limit,
         offset=offset,
         order_by=order_by,
@@ -51,11 +57,14 @@ def count_values(
     factor_version: Optional[int] = Query(default=None, ge=1),
     entity_type: Optional[str] = Query(default=None),
     entity_code: Optional[str] = Query(default=None),
+    entity_codes: Optional[list[str]] = Query(default=None),
     params_hash: Optional[str] = Query(default=None),
     job_id: Optional[str] = Query(default=None),
     trade_date: Optional[date] = Query(default=None),
     date_start: Optional[date] = Query(default=None),
     date_end: Optional[date] = Query(default=None),
+    date_end_exclusive: Optional[date] = Query(default=None),
+    available_before: Optional[datetime] = Query(default=None),
 ) -> dict[str, int]:
     return {
         "count": repository.count_values(
@@ -63,11 +72,14 @@ def count_values(
             factor_version=factor_version,
             entity_type=entity_type,
             entity_code=entity_code,
+            entity_codes=entity_codes,
             params_hash=params_hash,
             job_id=job_id,
             trade_date=trade_date,
             date_start=date_start,
             date_end=date_end,
+            date_end_exclusive=date_end_exclusive,
+            available_before=available_before,
         )
     }
 

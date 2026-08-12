@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from datetime import date, datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from factor_service.clickhouse import client, settings
@@ -51,22 +52,65 @@ def list_factors(
         """,
         parameters=params,
     ).result_rows
-    return [_factor_from_row(row) for row in rows]
+    versions = _factor_versions(
+        [str(row[0]) for row in rows],
+    )
+    return [
+        _factor_from_row(row, available_versions=versions.get(str(row[0]), ()))
+        for row in rows
+    ]
 
 
-def get_factor(factor_id: str) -> Optional[FactorOut]:
+def get_factor(
+    factor_id: str,
+    version: Optional[int] = None,
+) -> Optional[FactorOut]:
     database = settings().clickhouse_database
+    version_condition = (
+        "AND version = {version:UInt32}"
+        if version is not None
+        else ""
+    )
+    parameters = {"factor_id": factor_id}
+    if version is not None:
+        parameters["version"] = int(version)
     rows = client().query(
         f"""
         SELECT *
         FROM {database}.factor_definitions
         WHERE factor_id = {{factor_id:String}}
+        {version_condition}
         ORDER BY version DESC
         LIMIT 1
         """,
-        parameters={"factor_id": factor_id},
+        parameters=parameters,
     ).result_rows
-    return _factor_from_row(rows[0]) if rows else None
+    if not rows:
+        return None
+    versions = _factor_versions([factor_id]).get(factor_id, ())
+    return _factor_from_row(rows[0], available_versions=versions)
+
+
+def _factor_versions(
+    factor_ids: list[str],
+) -> dict[str, tuple[int, ...]]:
+    cleaned = sorted({str(item) for item in factor_ids if str(item)})
+    if not cleaned:
+        return {}
+    database = settings().clickhouse_database
+    rows = client().query(
+        f"""
+        SELECT factor_id, groupUniqArray(version)
+        FROM {database}.factor_definitions
+        WHERE factor_id IN {{factor_ids:Array(String)}}
+        GROUP BY factor_id
+        """,
+        parameters={"factor_ids": cleaned},
+    ).result_rows
+    return {
+        str(row[0]): tuple(sorted((int(item) for item in row[1]), reverse=True))
+        for row in rows
+    }
 
 
 def create_factor(payload: FactorCreate) -> FactorOut:
@@ -118,14 +162,54 @@ def _validated_factor_payload(payload: FactorCreate) -> FactorCreate:
         )
     except ValueError as exc:
         raise ValueError(f"因子表达式不合法: {exc}") from exc
-    return payload.model_copy(update={"required_fields": compiled.fields})
+    asset_id = str(payload.asset_id or "").strip()
+    source_node_id = str(payload.source_node_id or "").strip()
+    if not asset_id:
+        raise ValueError("因子必须绑定 entity asset")
+    if not source_node_id:
+        raise ValueError("因子必须绑定 source node")
+    if str(payload.entity_type or "").strip() != asset_id:
+        raise ValueError("entity_type 必须与 asset_id 一致")
+    param_schema = (
+        _validated_param_schema(payload.param_schema, payload.params)
+        if payload.param_schema
+        else _inferred_param_schema(payload.params)
+    )
+    availability_policy = dict(payload.availability_policy or {})
+    if (
+        str(availability_policy.get("field") or "") != "available_at"
+        or str(availability_policy.get("policy") or "")
+        != "persisted_timestamp"
+    ):
+        raise ValueError(
+            "availability_policy 必须使用持久化 available_at 时间戳"
+        )
+    return payload.model_copy(
+        update={
+            "asset_id": asset_id,
+            "source_node_id": source_node_id,
+            "required_fields": compiled.fields,
+            "param_schema": param_schema,
+            "availability_policy": availability_policy,
+        }
+    )
 
 
 def create_job(payload: FactorJobCreate) -> FactorJobOut:
-    factor = get_factor(payload.factor_id)
+    factor = get_factor(
+        payload.factor_id,
+        version=payload.factor_version,
+    )
     if not factor:
         raise ValueError(f"因子不存在: {payload.factor_id}")
-    version = payload.factor_version or factor.version
+    if str(payload.entity_type or "").strip() != factor.asset_id:
+        raise ValueError("任务 entity_type 必须与因子 asset_id 一致")
+    _normalize_factor_params(
+        factor.param_schema,
+        factor.params,
+        payload.params,
+    )
+    version = factor.version
     job_id = f"factor_job_{uuid4().hex}"
     now = datetime.now()
     database = settings().clickhouse_database
@@ -597,11 +681,14 @@ def list_values(
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    entity_codes: Optional[list[str]] = None,
     params_hash: Optional[str] = None,
     job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
+    date_end_exclusive: Optional[date] = None,
+    available_before: Optional[datetime] = None,
     limit: int = 500,
     offset: int = 0,
     order_by: str = "trade_date",
@@ -613,11 +700,14 @@ def list_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        entity_codes=entity_codes,
         params_hash=params_hash,
         job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
+        date_end_exclusive=date_end_exclusive,
+        available_before=available_before,
     )
     params["limit"] = max(1, min(limit, 5000))
     params["offset"] = max(0, offset)
@@ -643,11 +733,14 @@ def count_values(
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    entity_codes: Optional[list[str]] = None,
     params_hash: Optional[str] = None,
     job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
+    date_end_exclusive: Optional[date] = None,
+    available_before: Optional[datetime] = None,
 ) -> int:
     database = settings().clickhouse_database
     conditions, params = _value_conditions(
@@ -655,11 +748,14 @@ def count_values(
         factor_version=factor_version,
         entity_type=entity_type,
         entity_code=entity_code,
+        entity_codes=entity_codes,
         params_hash=params_hash,
         job_id=job_id,
         trade_date=trade_date,
         date_start=date_start,
         date_end=date_end,
+        date_end_exclusive=date_end_exclusive,
+        available_before=available_before,
     )
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = client().query(
@@ -867,11 +963,14 @@ def _value_conditions(
     factor_version: Optional[int] = None,
     entity_type: Optional[str] = None,
     entity_code: Optional[str] = None,
+    entity_codes: Optional[list[str]] = None,
     params_hash: Optional[str] = None,
     job_id: Optional[str] = None,
     trade_date: Optional[date] = None,
     date_start: Optional[date] = None,
     date_end: Optional[date] = None,
+    date_end_exclusive: Optional[date] = None,
+    available_before: Optional[datetime] = None,
 ) -> tuple[list[str], dict]:
     conditions = []
     params = {}
@@ -892,6 +991,13 @@ def _value_conditions(
     if entity_code:
         conditions.append("entity_code = {entity_code:String}")
         params["entity_code"] = entity_code
+    if entity_codes:
+        cleaned_codes = sorted(
+            {str(item).strip() for item in entity_codes if str(item).strip()}
+        )
+        if cleaned_codes:
+            conditions.append("entity_code IN {entity_codes:Array(String)}")
+            params["entity_codes"] = cleaned_codes
     if params_hash:
         conditions.append("params_hash = {params_hash:String}")
         params["params_hash"] = params_hash
@@ -907,6 +1013,13 @@ def _value_conditions(
     if date_end:
         conditions.append("trade_date <= {date_end:Date}")
         params["date_end"] = date_end
+    if date_end_exclusive:
+        conditions.append("trade_date < {date_end_exclusive:Date}")
+        params["date_end_exclusive"] = date_end_exclusive
+    if available_before:
+        conditions.append("available_at IS NOT NULL")
+        conditions.append("available_at <= {available_before:DateTime}")
+        params["available_before"] = available_before
     return conditions, params
 
 
@@ -996,8 +1109,20 @@ def _insert_factor(payload: FactorCreate, version: int, created_at: datetime, up
         payload.group_name,
         payload.output_type,
         payload.frequency,
+        payload.asset_id,
+        payload.source_node_id,
         payload.required_fields,
         json.dumps(payload.params, ensure_ascii=False, sort_keys=True),
+        json.dumps(
+            payload.param_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        json.dumps(
+            payload.availability_policy,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         payload.expression,
         1 if payload.enabled else 0,
         created_at,
@@ -1016,8 +1141,12 @@ def _insert_factor(payload: FactorCreate, version: int, created_at: datetime, up
             "group_name",
             "output_type",
             "frequency",
+            "asset_id",
+            "source_node_id",
             "required_fields",
             "params_json",
+            "param_schema_json",
+            "availability_policy_json",
             "expression",
             "enabled",
             "created_at",
@@ -1034,24 +1163,170 @@ def _json_dict(value: str) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _factor_from_row(row) -> FactorOut:
-    return FactorOut(
-        factor_id=row[0],
-        version=int(row[1]),
-        label=row[2],
-        description=row[3],
-        entity_type=row[4],
-        category=row[5],
-        group_name=row[6],
-        output_type=row[7],
-        frequency=row[8],
-        required_fields=list(row[9] or []),
-        params=_json_dict(row[10]),
-        expression=row[11],
-        enabled=bool(row[12]),
-        created_at=row[13],
-        updated_at=row[14],
+def _inferred_param_schema(
+    params: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    schema: dict[str, dict[str, Any]] = {}
+    for name, value in sorted(params.items()):
+        if isinstance(value, bool):
+            spec: dict[str, Any] = {"type": "boolean"}
+        elif isinstance(value, int):
+            spec = {"type": "integer"}
+        elif isinstance(value, float) and math.isfinite(value):
+            spec = {"type": "number"}
+        elif isinstance(value, str):
+            spec = {"type": "string"}
+        else:
+            raise ValueError(f"参数 {name} 缺少可推导的严格类型")
+        clean_name = str(name)
+        lowered = clean_name.lower()
+        if spec["type"] == "integer" and (
+            "window" in lowered or "period" in lowered
+        ):
+            spec.update({"minimum": 1, "maximum": 10000})
+        elif spec["type"] == "number" and lowered.endswith("_weight"):
+            spec.update({"minimum": 0, "maximum": 1})
+        spec["default"] = value
+        schema[clean_name] = spec
+    return schema
+
+
+def _validated_param_schema(
+    schema: dict[str, dict[str, Any]],
+    defaults: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if set(schema) != set(defaults):
+        raise ValueError("param_schema 必须精确覆盖全部默认参数")
+    allowed_types = {"boolean", "integer", "number", "string"}
+    normalized: dict[str, dict[str, Any]] = {}
+    for name, raw in schema.items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"参数 {name} 的 schema 必须是对象")
+        spec = dict(raw)
+        dtype = str(spec.get("type") or "").strip().lower()
+        if dtype not in allowed_types:
+            raise ValueError(f"参数 {name} 的 schema type 不受支持")
+        spec["type"] = dtype
+        if "default" in spec and spec["default"] != defaults[name]:
+            raise ValueError(f"参数 {name} 的 schema default 与 params 不一致")
+        spec["default"] = defaults[name]
+        _validate_parameter_value(str(name), defaults[name], spec)
+        normalized[str(name)] = spec
+    return normalized
+
+
+def _normalize_factor_params(
+    schema: dict[str, dict[str, Any]],
+    defaults: dict[str, Any],
+    supplied: dict[str, Any],
+) -> dict[str, Any]:
+    unknown = sorted(set(supplied) - set(schema))
+    if unknown:
+        raise ValueError("任务包含未声明参数: " + ", ".join(unknown))
+    normalized: dict[str, Any] = {}
+    for name, spec in schema.items():
+        if name not in supplied and name not in defaults:
+            if bool(spec.get("required")):
+                raise ValueError(f"任务缺少必需参数: {name}")
+            continue
+        value = supplied[name] if name in supplied else defaults[name]
+        _validate_parameter_value(name, value, spec)
+        normalized[name] = value
+    return normalized
+
+
+def _validate_parameter_value(
+    name: str,
+    value: Any,
+    spec: dict[str, Any],
+) -> None:
+    dtype = str(spec.get("type") or "").strip().lower()
+    valid = (
+        type(value) is bool
+        if dtype == "boolean"
+        else type(value) is int
+        if dtype == "integer"
+        else (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        if dtype == "number"
+        else isinstance(value, str)
+        if dtype == "string"
+        else False
     )
+    if not valid:
+        raise ValueError(f"参数 {name} 必须是 {dtype}")
+    minimum = spec.get("minimum")
+    maximum = spec.get("maximum")
+    choices = list(spec.get("choices", spec.get("enum", ())) or ())
+    if minimum is not None and value < minimum:
+        raise ValueError(f"参数 {name} 小于 minimum")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"参数 {name} 大于 maximum")
+    if choices and value not in choices:
+        raise ValueError(f"参数 {name} 不在允许值中")
+
+
+def _definition_hash(payload: dict[str, Any]) -> str:
+    stable = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "definition_hash",
+            "available_versions",
+            "created_at",
+            "updated_at",
+        }
+    }
+    return hashlib.sha256(
+        json.dumps(
+            stable,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _factor_from_row(
+    row,
+    *,
+    available_versions: tuple[int, ...] = (),
+) -> FactorOut:
+    params = _json_dict(row[12])
+    param_schema = _json_dict(row[13]) or _inferred_param_schema(params)
+    availability_policy = _json_dict(row[14]) or {
+        "field": "available_at",
+        "policy": "persisted_timestamp",
+    }
+    payload = {
+        "factor_id": row[0],
+        "version": int(row[1]),
+        "label": row[2],
+        "description": row[3],
+        "entity_type": row[4],
+        "category": row[5],
+        "group_name": row[6],
+        "output_type": row[7],
+        "frequency": row[8],
+        "asset_id": row[9],
+        "source_node_id": row[10],
+        "required_fields": list(row[11] or []),
+        "params": params,
+        "param_schema": param_schema,
+        "availability_policy": availability_policy,
+        "expression": row[15],
+        "enabled": bool(row[16]),
+        "available_versions": list(available_versions),
+        "created_at": row[17],
+        "updated_at": row[18],
+    }
+    payload["definition_hash"] = _definition_hash(payload)
+    return FactorOut(**payload)
 
 
 def _job_from_row(row) -> FactorJobOut:
@@ -1088,7 +1363,8 @@ def _value_from_row(row) -> FactorValueOut:
         percentile=row[8],
         score=row[9],
         job_id=row[10],
-        updated_at=row[11],
+        available_at=row[11],
+        updated_at=row[12],
     )
 
 

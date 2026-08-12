@@ -54,7 +54,10 @@ def run_job(job_id: str) -> FactorJobOut:
     started_at = datetime.now()
     repository.update_job_status(job.job_id, "running", started_at=started_at)
     try:
-        factor = repository.get_factor(job.factor_id)
+        factor = repository.get_factor(
+            job.factor_id,
+            version=job.factor_version,
+        )
         if not factor:
             raise ValueError(f"因子不存在: {job.factor_id}")
         if not factor.enabled:
@@ -81,6 +84,10 @@ def run_job(job_id: str) -> FactorJobOut:
 
 
 def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
+    if factor.frequency != "daily":
+        raise ValueError(
+            "分钟因子必须由分钟计算器写入，daily worker 不接受 minute 因子"
+        )
     config = settings()
     factor_db = _identifier(config.clickhouse_database, "factor database")
     source_db = _identifier(config.source_database, "source database")
@@ -141,6 +148,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         percentile,
         score,
         job_id,
+        available_at,
         updated_at
     )
     SELECT
@@ -155,6 +163,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         NULL,
         NULL,
         {{job_id:String}},
+        toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
         now()
     FROM (
         {value_plan.sql}

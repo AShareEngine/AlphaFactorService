@@ -28,8 +28,11 @@ def create_factor(payload: FactorCreate) -> FactorOut:
 
 
 @router.get("/{factor_id}", response_model=FactorOut)
-def get_factor(factor_id: str) -> FactorOut:
-    factor = repository.get_factor(factor_id)
+def get_factor(
+    factor_id: str,
+    version: Optional[int] = Query(default=None, ge=1),
+) -> FactorOut:
+    factor = repository.get_factor(factor_id, version=version)
     if not factor:
         raise HTTPException(status_code=404, detail="因子不存在")
     return factor
