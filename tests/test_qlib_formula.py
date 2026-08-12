@@ -149,6 +149,29 @@ def test_factor_payload_validation_syncs_required_fields():
     }
 
 
+def test_factor_processing_metadata_is_not_treated_as_job_parameter():
+    payload = FactorCreate(
+        factor_id="processed_demo",
+        label="Processed Demo",
+        expression="Mean($amount, $window)",
+        params={
+            "window": 20,
+            "data_processing": {
+                "winsorize": "quantile",
+                "standardize": "zscore",
+                "neutralize": [],
+            },
+            "weighting": "equal",
+        },
+        asset_id="stock",
+        source_node_id="stock_daily_real",
+    )
+
+    validated = _validated_factor_payload(payload)
+
+    assert list(validated.param_schema) == ["window"]
+
+
 def test_factor_payload_validation_rejects_bad_expression():
     payload = FactorCreate(
         factor_id="bad",

@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS ab_factor.factor_definitions
     frequency LowCardinality(String),
     required_fields Array(String),
     params_json String,
+    param_schema_json String DEFAULT '{}',
+    availability_policy_json String DEFAULT '{"field":"available_at","policy":"persisted_timestamp"}',
     expression String,
     enabled UInt8,
     created_at DateTime DEFAULT now(),
@@ -56,11 +58,36 @@ CREATE TABLE IF NOT EXISTS ab_factor.factor_values_daily
     percentile Nullable(Float64),
     score Nullable(Float64),
     job_id String,
+    available_at DateTime('Asia/Shanghai')
+        DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
     updated_at DateTime DEFAULT now()
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
 ORDER BY (factor_id, trade_date, entity_code, params_hash);
+
+ALTER TABLE ab_factor.factor_definitions
+ADD COLUMN IF NOT EXISTS asset_id String DEFAULT entity_type
+AFTER frequency;
+
+ALTER TABLE ab_factor.factor_definitions
+ADD COLUMN IF NOT EXISTS source_node_id String
+DEFAULT if(entity_type = 'stock' AND frequency = 'daily', 'stock_daily_real', '')
+AFTER asset_id;
+
+ALTER TABLE ab_factor.factor_definitions
+ADD COLUMN IF NOT EXISTS param_schema_json String DEFAULT '{}'
+AFTER params_json;
+
+ALTER TABLE ab_factor.factor_definitions
+ADD COLUMN IF NOT EXISTS availability_policy_json String
+DEFAULT '{"field":"available_at","policy":"persisted_timestamp"}'
+AFTER param_schema_json;
+
+ALTER TABLE ab_factor.factor_values_daily
+ADD COLUMN IF NOT EXISTS available_at DateTime('Asia/Shanghai')
+DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+AFTER job_id;
 
 CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_jobs
 (

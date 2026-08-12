@@ -1168,6 +1168,8 @@ def _inferred_param_schema(
 ) -> dict[str, dict[str, Any]]:
     schema: dict[str, dict[str, Any]] = {}
     for name, value in sorted(params.items()):
+        if str(name).startswith("_") or str(name) in {"data_processing", "weighting"}:
+            continue
         if isinstance(value, bool):
             spec: dict[str, Any] = {"type": "boolean"}
         elif isinstance(value, int):
@@ -1195,7 +1197,13 @@ def _validated_param_schema(
     schema: dict[str, dict[str, Any]],
     defaults: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    if set(schema) != set(defaults):
+    parameter_defaults = {
+        name: value
+        for name, value in defaults.items()
+        if not str(name).startswith("_")
+        and str(name) not in {"data_processing", "weighting"}
+    }
+    if set(schema) != set(parameter_defaults):
         raise ValueError("param_schema 必须精确覆盖全部默认参数")
     allowed_types = {"boolean", "integer", "number", "string"}
     normalized: dict[str, dict[str, Any]] = {}
@@ -1207,10 +1215,10 @@ def _validated_param_schema(
         if dtype not in allowed_types:
             raise ValueError(f"参数 {name} 的 schema type 不受支持")
         spec["type"] = dtype
-        if "default" in spec and spec["default"] != defaults[name]:
+        if "default" in spec and spec["default"] != parameter_defaults[name]:
             raise ValueError(f"参数 {name} 的 schema default 与 params 不一致")
-        spec["default"] = defaults[name]
-        _validate_parameter_value(str(name), defaults[name], spec)
+        spec["default"] = parameter_defaults[name]
+        _validate_parameter_value(str(name), parameter_defaults[name], spec)
         normalized[str(name)] = spec
     return normalized
 

@@ -37,6 +37,13 @@ class ValueSqlPlan:
     fields: list[str]
 
 
+@dataclass(frozen=True)
+class PostprocessConfig:
+    winsorize: str
+    standardize: str
+    neutralize: tuple[str, ...]
+
+
 def run_pending_jobs(limit: int = 5) -> list[FactorJobOut]:
     jobs = repository.list_jobs(status="pending", limit=limit)
     return [run_job(job.job_id) for job in jobs]
@@ -64,6 +71,7 @@ def run_job(job_id: str) -> FactorJobOut:
             raise ValueError(f"因子已停用: {job.factor_id}")
         plan = build_compute_plan(factor, job)
         client().command(plan.sql, parameters=plan.params)
+        _cleanup_superseded_values(plan)
         row_count = _count_job_values(job.job_id)
         return repository.update_job_status(
             job.job_id,
@@ -97,8 +105,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
     date_column = _identifier(config.stock_date_column, "stock date column")
     stock_type_column = _identifier(config.stock_basic_type_column, "stock basic type column")
 
-    params = dict(factor.params)
-    params.update(job.params or {})
+    params = _formula_params(factor, job.params or {})
     window = _positive_int(params.get("window", 20), "window")
     source = f"{source_db}.{source_table}"
     stock_basic = f"{source_db}.{stock_basic_table}"
@@ -116,6 +123,12 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         date_column=date_column,
         params={**params, "window": window},
         universe_filter=universe_filter,
+    )
+    processing = _postprocess_config(factor)
+    postprocessed_sql = _build_postprocessed_sql(
+        value_plan.sql,
+        output_type=factor.output_type,
+        processing=processing,
     )
     date_start, date_end = _resolve_date_range(job.date_start, job.date_end, source_db, source_table, date_column)
     lookback_days = max(value_plan.max_window * 4 + 20, 90)
@@ -159,20 +172,197 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         {{factor_version:UInt32}},
         {{params_hash:String}},
         raw_value,
-        NULL,
-        NULL,
-        NULL,
+        rank_value,
+        percentile,
+        score,
         {{job_id:String}},
         toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
         now()
     FROM (
-        {value_plan.sql}
+        {postprocessed_sql}
     )
     WHERE trade_date >= {{date_start:Date}}
       AND trade_date <= {{date_end:Date}}
       AND raw_value IS NOT NULL
     """
     return ComputePlan(sql=sql, params=base_params, date_start=date_start, date_end=date_end, params_hash=params_hash)
+
+
+def _postprocess_config(factor: FactorOut) -> PostprocessConfig:
+    raw = factor.params.get("data_processing")
+    configured = raw if isinstance(raw, dict) else {}
+    is_boolean = factor.output_type == "boolean"
+    winsorize = "none" if is_boolean else str(configured.get("winsorize") or "quantile").strip().lower()
+    standardize = "none" if is_boolean else str(configured.get("standardize") or "zscore").strip().lower()
+    neutralize_raw = configured.get("neutralize") or []
+    if not isinstance(neutralize_raw, list):
+        raise ValueError("data_processing.neutralize 必须是数组")
+    neutralize = tuple(str(item).strip().lower() for item in neutralize_raw if str(item).strip())
+
+    allowed_winsorize = {"none", "median", "mad", "quantile"}
+    allowed_standardize = {"none", "zscore", "rank"}
+    if winsorize not in allowed_winsorize:
+        raise ValueError(f"不支持的去极值方式: {winsorize}")
+    if standardize not in allowed_standardize:
+        raise ValueError(f"不支持的标准化方式: {standardize}")
+    if neutralize:
+        raise ValueError(
+            "当前因子源尚未绑定行业和市值暴露，不能执行中性化: "
+            + ", ".join(neutralize)
+        )
+    return PostprocessConfig(
+        winsorize=winsorize,
+        standardize=standardize,
+        neutralize=neutralize,
+    )
+
+
+def _formula_params(factor: FactorOut, overrides: dict) -> dict:
+    """Return only declared formula parameters, excluding UI/processing metadata."""
+    declared = set(factor.param_schema)
+    if not declared:
+        declared = {
+            str(name)
+            for name, value in factor.params.items()
+            if not str(name).startswith("_")
+            and str(name) not in {"data_processing", "weighting"}
+            and isinstance(value, (bool, int, float, str))
+        }
+    unknown = sorted(set(overrides) - declared)
+    if unknown:
+        raise ValueError("任务包含未声明参数: " + ", ".join(unknown))
+    return {
+        name: overrides[name] if name in overrides else factor.params[name]
+        for name in sorted(declared)
+        if name in overrides or name in factor.params
+    }
+
+
+def _build_postprocessed_sql(
+    raw_sql: str,
+    *,
+    output_type: str,
+    processing: PostprocessConfig,
+) -> str:
+    """Add daily cross-sectional rank, percentile and model-ready score."""
+    raw_cte = f"""
+    raw_values AS (
+        SELECT trade_date, entity_code, toFloat64(raw_value) AS raw_value
+        FROM ({raw_sql})
+        WHERE raw_value IS NOT NULL AND isFinite(raw_value)
+    )
+    """
+
+    if output_type == "boolean":
+        winsor_ctes = """
+        processed_values AS (
+            SELECT trade_date, entity_code, raw_value, raw_value AS processed_value
+            FROM raw_values
+        )
+        """
+    elif processing.winsorize == "quantile":
+        winsor_ctes = """
+        bounds AS (
+            SELECT
+                trade_date,
+                entity_code,
+                raw_value,
+                quantile(0.01)(raw_value) OVER (PARTITION BY trade_date) AS lower_bound,
+                quantile(0.99)(raw_value) OVER (PARTITION BY trade_date) AS upper_bound
+            FROM raw_values
+        ),
+        processed_values AS (
+            SELECT
+                trade_date,
+                entity_code,
+                raw_value,
+                least(greatest(raw_value, lower_bound), upper_bound) AS processed_value
+            FROM bounds
+        )
+        """
+    elif processing.winsorize in {"median", "mad"}:
+        multiple = 5.0 if processing.winsorize == "median" else 3.0
+        winsor_ctes = f"""
+        centers AS (
+            SELECT
+                trade_date,
+                entity_code,
+                raw_value,
+                median(raw_value) OVER (PARTITION BY trade_date) AS center
+            FROM raw_values
+        ),
+        dispersions AS (
+            SELECT
+                trade_date,
+                entity_code,
+                raw_value,
+                center,
+                median(abs(raw_value - center)) OVER (PARTITION BY trade_date) * 1.4826 AS robust_sigma
+            FROM centers
+        ),
+        processed_values AS (
+            SELECT
+                trade_date,
+                entity_code,
+                raw_value,
+                if(
+                    robust_sigma = 0,
+                    raw_value,
+                    least(
+                        greatest(raw_value, center - {multiple} * robust_sigma),
+                        center + {multiple} * robust_sigma
+                    )
+                ) AS processed_value
+            FROM dispersions
+        )
+        """
+    else:
+        winsor_ctes = """
+        processed_values AS (
+            SELECT trade_date, entity_code, raw_value, raw_value AS processed_value
+            FROM raw_values
+        )
+        """
+
+    if output_type == "boolean":
+        score_sql = "raw_value"
+    elif processing.standardize == "rank":
+        score_sql = "percentile"
+    elif processing.standardize == "none":
+        score_sql = "processed_value"
+    else:
+        score_sql = "if(processed_stddev = 0, 0.0, (processed_value - processed_mean) / processed_stddev)"
+
+    return f"""
+    WITH
+    {raw_cte},
+    {winsor_ctes},
+    ranked_values AS (
+        SELECT
+            trade_date,
+            entity_code,
+            raw_value,
+            processed_value,
+            toUInt32(rank() OVER (PARTITION BY trade_date ORDER BY raw_value DESC)) AS rank_value,
+            toFloat64(percent_rank() OVER (PARTITION BY trade_date ORDER BY raw_value ASC)) AS percentile
+        FROM processed_values
+    ),
+    scored_values AS (
+        SELECT
+            *,
+            avg(processed_value) OVER (PARTITION BY trade_date) AS processed_mean,
+            stddevPop(processed_value) OVER (PARTITION BY trade_date) AS processed_stddev
+        FROM ranked_values
+    )
+    SELECT
+        trade_date,
+        entity_code,
+        raw_value,
+        rank_value,
+        percentile,
+        toFloat64({score_sql}) AS score
+    FROM scored_values
+    """
 
 
 def _build_value_sql(
@@ -250,6 +440,33 @@ def _count_job_values(job_id: str) -> int:
         parameters={"job_id": job_id},
     ).result_rows
     return int(rows[0][0] or 0)
+
+
+def _cleanup_superseded_values(plan: ComputePlan) -> None:
+    """Keep the newly written batch and remove older rows for the same keys/range."""
+    database = _identifier(settings().clickhouse_database, "factor database")
+    client().command(
+        f"""
+        ALTER TABLE {database}.factor_values_daily DELETE
+        WHERE factor_id = {{factor_id:String}}
+          AND factor_version = {{factor_version:UInt32}}
+          AND entity_type = {{entity_type:String}}
+          AND params_hash = {{params_hash:String}}
+          AND trade_date >= {{date_start:Date}}
+          AND trade_date <= {{date_end:Date}}
+          AND job_id != {{job_id:String}}
+        SETTINGS mutations_sync = 2
+        """,
+        parameters={
+            "factor_id": plan.params["factor_id"],
+            "factor_version": plan.params["factor_version"],
+            "entity_type": plan.params["entity_type"],
+            "params_hash": plan.params["params_hash"],
+            "date_start": plan.date_start,
+            "date_end": plan.date_end,
+            "job_id": plan.params["job_id"],
+        },
+    )
 
 
 def _params_hash(factor_id: str, version: int, params: dict) -> str:
