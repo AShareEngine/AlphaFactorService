@@ -58,9 +58,22 @@ CREATE TABLE IF NOT EXISTS ab_factor.factor_values_daily
     percentile Nullable(Float64),
     score Nullable(Float64),
     job_id String,
-    available_at DateTime('Asia/Shanghai')
+    event_available_at DateTime('Asia/Shanghai')
         DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
-    updated_at DateTime DEFAULT now()
+    updated_at DateTime DEFAULT now(),
+    available_at DateTime('Asia/Shanghai')
+        DEFAULT toTimeZone(updated_at, 'Asia/Shanghai'),
+    computed_at DateTime('Asia/Shanghai')
+        DEFAULT toTimeZone(updated_at, 'Asia/Shanghai'),
+    source_vintage String DEFAULT concat(
+        'legacy#',
+        job_id,
+        '@',
+        formatDateTime(
+            toTimeZone(updated_at, 'Asia/Shanghai'),
+            '%Y-%m-%dT%H:%i:%S'
+        )
+    )
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(trade_date)
@@ -86,8 +99,45 @@ AFTER param_schema_json;
 
 ALTER TABLE ab_factor.factor_values_daily
 ADD COLUMN IF NOT EXISTS available_at DateTime('Asia/Shanghai')
+DEFAULT toTimeZone(updated_at, 'Asia/Shanghai')
+AFTER job_id;
+
+ALTER TABLE ab_factor.factor_values_daily
+MODIFY COLUMN available_at DateTime('Asia/Shanghai')
+DEFAULT toTimeZone(updated_at, 'Asia/Shanghai');
+
+ALTER TABLE ab_factor.factor_values_daily
+ADD COLUMN IF NOT EXISTS event_available_at DateTime('Asia/Shanghai')
 DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
 AFTER job_id;
+
+ALTER TABLE ab_factor.factor_values_daily
+ADD COLUMN IF NOT EXISTS computed_at DateTime('Asia/Shanghai')
+DEFAULT toTimeZone(updated_at, 'Asia/Shanghai')
+AFTER available_at;
+
+ALTER TABLE ab_factor.factor_values_daily
+ADD COLUMN IF NOT EXISTS source_vintage String DEFAULT concat(
+    'legacy#',
+    job_id,
+    '@',
+    formatDateTime(
+        toTimeZone(updated_at, 'Asia/Shanghai'),
+        '%Y-%m-%dT%H:%i:%S'
+    )
+)
+AFTER computed_at;
+
+ALTER TABLE ab_factor.factor_values_daily
+MODIFY COLUMN source_vintage String DEFAULT concat(
+    'legacy#',
+    job_id,
+    '@',
+    formatDateTime(
+        toTimeZone(updated_at, 'Asia/Shanghai'),
+        '%Y-%m-%dT%H:%i:%S'
+    )
+);
 
 CREATE TABLE IF NOT EXISTS ab_factor.factor_analysis_jobs
 (

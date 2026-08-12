@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from threading import local
 
 import clickhouse_connect
 
 from factor_service.config import Settings, load_settings
+
+
+_client_state = local()
 
 
 SCHEMA_STATEMENTS = [
@@ -72,9 +76,22 @@ SCHEMA_STATEMENTS = [
         percentile Nullable(Float64),
         score Nullable(Float64),
         job_id String,
-        available_at DateTime('Asia/Shanghai')
+        event_available_at DateTime('Asia/Shanghai')
             DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
-        updated_at DateTime DEFAULT now()
+        updated_at DateTime DEFAULT now(),
+        available_at DateTime('Asia/Shanghai')
+            DEFAULT toTimeZone(updated_at, 'Asia/Shanghai'),
+        computed_at DateTime('Asia/Shanghai')
+            DEFAULT toTimeZone(updated_at, 'Asia/Shanghai'),
+        source_vintage String DEFAULT concat(
+            'legacy#',
+            job_id,
+            '@',
+            formatDateTime(
+                toTimeZone(updated_at, 'Asia/Shanghai'),
+                '%Y-%m-%dT%H:%i:%S'
+            )
+        )
     )
     ENGINE = MergeTree
     PARTITION BY toYYYYMM(trade_date)
@@ -183,8 +200,50 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE {database}.factor_values_daily
     ADD COLUMN IF NOT EXISTS available_at DateTime('Asia/Shanghai')
+    DEFAULT toTimeZone(updated_at, 'Asia/Shanghai')
+    AFTER job_id
+    """,
+    """
+    ALTER TABLE {database}.factor_values_daily
+    MODIFY COLUMN available_at DateTime('Asia/Shanghai')
+    DEFAULT toTimeZone(updated_at, 'Asia/Shanghai')
+    """,
+    """
+    ALTER TABLE {database}.factor_values_daily
+    ADD COLUMN IF NOT EXISTS event_available_at DateTime('Asia/Shanghai')
     DEFAULT toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
     AFTER job_id
+    """,
+    """
+    ALTER TABLE {database}.factor_values_daily
+    ADD COLUMN IF NOT EXISTS computed_at DateTime('Asia/Shanghai')
+    DEFAULT toTimeZone(updated_at, 'Asia/Shanghai')
+    AFTER available_at
+    """,
+    """
+    ALTER TABLE {database}.factor_values_daily
+    ADD COLUMN IF NOT EXISTS source_vintage String DEFAULT concat(
+        'legacy#',
+        job_id,
+        '@',
+        formatDateTime(
+            toTimeZone(updated_at, 'Asia/Shanghai'),
+            '%Y-%m-%dT%H:%i:%S'
+        )
+    )
+    AFTER computed_at
+    """,
+    """
+    ALTER TABLE {database}.factor_values_daily
+    MODIFY COLUMN source_vintage String DEFAULT concat(
+        'legacy#',
+        job_id,
+        '@',
+        formatDateTime(
+            toTimeZone(updated_at, 'Asia/Shanghai'),
+            '%Y-%m-%dT%H:%i:%S'
+        )
+    )
     """,
 ]
 
@@ -194,16 +253,29 @@ def settings() -> Settings:
     return load_settings()
 
 
-@lru_cache(maxsize=1)
 def client():
+    """Return one ClickHouse client per worker thread.
+
+    FastAPI executes synchronous endpoints in a thread pool.  A
+    clickhouse-connect client owns a session and rejects concurrent queries in
+    that session, so sharing one globally makes simultaneous page requests
+    fail intermittently.
+    """
+    cached = getattr(_client_state, "client", None)
+    if cached is not None:
+        return cached
+
     config = settings()
-    return clickhouse_connect.get_client(
+    cached = clickhouse_connect.get_client(
         host=config.clickhouse_host,
         port=config.clickhouse_port,
         username=config.clickhouse_user,
         password=config.clickhouse_password,
         secure=config.clickhouse_secure,
+        autogenerate_session_id=False,
     )
+    _client_state.client = cached
+    return cached
 
 
 def init_schema() -> None:
@@ -211,3 +283,37 @@ def init_schema() -> None:
     db_client = client()
     for statement in SCHEMA_STATEMENTS:
         db_client.command(statement.format(database=config.clickhouse_database))
+    _migrate_legacy_available_at(db_client, config.clickhouse_database)
+
+
+def _migrate_legacy_available_at(db_client, database: str) -> None:
+    """Keep old event timestamps while making available_at truly persisted-time.
+
+    Renaming a ClickHouse column is metadata-only. The replacement column uses
+    updated_at as its default, so old rows do not need a 70M-row mutation.
+    """
+    table = f"{database}.factor_values_daily"
+    columns = {
+        str(row[0])
+        for row in db_client.query(f"DESCRIBE TABLE {table}").result_rows
+    }
+    if "legacy_available_at" in columns or "available_at" not in columns:
+        return
+    mismatched = int(
+        db_client.query(
+            f"SELECT countIf(available_at != computed_at) FROM {table}"
+        ).result_rows[0][0]
+        or 0
+    )
+    if mismatched < 1:
+        return
+    db_client.command(
+        f"ALTER TABLE {table} "
+        "RENAME COLUMN available_at TO legacy_available_at"
+    )
+    db_client.command(
+        f"ALTER TABLE {table} "
+        "ADD COLUMN available_at DateTime('Asia/Shanghai') "
+        "DEFAULT toTimeZone(updated_at, 'Asia/Shanghai') "
+        "AFTER event_available_at"
+    )

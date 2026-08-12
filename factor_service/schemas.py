@@ -125,7 +125,10 @@ class FactorValueOut(BaseModel):
     percentile: Optional[float] = None
     score: Optional[float] = None
     job_id: str
+    event_available_at: Optional[datetime] = None
     available_at: Optional[datetime] = None
+    computed_at: Optional[datetime] = None
+    source_vintage: str = ""
     updated_at: Optional[datetime] = None
 
 
@@ -136,6 +139,23 @@ class CoverageOut(BaseModel):
     rows: int
     entity_count: int
     trade_date_count: int
+
+
+class FactorValueSyncStateItem(BaseModel):
+    factor_id: str = Field(min_length=1)
+    factor_version: Optional[int] = Field(default=None, ge=1)
+    entity_type: str = "stock"
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class FactorValueSyncStatesRequest(BaseModel):
+    items: list[FactorValueSyncStateItem] = Field(min_length=1, max_length=100)
+
+
+class FactorValueSyncStateOut(CoverageOut):
+    factor_version: int
+    entity_type: str
+    params_hash: str
 
 
 class FactorValueMetricQualityOut(BaseModel):

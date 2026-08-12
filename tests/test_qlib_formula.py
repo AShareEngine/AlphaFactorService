@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from factor_service.qlib_formula import compile_qlib_formula
@@ -266,3 +268,29 @@ def test_value_queries_allow_explicit_factor_version():
     assert params["factor_version"] == 2
     assert "factor_version = {factor_version:UInt32}" in conditions
     assert not any("SELECT max(version)" in condition for condition in conditions)
+
+
+def test_value_queries_use_actual_compute_time_for_strict_cutoff():
+    cutoff = datetime(2024, 1, 3, 15, 0)
+
+    conditions, params = _value_conditions(available_before=cutoff)
+
+    assert "available_at <= {available_before:DateTime}" in conditions
+    assert not any("event_available_at" in condition for condition in conditions)
+    assert params["available_before"] == cutoff
+
+
+def test_value_queries_require_explicit_event_cutoff_for_reconstruction():
+    cutoff = datetime(2024, 1, 3, 15, 0)
+
+    conditions, params = _value_conditions(event_available_before=cutoff)
+
+    assert (
+        "event_available_at <= {event_available_before:DateTime}"
+        in conditions
+    )
+    assert not any(
+        condition.startswith("available_at <=")
+        for condition in conditions
+    )
+    assert params["event_available_before"] == cutoff

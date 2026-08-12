@@ -85,6 +85,7 @@ def build_analysis_payload(job: FactorAnalysisJobOut) -> AnalysisPayload:
     factor = _load_factor_series(job, date_start, date_end)
     price_end = date_end + timedelta(days=max(periods) * 4 + 15)
     prices = _load_prices(job, date_start, price_end)
+    factor = _shift_factor_to_next_trading_day(factor, prices.index)
 
     factor_data = utils.get_clean_factor_and_forward_returns(
         factor=factor,
@@ -251,6 +252,41 @@ def _load_prices(job: FactorAnalysisJobOut, date_start: date, date_end: date) ->
     return prices
 
 
+def _shift_factor_to_next_trading_day(
+    factor: pd.Series,
+    price_dates: pd.Index,
+) -> pd.Series:
+    """Make close-derived signals tradable before Alphalens measures returns.
+
+    A daily factor can use that day's close, so it is only known after the
+    close. Alphalens otherwise starts its forward return at the same day's
+    close. Relabeling each observation to the next market date makes the
+    evaluation use the next close and prevents same-close execution leakage.
+    """
+    calendar = pd.DatetimeIndex(price_dates).drop_duplicates().sort_values()
+    if calendar.empty:
+        raise ValueError("价格交易日历为空，无法延迟因子信号")
+
+    frame = factor.rename("factor").reset_index()
+    frame["date"] = pd.to_datetime(frame["date"])
+    positions = calendar.searchsorted(frame["date"], side="right")
+    valid = positions < len(calendar)
+    frame = frame.loc[valid].copy()
+    if frame.empty:
+        raise ValueError("因子区间后没有下一交易日价格，无法分析")
+    frame["date"] = calendar.take(positions[valid])
+    frame = frame.drop_duplicates(["date", "asset"], keep="last")
+    index = pd.MultiIndex.from_frame(
+        frame[["date", "asset"]],
+        names=["date", "asset"],
+    )
+    return pd.Series(
+        frame["factor"].to_numpy(dtype=float),
+        index=index,
+        name="factor",
+    ).sort_index()
+
+
 def _build_summary_rows(
     job: FactorAnalysisJobOut,
     factor_data: pd.DataFrame,
@@ -263,6 +299,7 @@ def _build_summary_rows(
         _summary(job, "factor_date_count", "", float(factor_data.index.get_level_values("date").nunique())),
         _summary(job, "asset_count", "", float(factor_data.index.get_level_values("asset").nunique())),
         _summary(job, "quantiles", "", float(job.quantiles)),
+        _summary(job, "signal_lag_trading_days", "", 1.0),
     ]
     for period in forward_columns:
         series = pd.to_numeric(ic[period], errors="coerce").dropna() if period in ic else pd.Series(dtype=float)

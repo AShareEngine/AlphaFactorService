@@ -21,6 +21,24 @@
 - `POST /factor-jobs/run-pending` 批量执行 pending 任务。
 - `GET /factor-values` 查询因子结果。
 - `GET /factor-values/coverage` 查询覆盖率框架。
+- `POST /factor-values/sync-states` 批量查询因子规格的真实持久化覆盖范围，供自动全量/增量同步规划使用。
+
+聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过
+`rtk .venv/bin/python scripts/export_joinquant_factor_catalog.py` 重新生成公开目录与详情快照。
+
+当前数据源和公式引擎的逐因子兼容性检测见
+[`docs/joinquant-factor-compatibility.md`](docs/joinquant-factor-compatibility.md)，可通过
+`rtk .venv/bin/python scripts/audit_joinquant_factor_compatibility.py` 重新实测字段覆盖率并生成报告。
+
+将审计通过的 84 个聚宽因子幂等导入当前因子库：
+
+```bash
+rtk .venv/bin/python -m scripts.import_joinquant_ready_factors
+rtk .venv/bin/python -m scripts.import_joinquant_ready_factors --apply
+```
+
+第一条命令只校验；第二条才写入定义，不会自动创建计算任务或启动全历史同步。重复执行不会增加版本；只有显式追加
+`--update-existing` 才会覆盖同名但定义不同的因子并创建新版本。
 - `POST /factor-analysis/jobs` 创建 Alphalens 标准分析任务。
 - `POST /factor-analysis/jobs/{analysis_job_id}/run` 执行分析任务。
 - `GET /factor-analysis/summary` 查询 IC、分位收益、换手等汇总结果。
@@ -188,6 +206,8 @@ ab_factor.factor_analysis_turnover_daily
 - `factor_values_daily` 保存日频因子结果。
 - `factor_analysis_jobs` 保存因子评价任务。
 - `factor_analysis_*` 保存 Alphalens 生成的 IC、分位收益、换手和汇总指标。
+
+`factor_values_daily` 同时保存两套时间：`event_available_at` 是行情事件理论可用时间，`computed_at` 是因子批次实际生成时间。策略查询默认按 `computed_at` 和 DataCutoff 做严格截断；只有显式历史重建研究才按 `event_available_at` 查询。`source_vintage` 记录计算源和任务批次。Alphalens 对日频收盘因子统一延迟一个交易日后再计算 forward return，避免用当天收盘数据又假设能在当天收盘成交。
 
 后续分钟级结果可以单独增加：
 

@@ -11,6 +11,7 @@ from factor_service.worker import (
     _build_postprocessed_sql,
     _formula_params,
     _cleanup_superseded_values,
+    factor_params_hash,
     _postprocess_config,
 )
 
@@ -93,6 +94,15 @@ def test_processing_metadata_is_not_part_of_formula_params_hash_input():
     }
 
     assert _formula_params(item, {"window": 30}) == {"window": 30}
+
+
+def test_factor_params_hash_matches_effective_default_params():
+    item = factor()
+    item.param_schema = {
+        "window": {"type": "integer", "default": 20}
+    }
+
+    assert factor_params_hash(item, {}) == factor_params_hash(item, {"window": 20})
 
 
 def test_cleanup_only_removes_older_batches_in_exact_scope(monkeypatch):

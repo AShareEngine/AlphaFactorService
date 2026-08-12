@@ -125,6 +125,37 @@ def create_factor(payload: FactorCreate) -> FactorOut:
     return factor
 
 
+def ensure_factor_definition(
+    payload: FactorCreate,
+    *,
+    update_existing: bool = False,
+) -> tuple[FactorOut, str]:
+    """Create a factor definition once and avoid version churn on repeated imports."""
+    validated = _validated_factor_payload(payload)
+    current = get_factor(validated.factor_id)
+    if current is None:
+        now = datetime.now()
+        _insert_factor(validated, version=1, created_at=now, updated_at=now)
+        created = get_factor(validated.factor_id)
+        if created is None:
+            raise RuntimeError("因子创建后读取失败")
+        return created, "created"
+    if _factor_definition_matches(current, validated):
+        return current, "unchanged"
+    if not update_existing:
+        raise ValueError(f"因子已存在且定义不同: {validated.factor_id}")
+    _insert_factor(
+        validated,
+        version=current.version + 1,
+        created_at=current.created_at or datetime.now(),
+        updated_at=datetime.now(),
+    )
+    updated = get_factor(validated.factor_id)
+    if updated is None:
+        raise RuntimeError("因子更新后读取失败")
+    return updated, "updated"
+
+
 def update_factor(factor_id: str, payload: FactorUpdate) -> FactorOut:
     current = get_factor(factor_id)
     if not current:
@@ -148,6 +179,14 @@ def update_factor(factor_id: str, payload: FactorUpdate) -> FactorOut:
 
 def disable_factor(factor_id: str) -> FactorOut:
     return update_factor(factor_id, FactorUpdate(enabled=False))
+
+
+def _factor_definition_matches(current: FactorOut, desired: FactorCreate) -> bool:
+    current_payload = {
+        name: getattr(current, name)
+        for name in FactorCreate.model_fields
+    }
+    return current_payload == desired.model_dump()
 
 
 def _validated_factor_payload(payload: FactorCreate) -> FactorCreate:
@@ -689,6 +728,7 @@ def list_values(
     date_end: Optional[date] = None,
     date_end_exclusive: Optional[date] = None,
     available_before: Optional[datetime] = None,
+    event_available_before: Optional[datetime] = None,
     limit: int = 500,
     offset: int = 0,
     order_by: str = "trade_date",
@@ -708,6 +748,7 @@ def list_values(
         date_end=date_end,
         date_end_exclusive=date_end_exclusive,
         available_before=available_before,
+        event_available_before=event_available_before,
     )
     params["limit"] = max(1, min(limit, 5000))
     params["offset"] = max(0, offset)
@@ -716,7 +757,23 @@ def list_values(
     direction = "ASC" if str(order_dir).lower() == "asc" else "DESC"
     rows = client().query(
         f"""
-        SELECT *
+        SELECT
+            trade_date,
+            entity_type,
+            entity_code,
+            factor_id,
+            factor_version,
+            params_hash,
+            raw_value,
+            rank_value,
+            percentile,
+            score,
+            job_id,
+            available_at,
+            event_available_at,
+            computed_at,
+            source_vintage,
+            updated_at
         FROM {database}.factor_values_daily
         {where}
         ORDER BY {order_column} {direction}, trade_date DESC, entity_code ASC
@@ -741,6 +798,7 @@ def count_values(
     date_end: Optional[date] = None,
     date_end_exclusive: Optional[date] = None,
     available_before: Optional[datetime] = None,
+    event_available_before: Optional[datetime] = None,
 ) -> int:
     database = settings().clickhouse_database
     conditions, params = _value_conditions(
@@ -756,6 +814,7 @@ def count_values(
         date_end=date_end,
         date_end_exclusive=date_end_exclusive,
         available_before=available_before,
+        event_available_before=event_available_before,
     )
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = client().query(
@@ -826,17 +885,20 @@ def coverage(
         SELECT
             count() AS rows,
             uniqExact(entity_code) AS entity_count,
-            uniqExact(trade_date) AS trade_date_count
+            uniqExact(trade_date) AS trade_date_count,
+            min(trade_date) AS date_start,
+            max(trade_date) AS date_end
         FROM {database}.factor_values_daily
         WHERE {' AND '.join(conditions)}
         """,
         parameters=params,
     ).result_rows
-    row = rows[0] if rows else (0, 0, 0)
+    row = rows[0] if rows else (0, 0, 0, None, None)
+    has_rows = int(row[0] or 0) > 0
     return CoverageOut(
         factor_id=factor_id,
-        date_start=date_start,
-        date_end=date_end,
+        date_start=row[3] if has_rows else None,
+        date_end=row[4] if has_rows else None,
         rows=int(row[0] or 0),
         entity_count=int(row[1] or 0),
         trade_date_count=int(row[2] or 0),
@@ -971,6 +1033,7 @@ def _value_conditions(
     date_end: Optional[date] = None,
     date_end_exclusive: Optional[date] = None,
     available_before: Optional[datetime] = None,
+    event_available_before: Optional[datetime] = None,
 ) -> tuple[list[str], dict]:
     conditions = []
     params = {}
@@ -1020,6 +1083,12 @@ def _value_conditions(
         conditions.append("available_at IS NOT NULL")
         conditions.append("available_at <= {available_before:DateTime}")
         params["available_before"] = available_before
+    if event_available_before:
+        conditions.append("event_available_at IS NOT NULL")
+        conditions.append(
+            "event_available_at <= {event_available_before:DateTime}"
+        )
+        params["event_available_before"] = event_available_before
     return conditions, params
 
 
@@ -1372,7 +1441,10 @@ def _value_from_row(row) -> FactorValueOut:
         score=row[9],
         job_id=row[10],
         available_at=row[11],
-        updated_at=row[12],
+        event_available_at=row[12],
+        computed_at=row[13],
+        source_vintage=row[14],
+        updated_at=row[15],
     )
 
 

@@ -136,6 +136,9 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
     _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
     _ensure_source_has_rows(source, date_column, source_start, date_end)
     params_hash = _params_hash(factor.factor_id, factor.version, params)
+    source_vintage = (
+        f"{source_db}.{source_table}@{date_end.isoformat()}#{job.job_id}"
+    )
     base_params = {
         "date_start": date_start,
         "date_end": date_end,
@@ -145,6 +148,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         "factor_version": factor.version,
         "params_hash": params_hash,
         "job_id": job.job_id,
+        "source_vintage": source_vintage,
         "stock_type_value": config.stock_basic_stock_type_value,
     }
     sql = f"""
@@ -161,7 +165,10 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         percentile,
         score,
         job_id,
+        event_available_at,
         available_at,
+        computed_at,
+        source_vintage,
         updated_at
     )
     SELECT
@@ -177,6 +184,9 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         score,
         {{job_id:String}},
         toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR,
+        now(),
+        now(),
+        {{source_vintage:String}},
         now()
     FROM (
         {postprocessed_sql}
@@ -477,6 +487,15 @@ def _params_hash(factor_id: str, version: int, params: dict) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def factor_params_hash(factor: FactorOut, overrides: dict) -> str:
+    """Return the persisted value hash for one validated factor parameter set."""
+    return _params_hash(
+        factor.factor_id,
+        factor.version,
+        _formula_params(factor, overrides),
+    )
 
 
 def _identifier(value: str, label: str) -> str:
