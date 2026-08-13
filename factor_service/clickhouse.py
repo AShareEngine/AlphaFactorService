@@ -162,6 +162,88 @@ SCHEMA_STATEMENTS = [
     ORDER BY (analysis_job_id, period, quantile, trade_date)
     """,
     """
+    CREATE TABLE IF NOT EXISTS {database}.factor_backtest_jobs
+    (
+        backtest_job_id String,
+        factor_ids Array(String),
+        universe_id LowCardinality(String),
+        benchmark_code String,
+        date_preset LowCardinality(String),
+        requested_date_start Nullable(Date),
+        requested_date_end Nullable(Date),
+        date_start Nullable(Date),
+        date_end Nullable(Date),
+        quantiles UInt8 DEFAULT 5,
+        signal_field LowCardinality(String) DEFAULT 'score',
+        rebalance_frequency LowCardinality(String) DEFAULT 'daily',
+        execution_price LowCardinality(String) DEFAULT 'next_open_backward_adjusted',
+        buy_cost_rate Float64 DEFAULT 0.0003,
+        sell_cost_rate Float64 DEFAULT 0.0013,
+        configuration_json String DEFAULT '{{}}',
+        status LowCardinality(String),
+        error_message String,
+        completed_factors UInt32 DEFAULT 0,
+        total_factors UInt32 DEFAULT 0,
+        created_at DateTime DEFAULT now(),
+        started_at Nullable(DateTime),
+        finished_at Nullable(DateTime),
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY backtest_job_id
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {database}.factor_backtest_summary
+    (
+        backtest_job_id String,
+        factor_id String,
+        factor_version UInt32,
+        params_hash String,
+        status LowCardinality(String),
+        error_message String,
+        annual_return Nullable(Float64),
+        excess_annual_return Nullable(Float64),
+        long_short_annual_return Nullable(Float64),
+        turnover_rate Nullable(Float64),
+        ic_mean Nullable(Float64),
+        ic_ir Nullable(Float64),
+        max_drawdown Nullable(Float64),
+        trading_days UInt32 DEFAULT 0,
+        sample_days UInt32 DEFAULT 0,
+        payload_json String DEFAULT '{{}}',
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY (backtest_job_id, factor_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {database}.factor_backtest_daily
+    (
+        backtest_job_id String,
+        factor_id String,
+        trade_date Date,
+        q1_return Nullable(Float64),
+        q5_return Nullable(Float64),
+        long_short_return Nullable(Float64),
+        benchmark_return Nullable(Float64),
+        excess_return Nullable(Float64),
+        q1_nav Nullable(Float64),
+        q5_nav Nullable(Float64),
+        long_short_nav Nullable(Float64),
+        benchmark_nav Nullable(Float64),
+        turnover Nullable(Float64),
+        transaction_cost Nullable(Float64),
+        ic Nullable(Float64),
+        sample_count UInt32 DEFAULT 0,
+        blocked_buy_count UInt32 DEFAULT 0,
+        blocked_sell_count UInt32 DEFAULT 0,
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    PARTITION BY toYYYYMM(trade_date)
+    ORDER BY (backtest_job_id, factor_id, trade_date)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS {database}.factor_analysis_turnover_daily
     (
         analysis_job_id String,

@@ -16,6 +16,10 @@ from factor_service.schemas import (
     FactorAnalysisQuantileReturnOut,
     FactorAnalysisSummaryOut,
     FactorAnalysisTurnoverOut,
+    FactorBacktestDailyOut,
+    FactorBacktestJobCreate,
+    FactorBacktestJobOut,
+    FactorBacktestSummaryOut,
     CoverageOut,
     FactorCreate,
     FactorJobCreate,
@@ -26,6 +30,15 @@ from factor_service.schemas import (
     FactorValueQualityOut,
     FactorValueOut,
 )
+
+
+BACKTEST_UNIVERSES = {
+    "csi300": ("000300.SH", "000300.SH"),
+    "csi500": ("000905.SH", "000905.SH"),
+    "csi800": ("000906.SH", "000906.SH"),
+    "csi1000": ("000852.SH", "000852.SH"),
+    "all_a": ("000985.SH", "000985.SH"),
+}
 
 
 def list_factors(
@@ -713,6 +726,230 @@ def list_analysis_turnover(
         parameters=params,
     ).result_rows
     return [_analysis_turnover_from_row(row) for row in rows]
+
+
+def create_factor_backtest_job(payload: FactorBacktestJobCreate) -> FactorBacktestJobOut:
+    factor_ids = sorted({str(item).strip() for item in payload.factor_ids if str(item).strip()})
+    if not factor_ids:
+        raise ValueError("至少选择一个因子")
+    missing = [factor_id for factor_id in factor_ids if get_factor(factor_id) is None]
+    if missing:
+        raise ValueError("因子不存在: " + ", ".join(missing))
+    if payload.universe_id not in BACKTEST_UNIVERSES:
+        raise ValueError(f"不支持的股票池: {payload.universe_id}")
+    if payload.date_preset == "custom":
+        if payload.date_start is None or payload.date_end is None:
+            raise ValueError("自定义回测必须提供开始和结束日期")
+        if payload.date_start >= payload.date_end:
+            raise ValueError("开始日期必须早于结束日期")
+    benchmark_code = BACKTEST_UNIVERSES[payload.universe_id][1]
+    backtest_job_id = f"factor_backtest_{uuid4().hex}"
+    now = datetime.now()
+    configuration = {
+        "signal_time": "trade_date_close",
+        "execution_time": "next_trade_date_open",
+        "return_horizon": "next_open_to_following_open",
+        "factor_direction": "q5_minus_q1",
+        "group_weighting": "equal",
+        "minimum_sample_count": 25,
+        "exclude_st": True,
+        "minimum_listing_trading_days": 60,
+        "exclude_delisting": True,
+        "exclude_bse": True,
+        "keep_star_and_chinext": True,
+        "blocked_trades_are_carried": True,
+        "availability_mode": "reconstructed",
+        "data_cutoff": now.isoformat(),
+    }
+    database = settings().clickhouse_database
+    row = [
+        backtest_job_id, factor_ids, payload.universe_id, benchmark_code,
+        payload.date_preset, payload.date_start, payload.date_end,
+        None, None, 5, "score", "daily", "next_open_backward_adjusted",
+        0.0003, 0.0013,
+        json.dumps(configuration, ensure_ascii=False, sort_keys=True),
+        "pending", "", 0, len(factor_ids), now, None, None, now,
+    ]
+    client().insert(
+        f"{database}.factor_backtest_jobs",
+        [row],
+        column_names=[
+            "backtest_job_id", "factor_ids", "universe_id", "benchmark_code",
+            "date_preset", "requested_date_start", "requested_date_end",
+            "date_start", "date_end", "quantiles", "signal_field",
+            "rebalance_frequency", "execution_price", "buy_cost_rate",
+            "sell_cost_rate", "configuration_json", "status", "error_message",
+            "completed_factors", "total_factors", "created_at", "started_at",
+            "finished_at", "updated_at",
+        ],
+    )
+    job = get_factor_backtest_job(backtest_job_id)
+    if job is None:
+        raise RuntimeError("因子回测任务创建后读取失败")
+    return job
+
+
+def list_factor_backtest_jobs(
+    *, status: Optional[str] = None, limit: int = 100,
+) -> list[FactorBacktestJobOut]:
+    database = settings().clickhouse_database
+    where = "WHERE status = {status:String}" if status else ""
+    params = {"limit": max(1, min(limit, 500))}
+    if status:
+        params["status"] = status
+    rows = client().query(
+        f"""
+        SELECT * FROM {database}.factor_backtest_jobs FINAL
+        {where}
+        ORDER BY created_at DESC
+        LIMIT {{limit:UInt32}}
+        """,
+        parameters=params,
+    ).result_rows
+    return [_factor_backtest_job_from_row(row) for row in rows]
+
+
+def get_factor_backtest_job(backtest_job_id: str) -> Optional[FactorBacktestJobOut]:
+    database = settings().clickhouse_database
+    rows = client().query(
+        f"""
+        SELECT * FROM {database}.factor_backtest_jobs FINAL
+        WHERE backtest_job_id = {{backtest_job_id:String}}
+        LIMIT 1
+        """,
+        parameters={"backtest_job_id": backtest_job_id},
+    ).result_rows
+    return _factor_backtest_job_from_row(rows[0]) if rows else None
+
+
+def update_factor_backtest_job(
+    backtest_job_id: str,
+    *,
+    status: Optional[str] = None,
+    error_message: Optional[str] = None,
+    completed_factors: Optional[int] = None,
+    date_start: Optional[date] = None,
+    date_end: Optional[date] = None,
+    started_at: Optional[datetime] = None,
+    finished_at: Optional[datetime] = None,
+) -> FactorBacktestJobOut:
+    current = get_factor_backtest_job(backtest_job_id)
+    if current is None:
+        raise ValueError("因子回测任务不存在")
+    now = datetime.now()
+    row = [
+        current.backtest_job_id, current.factor_ids, current.universe_id,
+        current.benchmark_code, current.date_preset,
+        current.requested_date_start, current.requested_date_end,
+        date_start if date_start is not None else current.date_start,
+        date_end if date_end is not None else current.date_end,
+        current.quantiles, current.signal_field, current.rebalance_frequency,
+        current.execution_price, current.buy_cost_rate, current.sell_cost_rate,
+        json.dumps(current.configuration, ensure_ascii=False, sort_keys=True),
+        status or current.status,
+        current.error_message if error_message is None else error_message,
+        current.completed_factors if completed_factors is None else completed_factors,
+        current.total_factors, current.created_at or now,
+        started_at if started_at is not None else current.started_at,
+        finished_at if finished_at is not None else current.finished_at,
+        now,
+    ]
+    database = settings().clickhouse_database
+    client().insert(
+        f"{database}.factor_backtest_jobs", [row],
+        column_names=[
+            "backtest_job_id", "factor_ids", "universe_id", "benchmark_code",
+            "date_preset", "requested_date_start", "requested_date_end",
+            "date_start", "date_end", "quantiles", "signal_field",
+            "rebalance_frequency", "execution_price", "buy_cost_rate",
+            "sell_cost_rate", "configuration_json", "status", "error_message",
+            "completed_factors", "total_factors", "created_at", "started_at",
+            "finished_at", "updated_at",
+        ],
+    )
+    updated = get_factor_backtest_job(backtest_job_id)
+    if updated is None:
+        raise RuntimeError("因子回测任务更新后读取失败")
+    return updated
+
+
+def replace_factor_backtest_factor_results(
+    backtest_job_id: str,
+    factor_id: str,
+    *, summary_row: tuple,
+    daily_rows: list[tuple],
+) -> None:
+    database = settings().clickhouse_database
+    params = {"backtest_job_id": backtest_job_id, "factor_id": factor_id}
+    for table in ("factor_backtest_summary", "factor_backtest_daily"):
+        client().command(
+            f"""
+            ALTER TABLE {database}.{table} DELETE
+            WHERE backtest_job_id = {{backtest_job_id:String}}
+              AND factor_id = {{factor_id:String}}
+            SETTINGS mutations_sync = 2
+            """,
+            parameters=params,
+        )
+    now = datetime.now()
+    client().insert(
+        f"{database}.factor_backtest_summary",
+        [list(summary_row) + [now]],
+        column_names=[
+            "backtest_job_id", "factor_id", "factor_version", "params_hash",
+            "status", "error_message", "annual_return", "excess_annual_return",
+            "long_short_annual_return", "turnover_rate", "ic_mean", "ic_ir",
+            "max_drawdown", "trading_days", "sample_days", "payload_json",
+            "updated_at",
+        ],
+    )
+    if daily_rows:
+        client().insert(
+            f"{database}.factor_backtest_daily",
+            [list(row) + [now] for row in daily_rows],
+            column_names=[
+                "backtest_job_id", "factor_id", "trade_date", "q1_return",
+                "q5_return", "long_short_return", "benchmark_return",
+                "excess_return", "q1_nav", "q5_nav", "long_short_nav",
+                "benchmark_nav", "turnover", "transaction_cost", "ic",
+                "sample_count", "blocked_buy_count", "blocked_sell_count",
+                "updated_at",
+            ],
+        )
+
+
+def list_factor_backtest_summary(backtest_job_id: str) -> list[FactorBacktestSummaryOut]:
+    database = settings().clickhouse_database
+    rows = client().query(
+        f"""
+        SELECT * FROM {database}.factor_backtest_summary FINAL
+        WHERE backtest_job_id = {{backtest_job_id:String}}
+        ORDER BY status ASC, annual_return DESC NULLS LAST, factor_id ASC
+        """,
+        parameters={"backtest_job_id": backtest_job_id},
+    ).result_rows
+    return [_factor_backtest_summary_from_row(row) for row in rows]
+
+
+def list_factor_backtest_daily(
+    backtest_job_id: str, factor_id: str, limit: int = 5000,
+) -> list[FactorBacktestDailyOut]:
+    database = settings().clickhouse_database
+    rows = client().query(
+        f"""
+        SELECT * FROM {database}.factor_backtest_daily FINAL
+        WHERE backtest_job_id = {{backtest_job_id:String}}
+          AND factor_id = {{factor_id:String}}
+        ORDER BY trade_date ASC
+        LIMIT {{limit:UInt32}}
+        """,
+        parameters={
+            "backtest_job_id": backtest_job_id,
+            "factor_id": factor_id,
+            "limit": max(1, min(limit, 20000)),
+        },
+    ).result_rows
+    return [_factor_backtest_daily_from_row(row) for row in rows]
 
 
 def list_values(
@@ -1469,6 +1706,43 @@ def _analysis_job_from_row(row) -> FactorAnalysisJobOut:
         started_at=row[16],
         finished_at=row[17],
         updated_at=row[18],
+    )
+
+
+def _factor_backtest_job_from_row(row) -> FactorBacktestJobOut:
+    return FactorBacktestJobOut(
+        backtest_job_id=row[0], factor_ids=list(row[1]), universe_id=row[2],
+        benchmark_code=row[3], date_preset=row[4], requested_date_start=row[5],
+        requested_date_end=row[6], date_start=row[7], date_end=row[8],
+        quantiles=int(row[9]), signal_field=row[10], rebalance_frequency=row[11],
+        execution_price=row[12], buy_cost_rate=float(row[13]),
+        sell_cost_rate=float(row[14]), configuration=_json_dict(row[15]),
+        status=row[16], error_message=row[17], completed_factors=int(row[18]),
+        total_factors=int(row[19]), created_at=row[20], started_at=row[21],
+        finished_at=row[22], updated_at=row[23],
+    )
+
+
+def _factor_backtest_summary_from_row(row) -> FactorBacktestSummaryOut:
+    return FactorBacktestSummaryOut(
+        backtest_job_id=row[0], factor_id=row[1], factor_version=int(row[2]),
+        params_hash=row[3], status=row[4], error_message=row[5],
+        annual_return=row[6], excess_annual_return=row[7],
+        long_short_annual_return=row[8], turnover_rate=row[9], ic_mean=row[10],
+        ic_ir=row[11], max_drawdown=row[12], trading_days=int(row[13]),
+        sample_days=int(row[14]), payload=_json_dict(row[15]), updated_at=row[16],
+    )
+
+
+def _factor_backtest_daily_from_row(row) -> FactorBacktestDailyOut:
+    return FactorBacktestDailyOut(
+        backtest_job_id=row[0], factor_id=row[1], trade_date=row[2],
+        q1_return=row[3], q5_return=row[4], long_short_return=row[5],
+        benchmark_return=row[6], excess_return=row[7], q1_nav=row[8],
+        q5_nav=row[9], long_short_nav=row[10], benchmark_nav=row[11],
+        turnover=row[12], transaction_cost=row[13], ic=row[14],
+        sample_count=int(row[15]), blocked_buy_count=int(row[16]),
+        blocked_sell_count=int(row[17]), updated_at=row[18],
     )
 
 

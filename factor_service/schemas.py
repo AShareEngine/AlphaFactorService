@@ -11,6 +11,7 @@ Frequency = Literal["daily", "minute"]
 JobMode = Literal["incremental", "backfill", "recompute"]
 JobStatus = Literal["pending", "running", "success", "failed", "cancelled"]
 AnalysisStatus = Literal["pending", "running", "success", "failed", "cancelled"]
+BacktestStatus = Literal["pending", "running", "success", "failed", "cancelled"]
 
 
 class FactorBase(BaseModel):
@@ -260,4 +261,81 @@ class FactorAnalysisTurnoverOut(BaseModel):
     quantile: int
     turnover: Optional[float] = None
     rank_autocorrelation: Optional[float] = None
+    updated_at: Optional[datetime] = None
+
+
+class FactorBacktestJobCreate(BaseModel):
+    factor_ids: list[str] = Field(min_length=1, max_length=100)
+    universe_id: str = "csi500"
+    date_preset: Literal["3m", "1y", "3y", "10y", "custom"] = "3y"
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+
+
+class FactorBacktestJobOut(BaseModel):
+    backtest_job_id: str
+    factor_ids: list[str] = Field(default_factory=list)
+    universe_id: str
+    benchmark_code: str
+    date_preset: str
+    requested_date_start: Optional[date] = None
+    requested_date_end: Optional[date] = None
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    quantiles: int = 5
+    signal_field: str = "score"
+    rebalance_frequency: str = "daily"
+    execution_price: str = "next_open_backward_adjusted"
+    buy_cost_rate: float = 0.0003
+    sell_cost_rate: float = 0.0013
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    status: BacktestStatus
+    error_message: str = ""
+    completed_factors: int = 0
+    total_factors: int = 0
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class FactorBacktestSummaryOut(BaseModel):
+    backtest_job_id: str
+    factor_id: str
+    factor_version: int
+    params_hash: str = ""
+    status: str
+    error_message: str = ""
+    annual_return: Optional[float] = None
+    excess_annual_return: Optional[float] = None
+    long_short_annual_return: Optional[float] = None
+    turnover_rate: Optional[float] = None
+    ic_mean: Optional[float] = None
+    ic_ir: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    trading_days: int = 0
+    sample_days: int = 0
+    payload: dict[str, Any] = Field(default_factory=dict)
+    updated_at: Optional[datetime] = None
+
+
+class FactorBacktestDailyOut(BaseModel):
+    backtest_job_id: str
+    factor_id: str
+    trade_date: date
+    q1_return: Optional[float] = None
+    q5_return: Optional[float] = None
+    long_short_return: Optional[float] = None
+    benchmark_return: Optional[float] = None
+    excess_return: Optional[float] = None
+    q1_nav: Optional[float] = None
+    q5_nav: Optional[float] = None
+    long_short_nav: Optional[float] = None
+    benchmark_nav: Optional[float] = None
+    turnover: Optional[float] = None
+    transaction_cost: Optional[float] = None
+    ic: Optional[float] = None
+    sample_count: int = 0
+    blocked_buy_count: int = 0
+    blocked_sell_count: int = 0
     updated_at: Optional[datetime] = None

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from factor_service import __version__
 from factor_service.api.analysis import router as analysis_router
+from factor_service.api.backtests import router as backtests_router
 from factor_service.api.factors import router as factors_router
 from factor_service.api.formulas import router as formulas_router
 from factor_service.api.jobs import router as jobs_router
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(formulas_router)
     app.include_router(jobs_router)
     app.include_router(analysis_router)
+    app.include_router(backtests_router)
     app.include_router(metadata_router)
     app.include_router(values_router)
     return app
