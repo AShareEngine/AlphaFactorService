@@ -90,7 +90,9 @@ def run_factor_backtest_job(backtest_job_id: str) -> FactorBacktestJobOut:
             )
         message = f"{failed} 个因子回测失败" if failed else ""
         return repository.update_factor_backtest_job(
-            job.backtest_job_id, status="success", error_message=message,
+            job.backtest_job_id,
+            status="failed" if failed == completed else "success",
+            error_message=message,
             completed_factors=completed, finished_at=datetime.now(),
         )
     except Exception as exc:
@@ -107,21 +109,13 @@ def resolve_backtest_range(job: FactorBacktestJobOut) -> tuple[date, date]:
             raise ValueError("自定义回测缺少日期范围")
         requested_start = job.requested_date_start
         requested_end = job.requested_date_end
+        end = min(requested_end, _common_latest_date(job))
     else:
         requested_end = _common_latest_date(job)
         offsets = {"3m": pd.DateOffset(months=3), "1y": pd.DateOffset(years=1),
                    "3y": pd.DateOffset(years=3), "10y": pd.DateOffset(years=10)}
         requested_start = (pd.Timestamp(requested_end) - offsets[job.date_preset]).date()
-    database = settings().clickhouse_database
-    factor_latest = client().query(
-        f"""
-        SELECT max(trade_date)
-        FROM {database}.factor_values_daily
-        WHERE factor_id IN {{factor_ids:Array(String)}} AND score IS NOT NULL
-        """,
-        parameters={"factor_ids": job.factor_ids},
-    ).result_rows[0][0]
-    end = min(item for item in (requested_end, factor_latest) if item is not None)
+        end = requested_end
     if requested_start >= end:
         raise ValueError("所选时间范围没有足够的共同数据")
     return requested_start, end
@@ -130,8 +124,15 @@ def resolve_backtest_range(job: FactorBacktestJobOut) -> tuple[date, date]:
 def _common_latest_date(job: FactorBacktestJobOut) -> date:
     database = settings().clickhouse_database
     factor_latest = client().query(
-        f"SELECT max(trade_date) FROM {database}.factor_values_daily "
-        "WHERE factor_id IN {factor_ids:Array(String)} AND score IS NOT NULL",
+        f"""
+        SELECT min(latest_date)
+        FROM (
+            SELECT factor_id, max(trade_date) AS latest_date
+            FROM {database}.factor_values_daily
+            WHERE factor_id IN {{factor_ids:Array(String)}} AND score IS NOT NULL
+            GROUP BY factor_id
+        )
+        """,
         parameters={"factor_ids": job.factor_ids},
     ).result_rows[0][0]
     market_latest = client().query(
@@ -220,15 +221,17 @@ def _resolve_signal_revision(
 ) -> tuple[int, str]:
     database = settings().clickhouse_database
     cutoff = datetime.fromisoformat(str(job.configuration.get("data_cutoff")))
+    universe_filter = _signal_universe_filter(job)
     rows = client().query(
         f"""
         SELECT factor_version, params_hash
         FROM {database}.factor_values_daily
         WHERE factor_id = {{factor_id:String}}
-          AND trade_date >= {{date_start:Date}} - INTERVAL 7 DAY
-          AND trade_date <= {{date_end:Date}}
+          AND greatest(trade_date, toDate(event_available_at)) >= {{date_start:Date}} - INTERVAL 7 DAY
+          AND greatest(trade_date, toDate(event_available_at)) <= {{date_end:Date}}
           AND computed_at <= {{cutoff:DateTime}}
           AND score IS NOT NULL
+          {universe_filter}
         GROUP BY factor_version, params_hash
         ORDER BY factor_version DESC, max(computed_at) DESC, max(updated_at) DESC
         LIMIT 1
@@ -250,11 +253,12 @@ def _load_signals(
 ) -> pd.DataFrame:
     database = settings().clickhouse_database
     cutoff = datetime.fromisoformat(str(job.configuration.get("data_cutoff")))
+    universe_filter = _signal_universe_filter(job)
     rows = client().query(
         f"""
-        SELECT trade_date, entity_code, score
+        SELECT trade_date, entity_code, score, event_available_at
         FROM (
-            SELECT trade_date, entity_code, score,
+            SELECT trade_date, entity_code, score, event_available_at,
                    row_number() OVER (
                        PARTITION BY trade_date, entity_code
                        ORDER BY computed_at DESC, updated_at DESC
@@ -263,10 +267,11 @@ def _load_signals(
             WHERE factor_id = {{factor_id:String}}
               AND factor_version = {{version:UInt32}}
               AND params_hash = {{params_hash:String}}
-              AND trade_date >= {{date_start:Date}} - INTERVAL 7 DAY
-              AND trade_date <= {{date_end:Date}}
+              AND greatest(trade_date, toDate(event_available_at)) >= {{date_start:Date}} - INTERVAL 7 DAY
+              AND greatest(trade_date, toDate(event_available_at)) <= {{date_end:Date}}
               AND computed_at <= {{cutoff:DateTime}}
               AND score IS NOT NULL
+              {universe_filter}
         ) WHERE rn = 1
         ORDER BY trade_date, entity_code
         """,
@@ -275,12 +280,41 @@ def _load_signals(
             "date_start": job.date_start, "date_end": job.date_end, "cutoff": cutoff,
         },
     ).result_rows
-    frame = pd.DataFrame(rows, columns=["signal_date", "code", "score"])
-    if not frame.empty:
-        frame["signal_date"] = pd.to_datetime(frame["signal_date"])
-        frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
-        frame.dropna(subset=["score"], inplace=True)
-    return frame
+    frame = pd.DataFrame(
+        rows, columns=["source_trade_date", "code", "score", "event_available_at"],
+    )
+    return _normalize_signal_dates(frame)
+
+
+def _normalize_signal_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["signal_date", "code", "score"])
+    result = frame.copy()
+    result["source_trade_date"] = pd.to_datetime(result["source_trade_date"])
+    result["event_available_at"] = pd.to_datetime(result["event_available_at"])
+    result["event_date"] = result["event_available_at"].dt.tz_localize(None).dt.normalize()
+    result["signal_date"] = result[["source_trade_date", "event_date"]].max(axis=1)
+    result["score"] = pd.to_numeric(result["score"], errors="coerce")
+    result.dropna(subset=["score", "signal_date"], inplace=True)
+    result.sort_values(["signal_date", "source_trade_date", "code"], inplace=True)
+    return result[["signal_date", "code", "score"]].drop_duplicates(
+        ["signal_date", "code"], keep="last",
+    )
+
+
+def _signal_universe_filter(job: FactorBacktestJobOut) -> str:
+    if job.universe_id == "all_a":
+        return ""
+    index_code = UNIVERSES[job.universe_id]["index_code"].replace("'", "''")
+    return f"""
+        AND entity_code IN (
+            SELECT DISTINCT con_code
+            FROM starlight.ad_index_constituent
+            WHERE index_code = '{index_code}'
+              AND in_date <= {{date_end:Date}}
+              AND (out_date IS NULL OR out_date >= {{date_start:Date}})
+        )
+    """
 
 
 def _load_benchmark(job: FactorBacktestJobOut) -> tuple[pd.DatetimeIndex, pd.Series]:
@@ -374,6 +408,7 @@ def _load_market(
             k.open * ifNull(a.backward_adj_factor, 1.0) AS adjusted_open,
             toUInt8(ifNull(s.is_st_sec, '') IN ('1','true','True')) AS is_st,
             toUInt8(ifNull(s.is_susp_sec, '') IN ('1','true','True')) AS is_suspended,
+            toUInt8(ifNull(s.is_wd_sec, '') IN ('1','true','True')) AS is_withdrawal,
             s.high_limited,
             s.low_limited
         FROM starlight.ad_market_kline_daily k
@@ -395,7 +430,7 @@ def _load_market(
     ).result_rows
     frame = pd.DataFrame(rows, columns=[
         "date", "code", "open", "adjusted_open", "is_st", "is_suspended",
-        "high_limit", "low_limit",
+        "is_withdrawal", "high_limit", "low_limit",
     ])
     if frame.empty:
         return frame
@@ -426,6 +461,7 @@ def _load_market(
                 "buy_allowed": bool(state["buy_allowed"]) if state is not None else False,
                 "sell_allowed": bool(state["sell_allowed"]) if state is not None else False,
                 "is_st": int(state["is_st"]) if state is not None else 0,
+                "is_withdrawal": int(state["is_withdrawal"]) if state is not None else 0,
             })
     return pd.DataFrame(result_rows)
 
@@ -449,7 +485,7 @@ def _build_targets(
             if key not in state_lookup.index:
                 continue
             state = state_lookup.loc[key]
-            if int(state["is_st"]) == 1:
+            if int(state["is_st"]) == 1 or int(state["is_withdrawal"]) == 1:
                 continue
             eligible.append((str(row.code), float(row.score), float(state["forward_return"])))
         if len(eligible) < 25:
@@ -462,7 +498,8 @@ def _build_targets(
         q5[execution_date] = {code: 1.0 / len(high) for code, _, _ in high}
         score_series = pd.Series([item[1] for item in ordered])
         return_series = pd.Series([item[2] for item in ordered])
-        ic[execution_date] = float(score_series.corr(return_series, method="spearman"))
+        if score_series.nunique() > 1 and return_series.nunique() > 1:
+            ic[execution_date] = float(score_series.corr(return_series, method="spearman"))
         counts[execution_date] = len(ordered)
     return q1, q5, ic, counts
 
@@ -479,8 +516,10 @@ def _simulate_quantile_portfolio(
     cash = 1.0
     results: dict[pd.Timestamp, PortfolioDay] = {}
     for trade_date in calendar[:-1]:
-        target = targets.get(trade_date, {})
+        target = targets.get(trade_date)
         old = dict(weights)
+        if target is None:
+            target = old
         next_weights: dict[str, float] = {}
         blocked_sells = 0
         for code, old_weight in sorted(old.items()):

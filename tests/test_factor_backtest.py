@@ -7,6 +7,7 @@ from factor_service.factor_backtest import (
     _annualized_return,
     _build_targets,
     _max_drawdown,
+    _normalize_signal_dates,
     _simulate_quantile_portfolio,
 )
 
@@ -22,6 +23,7 @@ def _market(calendar: pd.DatetimeIndex, codes: list[str]) -> pd.DataFrame:
                 "buy_allowed": True,
                 "sell_allowed": True,
                 "is_st": 0,
+                "is_withdrawal": 0,
             })
     return pd.DataFrame(rows)
 
@@ -46,6 +48,21 @@ def test_close_signal_is_executed_on_next_trading_day():
     assert counts[execution_date] == 25
 
 
+def test_event_availability_delays_the_signal_date_without_lookahead():
+    frame = pd.DataFrame([
+        {
+            "source_trade_date": "2024-01-05",
+            "code": "000001.SZ",
+            "score": 1.2,
+            "event_available_at": "2024-01-08 18:00:00+08:00",
+        },
+    ])
+
+    normalized = _normalize_signal_dates(frame)
+
+    assert normalized.iloc[0]["signal_date"] == pd.Timestamp("2024-01-08")
+
+
 def test_blocked_buy_stays_cash_and_is_reported():
     calendar = pd.DatetimeIndex(["2024-01-08", "2024-01-09"])
     market = pd.DataFrame([
@@ -56,6 +73,7 @@ def test_blocked_buy_stays_cash_and_is_reported():
             "buy_allowed": False,
             "sell_allowed": True,
             "is_st": 0,
+            "is_withdrawal": 0,
         },
     ])
 
@@ -82,6 +100,7 @@ def test_actual_buy_weight_is_charged_buy_cost():
             "buy_allowed": True,
             "sell_allowed": True,
             "is_st": 0,
+            "is_withdrawal": 0,
         },
     ])
 
@@ -95,6 +114,34 @@ def test_actual_buy_weight_is_charged_buy_cost():
 
     assert result.cost == pytest.approx(0.0003)
     assert result.net_return == pytest.approx(0.0097)
+
+
+def test_missing_signal_day_keeps_existing_portfolio_instead_of_liquidating():
+    calendar = pd.DatetimeIndex(["2024-01-08", "2024-01-09", "2024-01-10"])
+    market = pd.DataFrame([
+        {
+            "date": trade_date,
+            "code": "000001.SZ",
+            "forward_return": 0.01,
+            "buy_allowed": True,
+            "sell_allowed": True,
+            "is_st": 0,
+            "is_withdrawal": 0,
+        }
+        for trade_date in calendar[:-1]
+    ])
+
+    result = _simulate_quantile_portfolio(
+        {pd.Timestamp("2024-01-08"): {"000001.SZ": 1.0}},
+        market,
+        calendar,
+        buy_cost_rate=0.0003,
+        sell_cost_rate=0.0013,
+    )
+
+    assert result[pd.Timestamp("2024-01-08")].cost == pytest.approx(0.0003)
+    assert result[pd.Timestamp("2024-01-09")].cost == pytest.approx(0.0)
+    assert result[pd.Timestamp("2024-01-09")].net_return == pytest.approx(0.01)
 
 
 def test_summary_math_uses_trading_day_annualization_and_negative_drawdown():
