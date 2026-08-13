@@ -270,6 +270,11 @@ class FactorBacktestJobCreate(BaseModel):
     date_preset: Literal["3m", "1y", "3y", "10y", "custom"] = "3y"
     date_start: Optional[date] = None
     date_end: Optional[date] = None
+    exclude_limit_paused: bool = True
+    exclude_st: bool = False
+    exclude_new_stocks: bool = False
+    exclude_delisting: bool = False
+    exclude_bse: bool = False
 
 
 class FactorBacktestJobOut(BaseModel):
@@ -338,4 +343,92 @@ class FactorBacktestDailyOut(BaseModel):
     sample_count: int = 0
     blocked_buy_count: int = 0
     blocked_sell_count: int = 0
+    updated_at: Optional[datetime] = None
+
+
+class ModelPredictionIn(BaseModel):
+    trade_date: date
+    entity_code: str = Field(min_length=1)
+    raw_prediction: float
+    rank_value: int = Field(ge=1)
+    percentile: float = Field(ge=0, le=1)
+    score: float = Field(ge=-1, le=1)
+    feature_cutoff_at: datetime
+    computed_at: datetime
+    source_vintage: str = Field(min_length=1)
+
+
+class ModelPredictionBatchIn(BaseModel):
+    model_id: str = Field(min_length=1)
+    model_version: int = Field(ge=1)
+    dataset_hash: str = Field(min_length=16)
+    inference_run_id: str = Field(min_length=1)
+    rows: list[ModelPredictionIn] = Field(min_length=1, max_length=100_000)
+
+
+class ModelPredictionOut(ModelPredictionIn):
+    entity_type: str = "stock"
+    model_id: str
+    model_version: int
+    dataset_hash: str
+    inference_run_id: str
+
+
+class ModelBacktestJobCreate(BaseModel):
+    model_id: str = Field(min_length=1)
+    model_version: int = Field(ge=1)
+    universe_id: str = "csi500"
+    date_preset: Literal["3m", "1y", "3y", "10y", "custom"] = "3y"
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    top_n: int = Field(default=20, ge=1, le=500)
+    rebalance_every: int = Field(default=5, ge=1, le=60)
+
+
+class ModelBacktestJobOut(BaseModel):
+    backtest_job_id: str
+    model_id: str
+    model_version: int
+    universe_id: str
+    benchmark_code: str
+    date_preset: str
+    requested_date_start: Optional[date] = None
+    requested_date_end: Optional[date] = None
+    date_start: Optional[date] = None
+    date_end: Optional[date] = None
+    top_n: int = 20
+    rebalance_every: int = 5
+    buy_cost_rate: float = 0.0003
+    sell_cost_rate: float = 0.0013
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    status: BacktestStatus
+    error_message: str = ""
+    annual_return: Optional[float] = None
+    excess_annual_return: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    turnover_rate: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    trading_days: int = 0
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ModelBacktestDailyOut(BaseModel):
+    backtest_job_id: str
+    trade_date: date
+    portfolio_return: Optional[float] = None
+    benchmark_return: Optional[float] = None
+    excess_return: Optional[float] = None
+    portfolio_nav: Optional[float] = None
+    benchmark_nav: Optional[float] = None
+    turnover: Optional[float] = None
+    transaction_cost: Optional[float] = None
+    sample_count: int = 0
+    holding_count: int = 0
+    blocked_buy_count: int = 0
+    blocked_sell_count: int = 0
+    holdings: list[str] = Field(default_factory=list)
     updated_at: Optional[datetime] = None

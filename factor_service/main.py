@@ -11,6 +11,7 @@ from factor_service.api.factors import router as factors_router
 from factor_service.api.formulas import router as formulas_router
 from factor_service.api.jobs import router as jobs_router
 from factor_service.api.metadata import router as metadata_router
+from factor_service.api.models import router as models_router
 from factor_service.api.values import router as values_router
 from factor_service.clickhouse import init_schema, settings
 
@@ -44,6 +45,7 @@ def create_app() -> FastAPI:
     app.include_router(analysis_router)
     app.include_router(backtests_router)
     app.include_router(metadata_router)
+    app.include_router(models_router)
     app.include_router(values_router)
     return app
 

@@ -8,6 +8,7 @@ from factor_service.factor_backtest import (
     _build_targets,
     _max_drawdown,
     _normalize_signal_dates,
+    _sample_filters,
     _simulate_quantile_portfolio,
 )
 
@@ -46,6 +47,67 @@ def test_close_signal_is_executed_on_next_trading_day():
     assert set(q5[execution_date]) == set(codes[-5:])
     assert ic[execution_date] == pytest.approx(1.0)
     assert counts[execution_date] == 25
+
+
+def test_sample_filters_default_to_joinquant_style_tradeability_only():
+    filters = _sample_filters({})
+
+    assert filters == {
+        "exclude_limit_paused": True,
+        "exclude_st": False,
+        "exclude_new_stocks": False,
+        "exclude_delisting": False,
+        "exclude_bse": False,
+        "minimum_listing_trading_days": 60,
+    }
+
+
+def test_legacy_job_keeps_original_mandatory_sample_filters():
+    filters = _sample_filters({
+        "exclude_st": True,
+        "minimum_listing_trading_days": 60,
+        "exclude_delisting": True,
+        "exclude_bse": True,
+        "blocked_trades_are_carried": True,
+    })
+
+    assert filters["exclude_limit_paused"] is False
+    assert filters["exclude_new_stocks"] is True
+    assert filters["exclude_st"] is True
+    assert filters["exclude_delisting"] is True
+    assert filters["exclude_bse"] is True
+
+
+def test_target_building_respects_optional_st_and_tradeability_filters():
+    calendar = pd.DatetimeIndex(["2024-01-05", "2024-01-08", "2024-01-09"])
+    codes = [f"{index:06d}.SZ" for index in range(30)]
+    signals = pd.DataFrame({
+        "signal_date": pd.Timestamp("2024-01-05"),
+        "code": codes,
+        "score": list(range(30)),
+    })
+    market = _market(calendar, codes)
+    market.loc[market["code"] == codes[0], "is_st"] = 1
+    market.loc[market["code"] == codes[1], "buy_allowed"] = False
+
+    *_, default_counts = _build_targets(signals, market, calendar)
+    *_, enhanced_counts = _build_targets(
+        signals,
+        market,
+        calendar,
+        {"exclude_limit_paused": False, "exclude_st": True},
+    )
+    *_, unfiltered_counts = _build_targets(
+        signals,
+        market,
+        calendar,
+        {"exclude_limit_paused": False, "exclude_st": False},
+    )
+
+    execution_date = pd.Timestamp("2024-01-08")
+    assert default_counts[execution_date] == 29
+    assert enhanced_counts[execution_date] == 29
+    assert unfiltered_counts[execution_date] == 30
 
 
 def test_event_availability_delays_the_signal_date_without_lookahead():
@@ -114,6 +176,7 @@ def test_actual_buy_weight_is_charged_buy_cost():
 
     assert result.cost == pytest.approx(0.0003)
     assert result.net_return == pytest.approx(0.0097)
+    assert result.holdings == ("000001.SZ",)
 
 
 def test_missing_signal_day_keeps_existing_portfolio_instead_of_liquidating():

@@ -28,6 +28,7 @@ class Settings:
     stock_basic_table: str
     stock_basic_type_column: str
     stock_basic_stock_type_value: str
+    model_database: str
 
 
 def load_settings() -> Settings:
@@ -54,6 +55,7 @@ def load_settings() -> Settings:
         stock_basic_table=_env("AB_FACTOR_STOCK_BASIC_TABLE", "bs_stock_basic"),
         stock_basic_type_column=_env("AB_FACTOR_STOCK_BASIC_TYPE_COLUMN", "type"),
         stock_basic_stock_type_value=_env("AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE", "1"),
+        model_database=_env("AB_MODEL_CLICKHOUSE_DATABASE", "ab_model"),
     )
 
 

@@ -24,6 +24,15 @@ UNIVERSES = {
     "all_a": {"index_code": "000985.SH", "benchmark": "000985.SH"},
 }
 
+DEFAULT_SAMPLE_FILTERS = {
+    "exclude_limit_paused": True,
+    "exclude_st": False,
+    "exclude_new_stocks": False,
+    "exclude_delisting": False,
+    "exclude_bse": False,
+    "minimum_listing_trading_days": 60,
+}
+
 
 @dataclass(frozen=True)
 class PortfolioDay:
@@ -33,6 +42,7 @@ class PortfolioDay:
     cost: float
     blocked_buy_count: int
     blocked_sell_count: int
+    holdings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,7 +174,7 @@ def build_factor_backtest_result(
     if market.empty:
         raise ValueError("缺少股票开盘价和交易状态")
     targets_q1, targets_q5, ic_by_date, sample_counts = _build_targets(
-        signals, market, calendar,
+        signals, market, calendar, job.configuration,
     )
     q1 = _simulate_quantile_portfolio(
         targets_q1, market, calendar, job.buy_cost_rate, job.sell_cost_rate,
@@ -189,6 +199,7 @@ def build_factor_backtest_result(
         "signal_lag_trading_days": 1,
         "execution_price": job.execution_price,
         "source_vintage": "factor_values_as_of_job_creation",
+        "sample_filters": _sample_filters(job.configuration),
     }
     summary = (
         job.backtest_job_id, factor_id, factor.version, params_hash, "success", "",
@@ -366,16 +377,27 @@ def _apply_universe_and_sample_filters(
             (result["signal_date"] >= result["in_date"])
             & (result["signal_date"] <= result["out_date"])
         ].drop(columns=["in_date", "out_date"])
-    basics = _load_stock_basic(sorted(set(result["code"])))
-    result = result.merge(basics, on="code", how="left")
-    signal_positions = calendar.searchsorted(result["signal_date"])
-    ipo_positions = calendar.searchsorted(result["ipo_date"].fillna(result["signal_date"]))
-    result["listing_trading_days"] = signal_positions - ipo_positions
-    result = result[
-        ~result["code"].astype(str).str.endswith(".BJ")
-        & (result["listing_trading_days"] >= 60)
-        & (result["out_date"].isna() | (result["signal_date"] < result["out_date"]))
-    ]
+    filters = _sample_filters(job.configuration)
+    if filters["exclude_bse"]:
+        result = result[~result["code"].astype(str).str.endswith(".BJ")]
+    if filters["exclude_new_stocks"] or filters["exclude_delisting"]:
+        basics = _load_stock_basic(sorted(set(result["code"])))
+        result = result.merge(basics, on="code", how="left")
+        if filters["exclude_new_stocks"]:
+            signal_positions = calendar.searchsorted(result["signal_date"])
+            ipo_positions = calendar.searchsorted(
+                result["ipo_date"].fillna(result["signal_date"]),
+            )
+            result["listing_trading_days"] = signal_positions - ipo_positions
+            result = result[
+                result["listing_trading_days"]
+                >= filters["minimum_listing_trading_days"]
+            ]
+        if filters["exclude_delisting"]:
+            result = result[
+                result["out_date"].isna()
+                | (result["signal_date"] < result["out_date"])
+            ]
     return result[["signal_date", "code", "score"]].drop_duplicates(
         ["signal_date", "code"], keep="last",
     )
@@ -467,8 +489,12 @@ def _load_market(
 
 
 def _build_targets(
-    signals: pd.DataFrame, market: pd.DataFrame, calendar: pd.DatetimeIndex,
+    signals: pd.DataFrame,
+    market: pd.DataFrame,
+    calendar: pd.DatetimeIndex,
+    configuration: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[pd.Timestamp, dict[str, float]], dict[pd.Timestamp, dict[str, float]], dict[pd.Timestamp, float], dict[pd.Timestamp, int]]:
+    filters = _sample_filters(configuration)
     state_lookup = market.set_index(["date", "code"])
     q1: dict[pd.Timestamp, dict[str, float]] = {}
     q5: dict[pd.Timestamp, dict[str, float]] = {}
@@ -485,7 +511,13 @@ def _build_targets(
             if key not in state_lookup.index:
                 continue
             state = state_lookup.loc[key]
-            if int(state["is_st"]) == 1 or int(state["is_withdrawal"]) == 1:
+            if filters["exclude_limit_paused"] and (
+                not bool(state["buy_allowed"]) or not bool(state["sell_allowed"])
+            ):
+                continue
+            if filters["exclude_st"] and int(state["is_st"]) == 1:
+                continue
+            if filters["exclude_delisting"] and int(state["is_withdrawal"]) == 1:
                 continue
             eligible.append((str(row.code), float(row.score), float(state["forward_return"])))
         if len(eligible) < 25:
@@ -502,6 +534,21 @@ def _build_targets(
             ic[execution_date] = float(score_series.corr(return_series, method="spearman"))
         counts[execution_date] = len(ordered)
     return q1, q5, ic, counts
+
+
+def _sample_filters(configuration: Optional[dict[str, Any]]) -> dict[str, Any]:
+    source = configuration or {}
+    filters = {
+        key: source.get(key, default)
+        for key, default in DEFAULT_SAMPLE_FILTERS.items()
+    }
+    # Jobs created before sample filters became configurable persisted the
+    # original mandatory rules without these two explicit switches.
+    if "exclude_new_stocks" not in source and "minimum_listing_trading_days" in source:
+        filters["exclude_new_stocks"] = True
+    if "exclude_limit_paused" not in source and "blocked_trades_are_carried" in source:
+        filters["exclude_limit_paused"] = False
+    return filters
 
 
 def _simulate_quantile_portfolio(
@@ -569,6 +616,7 @@ def _simulate_quantile_portfolio(
             trade_date=trade_date.date(), net_return=gross_return - cost,
             turnover=0.5 * (buys + sells), cost=cost,
             blocked_buy_count=blocked_buys, blocked_sell_count=blocked_sells,
+            holdings=tuple(sorted(weights)),
         )
     return results
 

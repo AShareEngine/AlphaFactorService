@@ -330,6 +330,92 @@ SCHEMA_STATEMENTS = [
 ]
 
 
+MODEL_SCHEMA_STATEMENTS = [
+    "CREATE DATABASE IF NOT EXISTS {database}",
+    """
+    CREATE TABLE IF NOT EXISTS {database}.model_predictions_daily
+    (
+        trade_date Date,
+        entity_type LowCardinality(String) DEFAULT 'stock',
+        entity_code String,
+        model_id String,
+        model_version UInt32,
+        raw_prediction Float64,
+        rank_value UInt32,
+        percentile Float64,
+        score Float64,
+        feature_cutoff_at DateTime('Asia/Shanghai'),
+        computed_at DateTime('Asia/Shanghai'),
+        source_vintage String,
+        dataset_hash String,
+        inference_run_id String,
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    PARTITION BY toYYYYMM(trade_date)
+    ORDER BY (model_id, model_version, trade_date, entity_code, inference_run_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {database}.model_backtest_jobs
+    (
+        backtest_job_id String,
+        model_id String,
+        model_version UInt32,
+        universe_id LowCardinality(String),
+        benchmark_code String,
+        date_preset LowCardinality(String),
+        requested_date_start Nullable(Date),
+        requested_date_end Nullable(Date),
+        date_start Nullable(Date),
+        date_end Nullable(Date),
+        top_n UInt32 DEFAULT 20,
+        rebalance_every UInt32 DEFAULT 5,
+        buy_cost_rate Float64 DEFAULT 0.0003,
+        sell_cost_rate Float64 DEFAULT 0.0013,
+        configuration_json String DEFAULT '{{}}',
+        status LowCardinality(String),
+        error_message String,
+        annual_return Nullable(Float64),
+        excess_annual_return Nullable(Float64),
+        sharpe_ratio Nullable(Float64),
+        turnover_rate Nullable(Float64),
+        max_drawdown Nullable(Float64),
+        trading_days UInt32 DEFAULT 0,
+        payload_json String DEFAULT '{{}}',
+        created_at DateTime DEFAULT now(),
+        started_at Nullable(DateTime),
+        finished_at Nullable(DateTime),
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY backtest_job_id
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {database}.model_backtest_daily
+    (
+        backtest_job_id String,
+        trade_date Date,
+        portfolio_return Nullable(Float64),
+        benchmark_return Nullable(Float64),
+        excess_return Nullable(Float64),
+        portfolio_nav Nullable(Float64),
+        benchmark_nav Nullable(Float64),
+        turnover Nullable(Float64),
+        transaction_cost Nullable(Float64),
+        sample_count UInt32 DEFAULT 0,
+        holding_count UInt32 DEFAULT 0,
+        blocked_buy_count UInt32 DEFAULT 0,
+        blocked_sell_count UInt32 DEFAULT 0,
+        holdings_json String DEFAULT '[]',
+        updated_at DateTime DEFAULT now()
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    PARTITION BY toYYYYMM(trade_date)
+    ORDER BY (backtest_job_id, trade_date)
+    """,
+]
+
+
 @lru_cache(maxsize=1)
 def settings() -> Settings:
     return load_settings()
@@ -365,6 +451,8 @@ def init_schema() -> None:
     db_client = client()
     for statement in SCHEMA_STATEMENTS:
         db_client.command(statement.format(database=config.clickhouse_database))
+    for statement in MODEL_SCHEMA_STATEMENTS:
+        db_client.command(statement.format(database=config.model_database))
     _migrate_legacy_available_at(db_client, config.clickhouse_database)
 
 
