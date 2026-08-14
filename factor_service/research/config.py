@@ -22,6 +22,7 @@ class Settings:
     model_database: str
     source_database: str
     work_root: Path
+    model_artifacts_root: Path
     service_host: str
     service_port: int
 
@@ -48,7 +49,10 @@ def load_settings() -> Settings:
         factor_database=str(clickhouse.get("factor_database") or "ab_factor").strip(),
         model_database=str(clickhouse.get("model_database") or "ab_model").strip(),
         source_database=str(source.get("database") or "starlight").strip(),
-        work_root=resolve_project_path(storage.get("root"), "data/research"),
+        work_root=resolve_project_path(storage.get("work_root"), "data/research"),
+        model_artifacts_root=resolve_project_path(
+            storage.get("model_artifacts_root"), "data/model_artifacts"
+        ),
         service_host=service_host,
         service_port=service_port,
     )

@@ -4,8 +4,11 @@ from datetime import date, datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from factor_service import model_repository
+from factor_service.clickhouse import settings
+from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
 from factor_service.model_backtest import run_model_backtest_job
 from factor_service.schemas import (
     ModelBacktestDailyOut,
@@ -18,6 +21,19 @@ from factor_service.schemas import (
 
 
 router = APIRouter(tags=["models"])
+
+
+@router.get("/model-artifacts/{relative_path:path}")
+def download_model_artifact(relative_path: str) -> FileResponse:
+    try:
+        path = ModelArtifactStore(settings().model_artifacts_root).resolve(relative_path)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=path.name,
+    )
 
 
 @router.post("/model-predictions/batches")

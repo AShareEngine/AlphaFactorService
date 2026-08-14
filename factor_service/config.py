@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from factor_service.runtime_config import (
     as_bool,
     load_runtime_config,
+    resolve_project_path,
     section,
     string_list,
 )
@@ -33,6 +35,7 @@ class Settings:
     stock_basic_type_column: str
     stock_basic_stock_type_value: str
     model_database: str
+    model_artifacts_root: Path
     research_internal_url: str
 
 
@@ -41,6 +44,7 @@ def load_settings() -> Settings:
     service = section(runtime, "service")
     clickhouse = section(runtime, "clickhouse")
     source = section(runtime, "sources", "factor")
+    research_storage = section(runtime, "research", "storage")
     return Settings(
         host=str(service.get("host") or "127.0.0.1").strip(),
         port=int(service.get("port") or 8100),
@@ -64,6 +68,9 @@ def load_settings() -> Settings:
             source.get("stock_basic_stock_type_value") or "1"
         ).strip(),
         model_database=str(clickhouse.get("model_database") or "ab_model").strip(),
+        model_artifacts_root=resolve_project_path(
+            research_storage.get("model_artifacts_root"), "data/model_artifacts"
+        ),
         research_internal_url=str(
             service.get("research_internal_url") or "http://127.0.0.1:8787"
         ).strip().rstrip("/"),

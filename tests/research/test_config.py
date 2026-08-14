@@ -4,7 +4,11 @@ from factor_service.research import config
 from factor_service.runtime_config import PROJECT_ROOT
 
 
-def _runtime(*, storage_root: str = "./custom/research") -> dict:
+def _runtime(
+    *,
+    work_root: str = "./custom/research",
+    model_artifacts_root: str = "./custom/model-artifacts",
+) -> dict:
     return {
         "clickhouse": {
             "host": "10.0.0.8",
@@ -20,7 +24,10 @@ def _runtime(*, storage_root: str = "./custom/research") -> dict:
             "token": "worker-secret",
             "listen_host": "0.0.0.0",
             "listen_port": 8788,
-            "storage": {"root": storage_root},
+            "storage": {
+                "work_root": work_root,
+                "model_artifacts_root": model_artifacts_root,
+            },
         },
     }
 
@@ -48,7 +55,7 @@ def test_relative_storage_root_is_resolved_from_project_root(monkeypatch, tmp_pa
     monkeypatch.setattr(
         config,
         "load_runtime_config",
-        lambda: _runtime(storage_root="./mounted/model-research"),
+        lambda: _runtime(work_root="./mounted/model-research"),
     )
 
     settings = config.load_settings()
@@ -61,12 +68,26 @@ def test_absolute_storage_root_is_preserved(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         config,
         "load_runtime_config",
-        lambda: _runtime(storage_root=str(destination)),
+        lambda: _runtime(work_root=str(destination)),
     )
 
     settings = config.load_settings()
 
     assert settings.work_root == destination.resolve()
+
+
+def test_formal_model_artifact_root_is_independent_from_work_root(monkeypatch, tmp_path) -> None:
+    artifact_root = tmp_path / "formal-models"
+    monkeypatch.setattr(
+        config,
+        "load_runtime_config",
+        lambda: _runtime(model_artifacts_root=str(artifact_root)),
+    )
+
+    settings = config.load_settings()
+
+    assert settings.model_artifacts_root == artifact_root.resolve()
+    assert settings.model_artifacts_root != settings.work_root
 
 
 def test_worker_token_is_optional(monkeypatch) -> None:

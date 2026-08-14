@@ -76,43 +76,27 @@ class AlphaBlocksApi:
             "lease_token": lease_token, "stage": stage, "progress": progress,
         })
 
-    def upload(
-        self, job_id: str, lease_token: str, kind: str, path: Path,
-        *, checkpoint=None, progress=None,
+    def record_artifact(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        kind: str,
+        file_name: str,
+        relative_path: str,
+        digest: str,
+        size_bytes: int,
+        dataset_hash: str = "",
     ) -> dict[str, Any]:
-        digest = _file_sha256(path)
-        # Stable per job/kind/file so an interrupted retry overwrites its temporary
-        # chunks instead of leaking a new .uploads directory on every attempt.
-        upload_id = sha256(f"{job_id}:{kind}:{path.name}".encode()).hexdigest()[:32]
-        chunk_size = 8 * 1024 * 1024
-        total_chunks = max(1, (path.stat().st_size + chunk_size - 1) // chunk_size)
-        with path.open("rb") as source:
-            for chunk_index in range(total_chunks):
-                if checkpoint is not None:
-                    checkpoint()
-                body = source.read(chunk_size)
-                response = self.session.put(
-                    f"{self.base_url}/worker/jobs/{job_id}/artifact-chunks/{kind}/{path.name}/{upload_id}/{chunk_index}",
-                    headers={
-                        "X-Lease-Token": lease_token,
-                        "X-Chunk-SHA256": sha256(body).hexdigest(),
-                        "Content-Type": "application/octet-stream",
-                    },
-                    data=body,
-                    timeout=max(self.timeout, 120),
-                )
-                self._response(response)
-                if progress is not None:
-                    progress(chunk_index + 1, total_chunks)
-        if checkpoint is not None:
-            checkpoint()
-        response = self.session.post(
-            f"{self.base_url}/worker/jobs/{job_id}/artifact-chunks/{kind}/{path.name}/{upload_id}/complete",
-            headers={"X-Lease-Token": lease_token},
-            json={"total_chunks": total_chunks, "sha256": digest},
-            timeout=max(self.timeout, 600),
-        )
-        return self._response(response)
+        return self._json("POST", f"/worker/jobs/{job_id}/artifacts", {
+            "lease_token": lease_token,
+            "artifact_kind": kind,
+            "file_name": file_name,
+            "relative_path": relative_path,
+            "sha256": digest,
+            "size_bytes": int(size_bytes),
+            "dataset_hash": dataset_hash,
+        })
 
     def complete(self, job_id: str, lease_token: str, result: dict[str, Any]) -> dict[str, Any]:
         return self._json("POST", f"/worker/jobs/{job_id}/complete", {
@@ -142,14 +126,4 @@ class AlphaBlocksApi:
                 status_code=int(getattr(response, "status_code", 0) or 0),
             )
         return payload
-
-
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 __all__ = ["AlphaBlocksApi", "AlphaBlocksApiError"]

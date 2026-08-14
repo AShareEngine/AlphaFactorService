@@ -40,4 +40,6 @@ research:
     # Relative paths are resolved from the AlphaFactorService project root.
     # This root contains job datasets, trained models, predictions, MLflow files,
     # logs, manifests, and crash-recovery state.
-    root: "./data/research"
+    work_root: "./data/research"
+    # Immutable, formally published model artifacts managed by FactorService.
+    model_artifacts_root: "./data/model_artifacts"

@@ -1,5 +1,3 @@
-from hashlib import sha256
-from pathlib import Path
 from types import SimpleNamespace
 
 from factor_service.research.api import AlphaBlocksApi
@@ -17,67 +15,41 @@ class _Response:
 class _Session:
     def __init__(self) -> None:
         self.headers = {}
-        self.puts = []
-        self.posts = []
+        self.requests = []
 
-    def put(self, url, *, headers, data, timeout):
-        self.puts.append((url, headers, data, timeout))
-        return _Response()
-
-    def post(self, url, *, headers, json, timeout):
-        self.posts.append((url, headers, json, timeout))
+    def request(self, method, url, *, json, timeout):
+        self.requests.append((method, url, json, timeout))
         return _Response()
 
 
-def test_artifact_upload_chunks_and_carries_lease_headers(tmp_path: Path) -> None:
-    path = tmp_path / "model.bin"
-    path.write_bytes(b"artifact")
+def test_artifact_registration_sends_only_metadata_and_lease() -> None:
     api = AlphaBlocksApi("http://example/api/model-research", "worker-token")
     session = _Session()
     api.session = session  # type: ignore[assignment]
 
-    api.upload("job-1", "lease-1", "bundle", path)
+    api.record_artifact(
+        "job-1",
+        "lease-1",
+        kind="bundle",
+        file_name="model.bin",
+        relative_path="job-1/bundle/model.bin",
+        digest="a" * 64,
+        size_bytes=8,
+        dataset_hash="b" * 64,
+    )
 
-    assert len(session.puts) == 1
-    _, chunk_headers, body, _ = session.puts[0]
-    assert chunk_headers["X-Lease-Token"] == "lease-1"
-    assert chunk_headers["X-Chunk-SHA256"] == sha256(body).hexdigest()
-    _, complete_headers, complete_body, _ = session.posts[0]
-    assert "X-Worker-Node" not in complete_headers
-    assert complete_headers["X-Lease-Token"] == "lease-1"
-    assert complete_body["sha256"] == sha256(path.read_bytes()).hexdigest()
-
-
-def test_artifact_upload_stops_before_first_chunk_when_canceled(tmp_path: Path) -> None:
-    path = tmp_path / "model.bin"
-    path.write_bytes(b"artifact")
-    api = AlphaBlocksApi("http://example/api/model-research", "worker-token")
-    session = _Session()
-    api.session = session  # type: ignore[assignment]
-
-    with __import__("pytest").raises(RuntimeError, match="stop"):
-        api.upload(
-            "job-1", "lease-1", "bundle", path,
-            checkpoint=lambda: (_ for _ in ()).throw(RuntimeError("stop")),
-        )
-
-    assert session.puts == []
-    assert session.posts == []
-
-
-def test_artifact_upload_id_is_stable_across_retries(tmp_path: Path) -> None:
-    path = tmp_path / "model.bin"
-    path.write_bytes(b"artifact")
-    api = AlphaBlocksApi("http://example/api/model-research", "")
-    session = _Session()
-    api.session = session  # type: ignore[assignment]
-
-    api.upload("job-1", "lease-1", "bundle", path)
-    api.upload("job-1", "lease-1", "bundle", path)
-
-    first_upload_id = session.puts[0][0].split("/")[-2]
-    second_upload_id = session.puts[1][0].split("/")[-2]
-    assert first_upload_id == second_upload_id
+    method, url, payload, _timeout = session.requests[0]
+    assert method == "POST"
+    assert url.endswith("/worker/jobs/job-1/artifacts")
+    assert payload == {
+        "lease_token": "lease-1",
+        "artifact_kind": "bundle",
+        "file_name": "model.bin",
+        "relative_path": "job-1/bundle/model.bin",
+        "sha256": "a" * 64,
+        "size_bytes": 8,
+        "dataset_hash": "b" * 64,
+    }
 
 
 def test_api_omits_authorization_header_when_token_is_empty() -> None:

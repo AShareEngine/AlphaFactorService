@@ -16,13 +16,14 @@ cp config/runtime.example.yaml config/runtime.local.yaml
 - `sources.research`：模型训练行情源库。
 - `research`：训练调度服务、AlphaBlocks API及研究文件存储目录。
 
-训练产生的所有本地文件都放在`research.storage.root`下面。推荐在服务器或旧Mac上设置为
-容量充足的绝对路径，例如：
+训练工作文件和正式模型产物分别由`research.storage.work_root`和
+`research.storage.model_artifacts_root`管理。推荐在服务器或旧Mac上设置为容量充足的绝对路径：
 
 ```yaml
 research:
   storage:
-    root: /Volumes/QuantData/alphafactor/research
+    work_root: /Volumes/QuantData/alphafactor/research-work
+    model_artifacts_root: /Volumes/QuantData/alphafactor/model-artifacts
 ```
 
 若确实需要从另一位置读取配置，可设置

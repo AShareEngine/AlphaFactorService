@@ -23,6 +23,7 @@ def main() -> None:
             flush=True,
         )
         print(f"检查研究文件目录: {settings.work_root}", flush=True)
+        print(f"检查正式模型目录: {settings.model_artifacts_root}", flush=True)
         try:
             check = DatasetBuilder(settings).check()
             api = AlphaBlocksApi(settings.api_url, settings.worker_token)

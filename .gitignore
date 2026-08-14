@@ -11,3 +11,4 @@ venv/
 config/runtime.local.yaml
 logs/
 data/research/
+data/model_artifacts/

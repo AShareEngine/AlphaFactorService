@@ -128,13 +128,14 @@ research:
   listen_host: 127.0.0.1
   listen_port: 8787
   storage:
-    root: /Volumes/QuantData/alphafactor/research
+    work_root: /Volumes/QuantData/alphafactor/research-work
+    model_artifacts_root: /Volumes/QuantData/alphafactor/model-artifacts
 ```
 
-`research.storage.root`是研究文件的统一根目录，包含冻结数据集、训练模型、预测Parquet、
-MLflow记录、指标、日志、任务状态和临时文件。相对路径从AlphaFactorService项目根目录解析；
-需要放到外置磁盘或指定数据盘时建议直接填写绝对路径。最终上传并发布的模型包由AlphaBlocks
-自己的`storage.model_artifacts_root`控制。
+`research.storage.work_root`保存训练工作文件，包括冻结数据集、预测Parquet、MLflow记录、
+指标、日志、任务状态和临时文件；`research.storage.model_artifacts_root`保存经过SHA256校验并
+原子发布的正式模型产物。两者都由AlphaFactorService管理。相对路径从项目根目录解析；需要
+放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 
 AlphaBlocks只配置`external_services.factor_service.base_url`，不再保存单独的研究Worker地址。
 

@@ -15,6 +15,7 @@ import traceback
 from typing import Any
 
 from factor_service.research import __version__
+from factor_service.model_artifacts import ModelArtifactStore
 from factor_service.research.api import AlphaBlocksApi, AlphaBlocksApiError
 from factor_service.research.config import Settings
 from factor_service.research.errors import classify_exception, error_payload
@@ -33,6 +34,7 @@ class ResearchWorker:
         self.settings.work_root.mkdir(parents=True, exist_ok=True)
         if not self.settings.work_root.is_dir():
             raise ValueError(f"研究存储根目录无效: {self.settings.work_root}")
+        self.artifact_store = ModelArtifactStore(self.settings.model_artifacts_root)
         self.api = AlphaBlocksApi(settings.api_url, settings.worker_token)
         self.trainer: QlibTrainer | None = None
         self.inference_runner: DailyInferenceRunner | None = None
@@ -230,27 +232,33 @@ class ResearchWorker:
             })
             artifact_count = max(1, len(trained.artifacts))
             for artifact_index, (kind, path) in enumerate(trained.artifacts):
-                self.api.upload(
+                cancellation.checkpoint()
+                saved = self.artifact_store.publish_file(
+                    job_id=job_id,
+                    artifact_kind=kind,
+                    source_path=path,
+                    dataset_hash=str(job.get("dataset_hash") or ""),
+                )
+                self.api.record_artifact(
                     job_id,
                     lease_token,
-                    kind,
-                    path,
-                    checkpoint=cancellation.checkpoint,
-                    progress=lambda chunk, total, index=artifact_index, artifact_kind=kind: (
-                        self._report_progress(
-                            job,
-                            cancellation,
-                            "uploading",
-                            min(96, 90 + int(6 * (index + chunk / max(1, total)) / artifact_count)),
-                            {
-                                "artifact": artifact_kind,
-                                "artifact_index": index + 1,
-                                "artifact_count": artifact_count,
-                                "chunk": chunk,
-                                "chunk_count": total,
-                            },
-                        )
-                    ),
+                    kind=kind,
+                    file_name=path.name,
+                    relative_path=str(saved["relative_path"]),
+                    digest=str(saved["sha256"]),
+                    size_bytes=int(saved["size_bytes"]),
+                    dataset_hash=str(job.get("dataset_hash") or ""),
+                )
+                self._report_progress(
+                    job,
+                    cancellation,
+                    "uploading",
+                    min(96, 90 + int(6 * (artifact_index + 1) / artifact_count)),
+                    {
+                        "artifact": kind,
+                        "artifact_index": artifact_index + 1,
+                        "artifact_count": artifact_count,
+                    },
                 )
             self._report_progress(job, cancellation, "publishing_predictions", 97, {})
             publisher = self.trainer or QlibTrainer(self.settings)

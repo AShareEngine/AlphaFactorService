@@ -18,6 +18,7 @@ def _settings(tmp_path: Path):
         api_url="http://127.0.0.1/api/model-research",
         worker_token="",
         work_root=tmp_path,
+        model_artifacts_root=tmp_path / "artifacts",
     )
 
 
@@ -26,6 +27,7 @@ class _Api:
         self.failed: list[tuple[str, bool]] = []
         self.failure_messages: list[str] = []
         self.completed: list[str] = []
+        self.artifacts: list[dict] = []
 
     def renew(self, *_args, **_kwargs):
         return {"ok": True}
@@ -36,7 +38,8 @@ class _Api:
     def stage(self, *_args, **_kwargs):
         return {"ok": True}
 
-    def upload(self, *_args, **_kwargs):
+    def record_artifact(self, *_args, **kwargs):
+        self.artifacts.append(dict(kwargs))
         return {"ok": True}
 
     def complete(self, job_id, _lease_token, _result):
@@ -55,6 +58,43 @@ class _FailingTrainer:
 
     def train(self, *_args, **_kwargs):
         raise self.error
+
+
+class _SuccessfulTrainer:
+    def __init__(self, artifact: Path, predictions: Path) -> None:
+        self.artifact = artifact
+        self.predictions = predictions
+
+    def train(self, *_args, **_kwargs):
+        return TrainingResult(
+            result={"predictions": {"row_count": 0}},
+            artifacts=[("bundle", self.artifact)],
+            predictions_path=self.predictions,
+        )
+
+    def publish_predictions(self, *_args, **_kwargs):
+        return 0
+
+
+def test_successful_job_publishes_artifact_locally_then_records_metadata(tmp_path: Path) -> None:
+    artifact = tmp_path / "qlib_experiment.tar.gz"
+    predictions = tmp_path / "predictions.parquet"
+    artifact.write_bytes(b"formal model bundle")
+    predictions.write_bytes(b"")
+    worker = ResearchWorker(_settings(tmp_path / "work"))
+    api = _Api()
+    worker.api = api
+    worker.trainer = _SuccessfulTrainer(artifact, predictions)
+
+    worker._run_job(valid_job())
+
+    assert api.completed == ["model_job_test"]
+    assert len(api.artifacts) == 1
+    registered = api.artifacts[0]
+    assert registered["kind"] == "bundle"
+    assert registered["file_name"] == "qlib_experiment.tar.gz"
+    assert registered["relative_path"].endswith("bundle/qlib_experiment.tar.gz")
+    assert worker.artifact_store.resolve(registered["relative_path"]).read_bytes() == b"formal model bundle"
 
 
 def test_invalid_data_failure_is_not_retried(tmp_path: Path) -> None:
