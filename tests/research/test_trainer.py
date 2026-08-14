@@ -23,7 +23,7 @@ def test_lightgbm_parameters_are_deterministic() -> None:
 
 
 def test_supported_model_factories_are_available() -> None:
-    for kind in ("lightgbm", "xgboost", "catboost", "mlp"):
+    for kind in ("lightgbm", "xgboost", "catboost", "mlp", "lstm", "transformer_lstm"):
         completed = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(f"""
                 from factor_service.research.trainer import _create_model
@@ -69,6 +69,123 @@ def test_custom_mlp_fits_qlib_dataseth_and_predicts_frame() -> None:
         prediction = predict_feature_frame(model, "mlp", test)
         assert prediction.shape == (len(test),)
         assert np.isfinite(prediction).all()
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_custom_mlp_builds_each_configured_hidden_layer_width() -> None:
+    script = """
+        from factor_service.research.trainer import _create_model
+        model, params = _create_model("mlp", {
+            "hidden_layers": [64, 128, 256], "max_steps": 2, "batch_size": 16,
+        }, 42)
+        linear = [layer for layer in model.network if layer.__class__.__name__ == "Linear"]
+        assert [(layer.in_features, layer.out_features) for layer in linear] == [
+            (42, 64), (64, 128), (128, 256), (256, 1),
+        ]
+        assert params["hidden_layers"] == [64, 128, 256]
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_custom_lstm_fits_causal_qlib_time_windows() -> None:
+    script = """
+        import pickle
+        import numpy as np
+        import pandas as pd
+        from qlib.data.dataset import DataHandlerLP, TSDatasetH
+        from factor_service.research.trainer import _create_model
+        index = pd.MultiIndex.from_product(
+            [pd.date_range("2024-01-01", periods=12), ["A", "B"]],
+            names=["datetime", "instrument"],
+        )
+        values = np.random.default_rng(42).normal(size=(len(index), 3))
+        frame = pd.DataFrame(
+            np.column_stack((values, values[:, 0] - values[:, 1])), index=index,
+            columns=pd.MultiIndex.from_tuples([
+                ("feature", "f1"), ("feature", "f2"), ("feature", "f3"),
+                ("label", "LABEL0"),
+            ]),
+        )
+        dataset = TSDatasetH(
+            handler=DataHandlerLP.from_df(frame),
+            segments={
+                "train": ("2024-01-03", "2024-01-06"),
+                "valid": ("2024-01-07", "2024-01-09"),
+                "test": ("2024-01-10", "2024-01-12"),
+            },
+            step_len=3,
+        )
+        model, params = _create_model("lstm", {
+            "lookback_window": 3, "hidden_size": 8, "num_layers": 1,
+            "dropout": 0.0, "max_steps": 3, "batch_size": 16,
+            "eval_steps": 1, "early_stopping_rounds": 2,
+        }, 3)
+        model.fit(dataset, evals_result={})
+        restored = pickle.loads(pickle.dumps(model))
+        prediction = restored.predict(dataset, segment="test")
+        assert len(prediction) == 6
+        assert prediction.index.names == ["datetime", "instrument"]
+        assert np.isfinite(prediction.values).all()
+        assert params["lookback_window"] == 3
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_transformer_lstm_fits_the_same_causal_time_windows() -> None:
+    script = """
+        import pickle
+        import numpy as np
+        import pandas as pd
+        from qlib.data.dataset import DataHandlerLP, TSDatasetH
+        from factor_service.research.trainer import _create_model
+        index = pd.MultiIndex.from_product(
+            [pd.date_range("2024-01-01", periods=12), ["A", "B"]],
+            names=["datetime", "instrument"],
+        )
+        values = np.random.default_rng(42).normal(size=(len(index), 3))
+        frame = pd.DataFrame(
+            np.column_stack((values, values[:, 0] - values[:, 1])), index=index,
+            columns=pd.MultiIndex.from_tuples([
+                ("feature", "f1"), ("feature", "f2"), ("feature", "f3"),
+                ("label", "LABEL0"),
+            ]),
+        )
+        dataset = TSDatasetH(
+            handler=DataHandlerLP.from_df(frame),
+            segments={
+                "train": ("2024-01-03", "2024-01-06"),
+                "valid": ("2024-01-07", "2024-01-09"),
+                "test": ("2024-01-10", "2024-01-12"),
+            },
+            step_len=3,
+        )
+        model, params = _create_model("transformer_lstm", {
+            "lookback_window": 3, "d_model": 8, "nhead": 2,
+            "transformer_layers": 1, "dim_feedforward": 16,
+            "lstm_hidden_size": 8, "lstm_layers": 1, "dropout": 0.0,
+            "max_steps": 2, "batch_size": 16, "eval_steps": 1,
+            "early_stopping_rounds": 2,
+        }, 3)
+        model.fit(dataset, evals_result={})
+        restored = pickle.loads(pickle.dumps(model))
+        prediction = restored.predict(dataset, segment="test")
+        assert len(prediction) == 6
+        assert np.isfinite(prediction.values).all()
+        assert params["d_model"] == 8 and params["nhead"] == 2
+        assert len(restored.get_feature_importance()) == 3
     """
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

@@ -62,10 +62,12 @@ class QlibTrainer:
         dataset_path = snapshot.dataset_path
         raw_dataset_path = snapshot.raw_dataset_path
         dataset_manifest_path = snapshot.manifest_path
-        handler = DataHandlerLP.from_df(prepared.frame)
-        dataset = DatasetH(handler=handler, segments=prepared.segments)
         raw_params = dict(config.get("model", {}).get("params") or {})
         model_kind = str(config.get("model", {}).get("kind") or "lightgbm")
+        handler = DataHandlerLP.from_df(prepared.frame)
+        dataset = _dataset_for_model(
+            handler, prepared.segments, model_kind, raw_params, DatasetH,
+        )
         model, model_params = _create_model(model_kind, raw_params, len(prepared.feature_names))
         recorder_root = work_dir / "mlruns"
         # DatasetH由已冻结的DataFrame驱动，不读取Qlib本地行情；0.9.7仍要求
@@ -335,9 +337,8 @@ def _run_walk_forward(
         details = {"window_index": index, "window_count": total, "segments": segments}
         _progress(progress, "walk_forward_training", start_percent, details)
         window_frame, medians = _walk_forward_frame(prepared, segments)
-        dataset = DatasetH(
-            handler=DataHandlerLP.from_df(window_frame),
-            segments=segments,
+        dataset = _dataset_for_model(
+            DataHandlerLP.from_df(window_frame), segments, model_kind, raw_params, DatasetH,
         )
         model, _ = _create_model(model_kind, raw_params, len(prepared.feature_names))
         evals_result: dict[str, Any] = {}
@@ -611,8 +612,13 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
         from factor_service.research.models import QlibTorchMLPModel
 
-        hidden_size = int(source.get("hidden_size", 64))
-        layer_count = int(source.get("layer_count", 2))
+        raw_layers = source.get("hidden_layers")
+        if isinstance(raw_layers, list) and raw_layers:
+            hidden_layers = [int(width) for width in raw_layers]
+        else:
+            hidden_layers = [int(source.get("hidden_size", 64))] * int(
+                source.get("layer_count", 2)
+            )
         params = {
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "max_steps": int(source.get("max_steps", 300)),
@@ -622,12 +628,79 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "hidden_size": hidden_size,
-            "layer_count": layer_count,
+            "hidden_layers": hidden_layers,
             "num_threads": int(source.get("num_threads", 4)),
         }
         return QlibTorchMLPModel(**params), params
+    if kind == "lstm":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibTorchLSTMModel
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "hidden_size": int(source.get("hidden_size", 128)),
+            "num_layers": int(source.get("num_layers", 2)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 512)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return QlibTorchLSTMModel(**params), params
+    if kind == "transformer_lstm":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibTorchTransformerLSTMModel
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "d_model": int(source.get("d_model", 64)),
+            "nhead": int(source.get("nhead", 4)),
+            "transformer_layers": int(source.get("transformer_layers", 2)),
+            "dim_feedforward": int(source.get("dim_feedforward", 256)),
+            "lstm_hidden_size": int(source.get("lstm_hidden_size", 128)),
+            "lstm_layers": int(source.get("lstm_layers", 1)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 256)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return QlibTorchTransformerLSTMModel(**params), params
     raise ValueError(f"不支持的模型: {kind}")
+
+
+def _dataset_for_model(
+    handler: Any,
+    segments: dict[str, tuple[str, str]],
+    model_kind: str,
+    params: dict[str, Any],
+    DatasetH: Any,
+) -> Any:
+    if model_kind not in {"lstm", "transformer_lstm"}:
+        return DatasetH(handler=handler, segments=segments)
+    from qlib.data.dataset import TSDatasetH
+
+    return TSDatasetH(
+        handler=handler,
+        segments=segments,
+        step_len=int(params.get("lookback_window", 60)),
+    )
 
 
 def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -> np.ndarray:
@@ -638,6 +711,8 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
         return np.asarray(model.model.predict(xgb.DMatrix(features.values)), dtype=float)
     if model_kind == "mlp":
         return np.asarray(model.predict_frame(features), dtype=float).reshape(-1)
+    if model_kind in {"lstm", "transformer_lstm"}:
+        raise ValueError("时序模型推理必须通过TSDatasetH提供按股票组织的历史窗口")
     predictor = getattr(model, "model", None)
     if predictor is None or not hasattr(predictor, "predict"):
         raise ValueError(f"{model_kind}模型产物不包含可用预测器")
@@ -646,7 +721,10 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
 
 
 def _model_package_version(kind: str) -> dict[str, str]:
-    package = {"lightgbm": "lightgbm", "xgboost": "xgboost", "catboost": "catboost", "mlp": "torch"}[kind]
+    package = {
+        "lightgbm": "lightgbm", "xgboost": "xgboost", "catboost": "catboost",
+        "mlp": "torch", "lstm": "torch", "transformer_lstm": "torch",
+    }[kind]
     module = __import__(package)
     return {package: str(getattr(module, "__version__", "unknown"))}
 

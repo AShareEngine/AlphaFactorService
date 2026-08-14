@@ -59,10 +59,25 @@ class DailyInferenceRunner:
         if actual_names != expected_names or any(name not in medians for name in expected_names):
             raise PermanentJobError("模型产物中的特征顺序或训练中位数与冻结因子不一致")
 
+        lookback_window = 1
+        feature_date_start = trade_date
+        if model_kind in {"lstm", "transformer_lstm"}:
+            lookback_window = int(
+                dict(training_manifest.get("model_params") or {}).get("lookback_window") or 60
+            )
+            try:
+                sequence_dates = self.dataset_builder.trading_dates_ending_at(
+                    trade_date, lookback_window,
+                )
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
+            feature_date_start = sequence_dates[0]
+
         _progress(progress, "building_inference_features", 35, {"trade_date": trade_date})
-        membership = self.dataset_builder._membership(trade_date, trade_date)
-        if membership.empty:
+        target_membership = self.dataset_builder._membership(trade_date, trade_date)
+        if target_membership.empty:
             raise PermanentJobError(f"{trade_date}不是中证500可推理交易日")
+        membership = self.dataset_builder._membership(feature_date_start, trade_date)
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}
         expected_count = max(1, len(features))
@@ -74,7 +89,7 @@ class DailyInferenceRunner:
                 "factor_count": len(factors),
             })
             values = self.dataset_builder._factor_values(
-                factor, cutoff_for_clickhouse, trade_date, trade_date,
+                factor, cutoff_for_clickhouse, feature_date_start, trade_date,
             ).rename(columns={"value": feature_name})
             eligible_values = values.merge(
                 features[["trade_date", "instrument"]],
@@ -99,16 +114,44 @@ class DailyInferenceRunner:
 
         _checkpoint(cancellation)
         _progress(progress, "inferencing", 68, {"row_count": len(features)})
+        sequence_coverage: float | None = None
         try:
-            raw = predict_feature_frame(model, model_kind, features[expected_names])
+            if model_kind in {"lstm", "transformer_lstm"}:
+                from qlib.data.dataset import DataHandlerLP, TSDatasetH
+
+                sequence_frame = features.set_index(["trade_date", "instrument"])[expected_names]
+                sequence_frame.index.names = ["datetime", "instrument"]
+                sequence_frame.columns = pd.MultiIndex.from_tuples(
+                    [("feature", name) for name in expected_names]
+                )
+                inference_dataset = TSDatasetH(
+                    handler=DataHandlerLP.from_df(sequence_frame),
+                    segments={"infer": (trade_date, trade_date)},
+                    step_len=lookback_window,
+                )
+                sequence_prediction = model.predict(inference_dataset, segment="infer")
+                predictions = sequence_prediction.rename("raw_prediction").reset_index()
+                predictions.rename(
+                    columns={"datetime": "trade_date", "instrument": "entity_code"},
+                    inplace=True,
+                )
+                target_count = max(1, target_membership["instrument"].nunique())
+                sequence_coverage = len(predictions) / target_count
+                if sequence_coverage < minimum:
+                    raise ValueError(f"时序模型完整历史窗口覆盖率{sequence_coverage:.2%}低于阈值")
+                raw = predictions["raw_prediction"].to_numpy(dtype=float)
+            else:
+                raw = predict_feature_frame(model, model_kind, features[expected_names])
+                predictions = features[["trade_date", "instrument"]].rename(
+                    columns={"instrument": "entity_code"},
+                )
+                predictions["raw_prediction"] = raw
         except (ImportError, RuntimeError, ValueError) as exc:
             raise PermanentJobError(f"{model_kind}模型推理失败: {exc}") from exc
-        if raw.shape[0] != len(features) or not np.isfinite(raw).all():
+        expected_prediction_rows = len(predictions)
+        if raw.shape[0] != expected_prediction_rows or not np.isfinite(raw).all():
             raise PermanentJobError("模型推理结果数量不一致或包含非有限值")
-        predictions = features[["trade_date", "instrument"]].rename(
-            columns={"instrument": "entity_code"},
-        )
-        predictions["raw_prediction"] = raw
+        predictions["trade_date"] = pd.to_datetime(predictions["trade_date"])
         grouped = predictions.groupby("trade_date")["raw_prediction"]
         predictions["rank_value"] = grouped.rank(method="first", ascending=False).astype(int)
         predictions["percentile"] = grouped.rank(method="average", pct=True)
@@ -128,10 +171,13 @@ class DailyInferenceRunner:
             "dataset_hash": job["dataset_hash"],
             "training_job_id": source["training_job_id"],
             "trade_date": trade_date,
+            "feature_date_start": feature_date_start,
+            "lookback_window": lookback_window,
             "data_cutoff": inference["data_cutoff"],
             "feature_cutoff_at": inference["feature_cutoff_at"],
             "feature_names": expected_names,
             "coverage": coverages,
+            "sequence_coverage": sequence_coverage,
             "medians_source": "training_manifest",
             "row_count": len(predictions),
             "future_function_guards": [
@@ -139,6 +185,7 @@ class DailyInferenceRunner:
                 "source rows limited to signal date and available by market close",
                 "inference data_cutoff >= signal date close",
                 "historical index membership",
+                "causal per-instrument history ending at signal date",
                 "training-fitted medians only",
             ],
             "created_at": computed_at.isoformat(),

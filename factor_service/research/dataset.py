@@ -231,6 +231,31 @@ class DatasetBuilder:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
         return frame
 
+    def trading_dates_ending_at(self, trade_date: str, count: int) -> list[str]:
+        """Return the last ``count`` benchmark sessions without crossing signal time."""
+        requested = int(count)
+        if requested < 1:
+            raise ValueError("交易日窗口必须大于0")
+        rows = self.client.query(
+            f"""
+            SELECT trade_date
+            FROM (
+                SELECT DISTINCT toDate(trade_time) AS trade_date
+                FROM {self.settings.source_database}.ad_market_kline_daily
+                WHERE code = '000905.SH'
+                  AND toDate(trade_time) <= {{trade_date:Date}}
+                ORDER BY trade_date DESC
+                LIMIT {{count:UInt32}}
+            )
+            ORDER BY trade_date
+            """,
+            parameters={"trade_date": trade_date, "count": requested},
+        ).result_rows
+        dates = [pd.Timestamp(row[0]).date().isoformat() for row in rows]
+        if len(dates) < requested or dates[-1] != pd.Timestamp(trade_date).date().isoformat():
+            raise ValueError(f"{trade_date}之前没有足够的{requested}个基准交易日")
+        return dates
+
     def _factor_values(
         self, item: dict[str, Any], cutoff: datetime, date_start: str, date_end: str,
     ) -> pd.DataFrame:

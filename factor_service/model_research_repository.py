@@ -1011,23 +1011,71 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "mlp": {
             "qlib_model": "factor_service.research.models.QlibTorchMLPModel",
             "allowed": {
-                "learning_rate", "hidden_size", "layer_count", "max_steps",
+                "learning_rate", "hidden_layers", "max_steps",
                 "batch_size", "early_stopping_rounds", "eval_steps",
                 "weight_decay", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.001, "hidden_size": 64,
-                "layer_count": 2, "max_steps": 300, "batch_size": 2048,
+                "loss": "mse", "learning_rate": 0.001,
+                "hidden_layers": [64, 128, 256],
+                "max_steps": 300, "batch_size": 2048,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "lstm": {
+            "qlib_model": "factor_service.research.models.QlibTorchLSTMModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "hidden_size", "num_layers",
+                "dropout", "max_steps", "batch_size", "early_stopping_rounds",
+                "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "hidden_size": 128,
+                "num_layers": 2, "dropout": 0.2,
+                "max_steps": 300, "batch_size": 512,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "transformer_lstm": {
+            "qlib_model": "factor_service.research.models.QlibTorchTransformerLSTMModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "d_model", "nhead",
+                "transformer_layers", "dim_feedforward", "lstm_hidden_size",
+                "lstm_layers", "dropout", "max_steps", "batch_size",
+                "early_stopping_rounds", "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "d_model": 64, "nhead": 4,
+                "transformer_layers": 2, "dim_feedforward": 256,
+                "lstm_hidden_size": 128, "lstm_layers": 1, "dropout": 0.2,
+                "max_steps": 300, "batch_size": 256,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
     }
     if kind not in definitions:
-        raise ModelResearchError("model.kind只允许lightgbm、xgboost、catboost或mlp")
+        raise ModelResearchError(
+            "model.kind只允许lightgbm、xgboost、catboost、mlp、lstm或transformer_lstm"
+        )
     definition = definitions[kind]
     allowed = definition["allowed"]
     params = {key: value for key, value in dict(source.get("params") or {}).items() if key in allowed}
+    if kind == "mlp" and "hidden_layers" in params:
+        layers = params["hidden_layers"]
+        if not isinstance(layers, list) or not 1 <= len(layers) <= 8:
+            raise ModelResearchError("hidden_layers必须是包含1到8层的数组")
+        try:
+            normalized_layers = [int(width) for width in layers]
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError("hidden_layers每层宽度必须是整数") from exc
+        if any(width < 4 or width > 4096 for width in normalized_layers):
+            raise ModelResearchError("hidden_layers每层宽度必须在4到4096之间")
+        params["hidden_layers"] = normalized_layers
     defaults = {
         **definition["defaults"],
         "num_threads": max(1, min(int(params.get("num_threads") or 4), 32)),
@@ -1042,6 +1090,16 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "data_random_seed": 42,
         })
     defaults.update(params)
+    if kind == "transformer_lstm":
+        try:
+            d_model = int(defaults["d_model"])
+            nhead = int(defaults["nhead"])
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError("d_model和nhead必须是整数") from exc
+        if nhead < 1 or d_model % nhead != 0:
+            raise ModelResearchError("d_model必须能被nhead整除")
+        defaults["d_model"] = d_model
+        defaults["nhead"] = nhead
     return {"kind": kind, "qlib_model": definition["qlib_model"], "params": defaults}
 
 

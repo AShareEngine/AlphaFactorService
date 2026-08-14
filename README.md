@@ -98,6 +98,14 @@ pm2 start ecosystem.config.js
 
 PM2只启动一个常驻进程`alpha-factor-service`，统一提供因子、模型信号、回测、
 Qlib多模型训练和每日推理。模型训练在任务期间启动隔离子进程，完成后自动退出。
+PyTorch MLP使用显式`hidden_layers`数组冻结逐层宽度，例如`[64, 128, 256]`表示
+`输入维度 → 64 → 128 → 256 → 1`；层结构会进入任务配置和训练manifest，保证可复现。
+PyTorch LSTM使用Qlib `TSDatasetH`按股票构建因果历史窗口，默认结构为
+`60交易日 × 因子维度 → 2层LSTM(128) → 1`。训练、Walk-Forward、测试段预测和每日推理
+使用同一`lookback_window`，不允许把不同股票的数据拼成一条序列。
+Transformer+LSTM混合模型在同一窗口上先执行带因果遮罩的Transformer Encoder，再把
+时序表示交给LSTM输出截面预测。默认结构为`60日 → Transformer 64D/4头/2层 →
+LSTM(128) → 1`，所有结构参数随模型版本冻结。
 
 研究能力已经融合到`factor_service.research`模块，不再存在第二个顶层业务包。当前处于开发阶段，
 训练产物只接受新的`factor_service.research.models`类路径，不保留旧Worker包兼容层。

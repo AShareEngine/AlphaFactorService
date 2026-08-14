@@ -26,7 +26,17 @@ def test_job_validation_accepts_all_phase2_model_kinds() -> None:
     cases = {
         "xgboost": {"max_depth": 4, "n_estimators": 20},
         "catboost": {"depth": 4, "n_estimators": 20},
-        "mlp": {"hidden_size": 16, "layer_count": 2, "max_steps": 20, "batch_size": 32},
+        "mlp": {"hidden_layers": [16, 32, 64], "max_steps": 20, "batch_size": 32},
+        "lstm": {
+            "lookback_window": 20, "hidden_size": 32, "num_layers": 2,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
+        "transformer_lstm": {
+            "lookback_window": 20, "d_model": 32, "nhead": 4,
+            "transformer_layers": 1, "dim_feedforward": 64,
+            "lstm_hidden_size": 32, "lstm_layers": 1,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
     }
     for kind, params in cases.items():
         candidate = deepcopy(source)
@@ -85,6 +95,43 @@ def test_job_validation_rejects_unbounded_model_parameter() -> None:
     job["config_json"]["model"]["params"]["num_threads"] = 1000
 
     with pytest.raises(PermanentJobError, match="num_threads"):
+        validate_job(job)
+
+
+@pytest.mark.parametrize("layers", [[], [2, 64], [64] * 9, "64,128"])
+def test_job_validation_rejects_invalid_mlp_hidden_layers(layers) -> None:
+    job = valid_job()
+    job["config_json"]["model"] = {
+        "kind": "mlp",
+        "params": {"hidden_layers": layers, "max_steps": 20, "batch_size": 32},
+    }
+
+    with pytest.raises(PermanentJobError, match="hidden_layers"):
+        validate_job(job)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("lookback_window", 1), ("num_layers", 9), ("dropout", 1.0)],
+)
+def test_job_validation_rejects_invalid_lstm_architecture(field, value) -> None:
+    job = valid_job()
+    job["config_json"]["model"] = {
+        "kind": "lstm",
+        "params": {field: value, "max_steps": 20, "batch_size": 32},
+    }
+
+    with pytest.raises(PermanentJobError, match=field):
+        validate_job(job)
+
+
+def test_job_validation_rejects_incompatible_transformer_attention_heads() -> None:
+    job = valid_job()
+    job["config_json"]["model"] = {
+        "kind": "transformer_lstm",
+        "params": {"d_model": 30, "nhead": 8, "max_steps": 20, "batch_size": 32},
+    }
+
+    with pytest.raises(PermanentJobError, match="d_model.*nhead"):
         validate_job(job)
 
 

@@ -60,12 +60,64 @@ def test_all_supported_models_have_distinct_training_implementations() -> None:
         "xgboost": "qlib.contrib.model.xgboost.XGBModel",
         "catboost": "qlib.contrib.model.catboost_model.CatBoostModel",
         "mlp": "factor_service.research.models.QlibTorchMLPModel",
+        "lstm": "factor_service.research.models.QlibTorchLSTMModel",
+        "transformer_lstm": "factor_service.research.models.QlibTorchTransformerLSTMModel",
     }
 
     for kind, implementation in expected.items():
         spec = _model_spec({"kind": kind, "params": {}})
         assert spec["qlib_model"] == implementation
         assert spec["params"]["seed"] == 42
+
+
+def test_mlp_contract_freezes_explicit_hidden_layer_widths() -> None:
+    spec = _model_spec({
+        "kind": "mlp",
+        "params": {"hidden_layers": [64, 128, 256]},
+    })
+
+    assert spec["params"]["hidden_layers"] == [64, 128, 256]
+    assert "hidden_size" not in spec["params"]
+    assert "layer_count" not in spec["params"]
+
+
+def test_mlp_contract_rejects_invalid_hidden_layer_widths() -> None:
+    with pytest.raises(ModelResearchError, match="hidden_layers"):
+        _model_spec({"kind": "mlp", "params": {"hidden_layers": [64, 5000]}})
+
+
+def test_lstm_contract_freezes_sequence_architecture() -> None:
+    spec = _model_spec({
+        "kind": "lstm",
+        "params": {"lookback_window": 40, "hidden_size": 96, "num_layers": 3},
+    })
+
+    assert spec["params"]["lookback_window"] == 40
+    assert spec["params"]["hidden_size"] == 96
+    assert spec["params"]["num_layers"] == 3
+    assert spec["params"]["learning_rate"] == 0.001
+
+
+def test_transformer_lstm_contract_freezes_both_encoders() -> None:
+    spec = _model_spec({
+        "kind": "transformer_lstm",
+        "params": {
+            "lookback_window": 40, "d_model": 48, "nhead": 4,
+            "transformer_layers": 2, "lstm_hidden_size": 96,
+        },
+    })
+
+    assert spec["params"]["lookback_window"] == 40
+    assert spec["params"]["d_model"] == 48
+    assert spec["params"]["nhead"] == 4
+    assert spec["params"]["lstm_hidden_size"] == 96
+
+
+def test_transformer_lstm_contract_rejects_incompatible_heads() -> None:
+    with pytest.raises(ModelResearchError, match="d_model.*nhead"):
+        _model_spec({
+            "kind": "transformer_lstm", "params": {"d_model": 30, "nhead": 8},
+        })
 
 
 def test_walk_forward_contract_has_strict_independent_test_defaults() -> None:

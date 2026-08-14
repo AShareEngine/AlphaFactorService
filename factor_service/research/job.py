@@ -33,9 +33,21 @@ MODEL_PARAM_FIELDS = {
         "verbosity",
     },
     "mlp": {
-        "learning_rate", "hidden_size", "layer_count", "max_steps", "batch_size",
+        "learning_rate", "hidden_layers", "hidden_size", "layer_count",
+        "max_steps", "batch_size",
         "early_stopping_rounds", "eval_steps", "weight_decay", "num_threads",
         "loss", "seed", "deterministic", "verbosity",
+    },
+    "lstm": {
+        "learning_rate", "lookback_window", "hidden_size", "num_layers", "dropout",
+        "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
+        "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "transformer_lstm": {
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "transformer_layers", "dim_feedforward", "lstm_hidden_size", "lstm_layers",
+        "dropout", "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
+        "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
     },
 }
 
@@ -115,7 +127,9 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     model = config.get("model")
     model_kind = str(model.get("kind") or "") if isinstance(model, dict) else ""
     if model_kind not in MODEL_PARAM_FIELDS:
-        raise PermanentJobError("模型只允许lightgbm、xgboost、catboost或mlp")
+        raise PermanentJobError(
+            "模型只允许lightgbm、xgboost、catboost、mlp、lstm或transformer_lstm"
+        )
     params = model.get("params") or {}
     if not isinstance(params, dict) or set(params) - MODEL_PARAM_FIELDS[model_kind]:
         raise PermanentJobError(f"{model_kind}参数包含未允许字段")
@@ -142,7 +156,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
-    default_lr = 0.001 if kind == "mlp" else 0.05
+    default_lr = 0.001 if kind in {"mlp", "lstm", "transformer_lstm"} else 0.05
     _number(params.get("learning_rate", default_lr), "learning_rate", 0.000001, 1.0)
     if kind == "lightgbm":
         _integer(params.get("num_leaves", 31), "num_leaves", 2, 65536)
@@ -155,11 +169,46 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("depth", 6), "depth", 1, 16)
         _number(params.get("l2_leaf_reg", 3.0), "l2_leaf_reg", 0.0, 1_000_000.0)
         _number(params.get("random_strength", 1.0), "random_strength", 0.0, 1_000_000.0)
-    else:
-        _integer(params.get("hidden_size", 64), "hidden_size", 4, 4096)
-        _integer(params.get("layer_count", 2), "layer_count", 1, 8)
+    elif kind == "mlp":
+        layers = params.get("hidden_layers")
+        if layers is None:
+            _integer(params.get("hidden_size", 64), "hidden_size", 4, 4096)
+            _integer(params.get("layer_count", 2), "layer_count", 1, 8)
+        else:
+            if not isinstance(layers, list) or not 1 <= len(layers) <= 8:
+                raise PermanentJobError("hidden_layers必须是包含1到8层的数组")
+            for index, width in enumerate(layers, start=1):
+                _integer(width, f"hidden_layers[{index}]", 4, 4096)
         _integer(params.get("max_steps", 300), "max_steps", 1, 100_000)
         _integer(params.get("batch_size", 2048), "batch_size", 16, 1_000_000)
+        _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
+        _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
+        _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        return
+    elif kind == "lstm":
+        _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
+        _integer(params.get("hidden_size", 128), "hidden_size", 4, 4096)
+        _integer(params.get("num_layers", 2), "num_layers", 1, 8)
+        _number(params.get("dropout", 0.2), "dropout", 0.0, 0.9)
+        _integer(params.get("max_steps", 300), "max_steps", 1, 100_000)
+        _integer(params.get("batch_size", 512), "batch_size", 16, 1_000_000)
+        _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
+        _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
+        _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        return
+    elif kind == "transformer_lstm":
+        _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
+        d_model = _integer(params.get("d_model", 64), "d_model", 8, 1024)
+        nhead = _integer(params.get("nhead", 4), "nhead", 1, 32)
+        if d_model % nhead != 0:
+            raise PermanentJobError("d_model必须能被nhead整除")
+        _integer(params.get("transformer_layers", 2), "transformer_layers", 1, 8)
+        _integer(params.get("dim_feedforward", 256), "dim_feedforward", 16, 16_384)
+        _integer(params.get("lstm_hidden_size", 128), "lstm_hidden_size", 4, 4096)
+        _integer(params.get("lstm_layers", 1), "lstm_layers", 1, 8)
+        _number(params.get("dropout", 0.2), "dropout", 0.0, 0.9)
+        _integer(params.get("max_steps", 300), "max_steps", 1, 100_000)
+        _integer(params.get("batch_size", 256), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
         _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)

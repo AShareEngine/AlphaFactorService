@@ -72,7 +72,9 @@ class ResearchWorker:
             "python": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
-            "models": ["lightgbm", "xgboost", "catboost", "mlp"],
+            "models": [
+                "lightgbm", "xgboost", "catboost", "mlp", "lstm", "transformer_lstm",
+            ],
             "max_concurrency": 1,
             "packages": versions,
             "dispatch_mode": "local",
