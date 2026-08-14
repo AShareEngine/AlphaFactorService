@@ -36,7 +36,6 @@ class Settings:
     stock_basic_stock_type_value: str
     model_database: str
     model_artifacts_root: Path
-    research_internal_url: str
 
 
 def load_settings() -> Settings:
@@ -71,7 +70,4 @@ def load_settings() -> Settings:
         model_artifacts_root=resolve_project_path(
             research_storage.get("model_artifacts_root"), "data/model_artifacts"
         ),
-        research_internal_url=str(
-            service.get("research_internal_url") or "http://127.0.0.1:8787"
-        ).strip().rstrip("/"),
     )

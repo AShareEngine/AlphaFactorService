@@ -23,8 +23,6 @@ class Settings:
     source_database: str
     work_root: Path
     model_artifacts_root: Path
-    service_host: str
-    service_port: int
 
 
 def load_settings() -> Settings:
@@ -37,8 +35,6 @@ def load_settings() -> Settings:
         research.get("api_url") or "http://127.0.0.1:8001/api/model-research"
     ).strip().rstrip("/")
     clickhouse_host = str(clickhouse.get("host") or "127.0.0.1").strip()
-    service_host = str(research.get("listen_host") or "127.0.0.1").strip()
-    service_port = int(research.get("listen_port") or 8787)
     result = Settings(
         api_url=api_url,
         worker_token=str(research.get("token") or ""),
@@ -53,9 +49,5 @@ def load_settings() -> Settings:
         model_artifacts_root=resolve_project_path(
             storage.get("model_artifacts_root"), "data/model_artifacts"
         ),
-        service_host=service_host,
-        service_port=service_port,
     )
-    if not 1 <= result.service_port <= 65535:
-        raise ValueError("research.listen_port必须在1到65535之间")
     return result

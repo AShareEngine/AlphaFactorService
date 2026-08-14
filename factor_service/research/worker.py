@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import signal
 import subprocess
 import sys
 import threading
@@ -78,28 +77,25 @@ class ResearchWorker:
             "daily_inference": True,
         }
 
-    def run(self) -> None:
-        """Run the single HTTP scheduling service."""
-        from factor_service.research.service import WorkerHttpService
-
-        signal.signal(signal.SIGTERM, self._stop)
-        signal.signal(signal.SIGINT, self._stop)
+    def start(self) -> None:
+        """Start crash recovery inside the unified FactorService process."""
+        if self.stopping:
+            raise RuntimeError("研究调度器已经关闭")
         self._start_recovery_if_needed()
-        service = WorkerHttpService(self, self.settings)
         print(
-            "AlphaFactorService研究调度进程已启动: "
-            f"listen {self.settings.service_host}:{self.settings.service_port}",
+            "AlphaFactorService内置研究调度器已启动",
             flush=True,
         )
-        try:
-            service.serve_forever()
-        finally:
-            self.stopping = True
-            self._shutdown_event.set()
-            job_thread = self._job_thread
-            if job_thread is not None and job_thread.is_alive():
-                job_thread.join(timeout=30)
-            service.close()
+
+    def close(self) -> None:
+        """Stop active research work during the unified API shutdown."""
+        self._stop()
+        job_thread = self._job_thread
+        if job_thread is not None and job_thread.is_alive():
+            job_thread.join(timeout=30)
+        recovery_thread = self._recovery_thread
+        if recovery_thread is not None and recovery_thread.is_alive():
+            recovery_thread.join(timeout=6)
 
     def submit(self, payload: dict[str, Any]) -> dict[str, object]:
         """Validate and accept one centrally leased job without blocking HTTP."""
@@ -169,7 +165,7 @@ class ResearchWorker:
             ready = not self.stopping and not self.recovery_pending
             return {
                 "ok": True,
-                "service": "AlphaFactorResearchWorker",
+                "service": "AlphaFactorServiceResearch",
                 "worker_version": __version__,
                 "ready": ready,
                 "busy": busy,

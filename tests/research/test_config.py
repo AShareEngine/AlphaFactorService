@@ -22,8 +22,6 @@ def _runtime(
         "research": {
             "api_url": "http://10.0.0.9:8001/api/model-research/",
             "token": "worker-secret",
-            "listen_host": "0.0.0.0",
-            "listen_port": 8788,
             "storage": {
                 "work_root": work_root,
                 "model_artifacts_root": model_artifacts_root,
@@ -46,8 +44,6 @@ def test_research_settings_are_loaded_from_runtime_yaml(monkeypatch) -> None:
     assert settings.factor_database == "factor_shared"
     assert settings.model_database == "model_shared"
     assert settings.source_database == "market_source"
-    assert settings.service_host == "0.0.0.0"
-    assert settings.service_port == 8788
 
 
 def test_relative_storage_root_is_resolved_from_project_root(monkeypatch, tmp_path) -> None:
@@ -98,16 +94,3 @@ def test_worker_token_is_optional(monkeypatch) -> None:
     settings = config.load_settings()
 
     assert settings.worker_token == ""
-
-
-def test_service_port_is_validated(monkeypatch) -> None:
-    payload = _runtime()
-    payload["research"]["listen_port"] = 70000
-    monkeypatch.setattr(config, "load_runtime_config", lambda: payload)
-
-    try:
-        config.load_settings()
-    except ValueError as exc:
-        assert "research.listen_port" in str(exc)
-    else:
-        raise AssertionError("invalid port must fail")

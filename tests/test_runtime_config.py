@@ -12,7 +12,6 @@ def test_runtime_yaml_loads_factor_service_settings(monkeypatch) -> None:
             "host": "0.0.0.0",
             "port": 8110,
             "cors_origins": ["http://127.0.0.1:3000"],
-            "research_internal_url": "http://127.0.0.1:8790/",
         },
         "clickhouse": {
             "host": "10.126.126.3",
@@ -43,7 +42,6 @@ def test_runtime_yaml_loads_factor_service_settings(monkeypatch) -> None:
     assert settings.host == "0.0.0.0"
     assert settings.port == 8110
     assert settings.cors_origins == ("http://127.0.0.1:3000",)
-    assert settings.research_internal_url == "http://127.0.0.1:8790"
     assert settings.clickhouse_host == "10.126.126.3"
     assert settings.clickhouse_user == "factor"
     assert settings.clickhouse_password == "secret"

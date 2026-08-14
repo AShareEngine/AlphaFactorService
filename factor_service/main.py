@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +17,8 @@ from factor_service.api.models import router as models_router
 from factor_service.api.research import router as research_router
 from factor_service.api.values import router as values_router
 from factor_service.clickhouse import init_schema, settings
+from factor_service.research.config import load_settings as load_research_settings
+from factor_service.research.worker import ResearchWorker
 
 
 def create_app() -> FastAPI:
@@ -35,6 +39,15 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         init_schema()
+        worker = ResearchWorker(load_research_settings())
+        worker.start()
+        app.state.research_worker = worker
+
+    @app.on_event("shutdown")
+    def shutdown() -> None:
+        worker = getattr(app.state, "research_worker", None)
+        if isinstance(worker, ResearchWorker):
+            worker.close()
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -56,6 +69,14 @@ app = create_app()
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="alpha-factor-service")
+    parser.add_argument("command", choices=["run", "doctor"], nargs="?", default="run")
+    args = parser.parse_args()
+    if args.command == "doctor":
+        from factor_service.research.cli import doctor
+
+        doctor()
+        return
     config = settings()
     uvicorn.run(
         "factor_service.main:app",

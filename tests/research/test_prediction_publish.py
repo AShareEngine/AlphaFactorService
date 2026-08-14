@@ -33,7 +33,6 @@ def test_prediction_publish_replaces_exact_inference_run(monkeypatch, tmp_path: 
         factor_database="ab_factor", model_database="ab_model",
         source_database="starlight", work_root=tmp_path,
         model_artifacts_root=tmp_path / "artifacts",
-        service_host="127.0.0.1", service_port=8787,
     )
     # Avoid DatasetBuilder's constructor connection; publish owns its own client.
     trainer = QlibTrainer.__new__(QlibTrainer)
@@ -77,7 +76,6 @@ def test_daily_inference_publish_replaces_only_target_date(monkeypatch, tmp_path
         factor_database="ab_factor", model_database="ab_model",
         source_database="starlight", work_root=tmp_path,
         model_artifacts_root=tmp_path / "artifacts",
-        service_host="127.0.0.1", service_port=8787,
     )
     trainer = QlibTrainer.__new__(QlibTrainer)
     trainer.settings = settings

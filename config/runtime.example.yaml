@@ -6,8 +6,6 @@ service:
   port: 8100
   cors_origins:
     - "*"
-  # The public API proxies /research to this loopback-only process.
-  research_internal_url: "http://127.0.0.1:8787"
 
 clickhouse:
   host: 10.126.126.3
@@ -34,8 +32,6 @@ sources:
 research:
   api_url: "http://127.0.0.1:8001/api/model-research"
   token: ""
-  listen_host: 127.0.0.1
-  listen_port: 8787
   storage:
     # Relative paths are resolved from the AlphaFactorService project root.
     # This root contains job datasets, trained models, predictions, MLflow files,

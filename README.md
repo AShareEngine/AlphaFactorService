@@ -6,8 +6,8 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 
 - Studio 负责展示、编辑、创建任务、查看结果。
 - AlphaFactorService 负责保存因子定义、管理任务、执行计算、查询结果。
-- AlphaFactorService 内置独立研究Worker，负责LightGBM、XGBoost、CatBoost和PyTorch MLP训练与每日推理。
-- Factor API和研究Worker是同一仓库中的两个进程；机器学习依赖不会加载进API进程。
+- AlphaFactorService 内置研究调度器，负责LightGBM、XGBoost、CatBoost和PyTorch MLP训练与每日推理。
+- 因子API和研究调度器运行在同一个服务进程、共用8100端口；原生模型训练由短生命周期子进程隔离。
 - ClickHouse 的 `ab_factor` 库负责保存因子定义、计算任务和因子结果。
 - 不再用本地 SQLite 或 YAML 保存因子库，元数据和结果统一由 ClickHouse 承载。
 
@@ -26,8 +26,8 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 - `POST /factor-values/sync-states` 批量查询因子规格的真实持久化覆盖范围，供自动全量/增量同步规划使用。
 - `POST /model-inference/availability` 按冻结因子、数据截止时间和历史交易日检查每日推理可用性。
 - `GET /model-signals` 返回指定不可变模型版本、交易日的PIT安全TopN信号，供AlphaBlocks正式策略回测读取。
-- `POST /research/api/v1/jobs` 通过统一FactorService地址向本机研究进程下发训练或推理任务。
-- `GET /research/ready` 和 `GET /research/api/v1/status` 查询研究进程状态。
+- `POST /research/api/v1/jobs` 通过统一FactorService地址下发训练或推理任务。
+- `GET /research/ready` 和 `GET /research/api/v1/status` 查询内置研究调度器状态。
 
 聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过
 `rtk .venv/bin/python scripts/export_joinquant_factor_catalog.py` 重新生成公开目录与详情快照。
@@ -91,15 +91,13 @@ http://127.0.0.1:8100
 
 ```bash
 cd /Users/zhao/Desktop/git/AlphaFactorService
-python3.11 -m venv .venv-research
-.venv-research/bin/pip install -e '.[research]'
+python3.11 -m venv .venv
+.venv/bin/pip install -e .
 pm2 start ecosystem.config.js
 ```
 
-默认启动两个隔离进程：
-
-- `alpha-factor-service`：统一API，包含因子、模型信号、回测与研究网关。
-- `alpha-factor-research-worker`：Qlib多模型训练和每日推理，只监听loopback。
+PM2只启动一个常驻进程`alpha-factor-service`，统一提供因子、模型信号、回测、
+Qlib多模型训练和每日推理。模型训练在任务期间启动隔离子进程，完成后自动退出。
 
 研究能力已经融合到`factor_service.research`模块，不再存在第二个顶层业务包。当前处于开发阶段，
 训练产物只接受新的`factor_service.research.models`类路径，不保留旧Worker包兼容层。
@@ -119,14 +117,12 @@ config/runtime.local.yaml
 `runtime.local.yaml`已被Git忽略。部署时可以用`ALPHA_FACTOR_RUNTIME_CONFIG`显式选择
 另一份YAML；除Python解释器选择外，PM2不再通过环境变量覆盖业务配置。
 
-研究进程使用Python 3.11或3.12，并复用同一份`clickhouse`配置。研究配置示例：
+统一服务使用Python 3.11或3.12，并复用同一份`clickhouse`配置。研究配置示例：
 
 ```yaml
 research:
   api_url: http://127.0.0.1:8001/api/model-research
   token: ""
-  listen_host: 127.0.0.1
-  listen_port: 8787
   storage:
     work_root: /Volumes/QuantData/alphafactor/research-work
     model_artifacts_root: /Volumes/QuantData/alphafactor/model-artifacts
@@ -137,7 +133,13 @@ research:
 原子发布的正式模型产物。两者都由AlphaFactorService管理。相对路径从项目根目录解析；需要
 放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 
-AlphaBlocks只配置`external_services.factor_service.base_url`，不再保存单独的研究Worker地址。
+AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独的研究服务地址或端口。
+
+安装后可用统一命令执行环境诊断：
+
+```bash
+alpha-factor-service doctor
+```
 
 如果以后需要独立后台消费 pending 任务，可以单独运行：
 
