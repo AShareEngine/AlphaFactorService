@@ -31,6 +31,17 @@ class ComputePlan:
 
 
 @dataclass(frozen=True)
+class FactorQueryPlan:
+    """Read-only factor calculation used by dataset materialization/inference."""
+
+    sql: str
+    params: dict
+    date_start: date
+    date_end: date
+    params_hash: str
+
+
+@dataclass(frozen=True)
 class ValueSqlPlan:
     sql: str
     max_window: int
@@ -92,65 +103,16 @@ def run_job(job_id: str) -> FactorJobOut:
 
 
 def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
-    if factor.frequency != "daily":
-        raise ValueError(
-            "分钟因子必须由分钟计算器写入，daily worker 不接受 minute 因子"
-        )
+    query_plan = build_factor_query_plan(
+        factor,
+        overrides=job.params or {},
+        entity_type=job.entity_type,
+        date_start=job.date_start,
+        date_end=job.date_end,
+        job_id=job.job_id,
+    )
     config = settings()
     factor_db = _identifier(config.clickhouse_database, "factor database")
-    source_db = _identifier(config.source_database, "source database")
-    source_table = _identifier(config.stock_daily_table, "stock daily table")
-    stock_basic_table = _identifier(config.stock_basic_table, "stock basic table")
-    code_column = _identifier(config.stock_code_column, "stock code column")
-    date_column = _identifier(config.stock_date_column, "stock date column")
-    stock_type_column = _identifier(config.stock_basic_type_column, "stock basic type column")
-
-    params = _formula_params(factor, job.params or {})
-    window = _positive_int(params.get("window", 20), "window")
-    source = f"{source_db}.{source_table}"
-    stock_basic = f"{source_db}.{stock_basic_table}"
-    universe_filter = f"""
-        AND {code_column} IN (
-            SELECT {code_column}
-            FROM {stock_basic}
-            WHERE {stock_type_column} = {{stock_type_value:String}}
-        )
-    """
-    value_plan = _build_value_sql(
-        factor.expression,
-        source=source,
-        code_column=code_column,
-        date_column=date_column,
-        params={**params, "window": window},
-        universe_filter=universe_filter,
-    )
-    processing = _postprocess_config(factor)
-    postprocessed_sql = _build_postprocessed_sql(
-        value_plan.sql,
-        output_type=factor.output_type,
-        processing=processing,
-    )
-    date_start, date_end = _resolve_date_range(job.date_start, job.date_end, source_db, source_table, date_column)
-    lookback_days = max(value_plan.max_window * 4 + 20, 90)
-    source_start = date_start - timedelta(days=lookback_days)
-    _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
-    _ensure_source_has_rows(source, date_column, source_start, date_end)
-    params_hash = _params_hash(factor.factor_id, factor.version, params)
-    source_vintage = (
-        f"{source_db}.{source_table}@{date_end.isoformat()}#{job.job_id}"
-    )
-    base_params = {
-        "date_start": date_start,
-        "date_end": date_end,
-        "source_start": source_start,
-        "entity_type": job.entity_type,
-        "factor_id": factor.factor_id,
-        "factor_version": factor.version,
-        "params_hash": params_hash,
-        "job_id": job.job_id,
-        "source_vintage": source_vintage,
-        "stock_type_value": config.stock_basic_stock_type_value,
-    }
     sql = f"""
     INSERT INTO {factor_db}.factor_values_daily
     (
@@ -189,13 +151,104 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         {{source_vintage:String}},
         now()
     FROM (
+        {query_plan.sql}
+    )
+    """
+    return ComputePlan(
+        sql=sql,
+        params=query_plan.params,
+        date_start=query_plan.date_start,
+        date_end=query_plan.date_end,
+        params_hash=query_plan.params_hash,
+    )
+
+
+def build_factor_query_plan(
+    factor: FactorOut,
+    *,
+    overrides: dict,
+    entity_type: str,
+    date_start: Optional[date],
+    date_end: Optional[date],
+    job_id: str,
+) -> FactorQueryPlan:
+    """Build the canonical factor SELECT without persisting factor values."""
+    if factor.frequency != "daily":
+        raise ValueError(
+            "分钟因子必须由分钟计算器写入，daily worker 不接受 minute 因子"
+        )
+    config = settings()
+    source_db = _identifier(config.source_database, "source database")
+    source_table = _identifier(config.stock_daily_table, "stock daily table")
+    stock_basic_table = _identifier(config.stock_basic_table, "stock basic table")
+    code_column = _identifier(config.stock_code_column, "stock code column")
+    date_column = _identifier(config.stock_date_column, "stock date column")
+    stock_type_column = _identifier(config.stock_basic_type_column, "stock basic type column")
+
+    params = _formula_params(factor, overrides)
+    window = _positive_int(params.get("window", 20), "window")
+    source = f"{source_db}.{source_table}"
+    stock_basic = f"{source_db}.{stock_basic_table}"
+    universe_filter = f"""
+        AND {code_column} IN (
+            SELECT {code_column}
+            FROM {stock_basic}
+            WHERE {stock_type_column} = {{stock_type_value:String}}
+        )
+    """
+    value_plan = _build_value_sql(
+        factor.expression,
+        source=source,
+        code_column=code_column,
+        date_column=date_column,
+        params={**params, "window": window},
+        universe_filter=universe_filter,
+    )
+    processing = _postprocess_config(factor)
+    postprocessed_sql = _build_postprocessed_sql(
+        value_plan.sql,
+        output_type=factor.output_type,
+        processing=processing,
+    )
+    date_start, date_end = _resolve_date_range(
+        date_start, date_end, source_db, source_table, date_column,
+    )
+    lookback_days = max(value_plan.max_window * 4 + 20, 90)
+    source_start = date_start - timedelta(days=lookback_days)
+    _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
+    _ensure_source_has_rows(source, date_column, source_start, date_end)
+    params_hash = _params_hash(factor.factor_id, factor.version, params)
+    source_vintage = (
+        f"{source_db}.{source_table}@{date_end.isoformat()}#{job_id}"
+    )
+    base_params = {
+        "date_start": date_start,
+        "date_end": date_end,
+        "source_start": source_start,
+        "entity_type": entity_type,
+        "factor_id": factor.factor_id,
+        "factor_version": factor.version,
+        "params_hash": params_hash,
+        "job_id": job_id,
+        "source_vintage": source_vintage,
+        "stock_type_value": config.stock_basic_stock_type_value,
+    }
+    sql = f"""
+    SELECT trade_date, entity_code, raw_value, rank_value, percentile, score
+    FROM (
         {postprocessed_sql}
     )
     WHERE trade_date >= {{date_start:Date}}
       AND trade_date <= {{date_end:Date}}
       AND raw_value IS NOT NULL
     """
-    return ComputePlan(sql=sql, params=base_params, date_start=date_start, date_end=date_end, params_hash=params_hash)
+    return FactorQueryPlan(
+        sql=sql,
+        params=base_params,
+        date_start=date_start,
+        date_end=date_end,
+        params_hash=params_hash,
+    )
 
 
 def _postprocess_config(factor: FactorOut) -> PostprocessConfig:

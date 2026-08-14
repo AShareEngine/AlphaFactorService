@@ -14,7 +14,11 @@ import numpy as np
 import pandas as pd
 
 from factor_service.research.config import Settings
-from factor_service.research.dataset import DatasetBuilder, PreparedDataset
+from factor_service.research.dataset import (
+    DatasetBuilder,
+    PreparedDataset,
+    walk_forward_segments,
+)
 from factor_service.research.job import CancellationToken, ProgressCallback
 
 
@@ -47,12 +51,17 @@ class QlibTrainer:
         work_dir.mkdir(parents=True, exist_ok=True)
         _checkpoint(cancellation)
         prepared = self.dataset_builder.build(job, cancellation=cancellation, progress=progress)
+        config = dict(job.get("config_json") or {})
+        walk_forward_config = dict(config.get("walk_forward") or {})
         dataset_path = work_dir / "dataset.parquet"
         prepared.frame.to_parquet(dataset_path)
+        raw_dataset_path = work_dir / "dataset_raw.parquet"
+        if walk_forward_config.get("enabled") is True and prepared.raw_frame is not None:
+            prepared.raw_frame.to_parquet(raw_dataset_path)
         handler = DataHandlerLP.from_df(prepared.frame)
         dataset = DatasetH(handler=handler, segments=prepared.segments)
-        raw_params = dict((job.get("config_json") or {}).get("model", {}).get("params") or {})
-        model_kind = str((job.get("config_json") or {}).get("model", {}).get("kind") or "lightgbm")
+        raw_params = dict(config.get("model", {}).get("params") or {})
+        model_kind = str(config.get("model", {}).get("kind") or "lightgbm")
         model, model_params = _create_model(model_kind, raw_params, len(prepared.feature_names))
         recorder_root = work_dir / "mlruns"
         # DatasetH由已冻结的DataFrame驱动，不读取Qlib本地行情；0.9.7仍要求
@@ -66,6 +75,8 @@ class QlibTrainer:
         recorder_uri = f"sqlite:///{recorder_db.as_posix()}"
         experiment_name = f"alphablocks_{job['model_id']}"
         evals_result: dict[str, Any] = {}
+        walk_forward_report: dict[str, Any] | None = None
+        walk_forward_prediction: pd.Series | None = None
         with R.start(
             experiment_name=experiment_name,
             recorder_name=str(job["job_id"]),
@@ -77,10 +88,28 @@ class QlibTrainer:
                 dataset_hash=job["dataset_hash"],
                 schema_version="alphablocks.qlib-training.v1",
             )
-            _progress(progress, "training", 58, {"iteration": 0})
+            if walk_forward_config.get("enabled") is True:
+                walk_forward_prediction, walk_forward_report = _run_walk_forward(
+                    prepared,
+                    walk_forward_config,
+                    model_kind=model_kind,
+                    raw_params=raw_params,
+                    DataHandlerLP=DataHandlerLP,
+                    DatasetH=DatasetH,
+                    cancellation=cancellation,
+                    progress=progress,
+                )
+                training_start = 73
+            else:
+                training_start = 58
+            _progress(progress, "training_final_model", training_start, {"iteration": 0})
             _fit_model(
                 model_kind, model, dataset, evals_result,
                 cancellation=cancellation, progress=progress,
+                stage="training_final_model",
+                progress_start=training_start,
+                progress_end=80,
+                metric_prefix="final.",
             )
             _checkpoint(cancellation)
             _progress(progress, "predicting", 82, {})
@@ -88,11 +117,22 @@ class QlibTrainer:
             R.save_objects(trained_model=model)
             recorder_id = R.get_recorder().id
         # 研究回测只允许使用完全样本外的test段；train/valid预测不得进入模型信号库。
-        prediction_frame = _prediction_frame(test_prediction, prepared, job)
+        # 开启Walk-Forward时发布各窗口拼接后的OOS预测，正式模型仍单独保存用于后续每日推理。
+        published_prediction = walk_forward_prediction if walk_forward_prediction is not None else test_prediction
+        prediction_frame = _prediction_frame(published_prediction, prepared, job)
         predictions_path = work_dir / "predictions.parquet"
         prediction_frame.to_parquet(predictions_path, index=False)
         prediction_rows = len(prediction_frame)
-        metrics = _metrics(test_prediction, prepared.frame, prepared.segments["test"])
+        standard_metrics = _metrics(test_prediction, prepared.frame, prepared.segments["test"])
+        if walk_forward_report is not None:
+            metrics: dict[str, Any] = {
+                **walk_forward_report["aggregate"],
+                "evaluation_mode": "walk_forward",
+                "walk_forward_windows": walk_forward_report["window_count"],
+                "standard_test": standard_metrics,
+            }
+        else:
+            metrics = {**standard_metrics, "evaluation_mode": "single_split"}
         feature_importance = _feature_importance(model, prepared.feature_names)
         manifest = {
             **prepared.manifest,
@@ -103,6 +143,7 @@ class QlibTrainer:
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
             "model_params": model_params,
+            "walk_forward": walk_forward_report,
             "environment": {
                 "python": platform.python_version(),
                 "platform": platform.platform(),
@@ -128,6 +169,8 @@ class QlibTrainer:
         with tarfile.open(bundle_path, "w:gz") as archive:
             for path in [manifest_path, metrics_path, importance_path, config_path, model_path, predictions_path]:
                 archive.add(path, arcname=path.name)
+            if raw_dataset_path.exists():
+                archive.add(raw_dataset_path, arcname=raw_dataset_path.name)
             if recorder_db.exists():
                 archive.add(recorder_db, arcname=recorder_db.name)
             if recorder_root.exists():
@@ -150,6 +193,8 @@ class QlibTrainer:
             ("predictions", predictions_path),
             ("manifest", manifest_path),
         ]
+        if raw_dataset_path.exists():
+            artifacts.append(("dataset_raw", raw_dataset_path))
         _checkpoint(cancellation)
         _progress(progress, "packaged", 88, {
             "artifact_count": len(artifacts), "prediction_rows": prediction_rows,
@@ -249,6 +294,131 @@ class QlibTrainer:
         return published
 
 
+def _run_walk_forward(
+    prepared: PreparedDataset,
+    config: dict[str, Any],
+    *,
+    model_kind: str,
+    raw_params: dict[str, Any],
+    DataHandlerLP: Any,
+    DatasetH: Any,
+    cancellation: CancellationToken | None,
+    progress: ProgressCallback | None,
+) -> tuple[pd.Series, dict[str, Any]]:
+    raw_frame = prepared.raw_frame
+    if raw_frame is None:
+        raise ValueError("Walk-Forward缺少未填充的冻结数据集")
+    dates = pd.Index(raw_frame.index.get_level_values("datetime").unique())
+    windows = walk_forward_segments(
+        dates,
+        strategy=str(config.get("strategy") or "rolling"),
+        train_years=int(config.get("train_years") or 3),
+        valid_months=int(config.get("valid_months") or 6),
+        test_months=int(config.get("test_months") or 12),
+        step_months=int(config.get("step_months") or 12),
+        max_windows=int(config.get("max_windows") or 4),
+        embargo_days=int(config.get("embargo_days") or 5),
+    )
+    if not windows:
+        raise ValueError("没有可执行的Walk-Forward窗口")
+
+    predictions: list[pd.Series] = []
+    reports: list[dict[str, Any]] = []
+    total = len(windows)
+    for index, segments in enumerate(windows, start=1):
+        _checkpoint(cancellation)
+        start_percent = 58 + int(14 * (index - 1) / total)
+        end_percent = 58 + int(14 * index / total)
+        details = {"window_index": index, "window_count": total, "segments": segments}
+        _progress(progress, "walk_forward_training", start_percent, details)
+        window_frame, medians = _walk_forward_frame(prepared, segments)
+        dataset = DatasetH(
+            handler=DataHandlerLP.from_df(window_frame),
+            segments=segments,
+        )
+        model, _ = _create_model(model_kind, raw_params, len(prepared.feature_names))
+        evals_result: dict[str, Any] = {}
+        _fit_model(
+            model_kind,
+            model,
+            dataset,
+            evals_result,
+            cancellation=cancellation,
+            progress=progress,
+            stage="walk_forward_training",
+            progress_start=start_percent,
+            progress_end=end_percent,
+            progress_details=details,
+            metric_prefix=f"walk_forward.window_{index}.",
+        )
+        prediction = model.predict(dataset, segment="test")
+        window_metrics = _metrics(prediction, raw_frame, segments["test"])
+        predictions.append(prediction)
+        reports.append({
+            "window": index,
+            "segments": segments,
+            "metrics": window_metrics,
+            "train_medians": medians,
+        })
+
+    stitched = pd.concat(predictions).sort_index()
+    if stitched.index.duplicated().any():
+        raise ValueError("Walk-Forward样本外预测日期重叠")
+    aggregate = _metrics(
+        stitched,
+        raw_frame,
+        (windows[0]["test"][0], windows[-1]["test"][1]),
+    )
+    window_ics = np.asarray([float(item["metrics"]["ic"]) for item in reports], dtype=float)
+    aggregate.update({
+        "window_ic_mean": float(window_ics.mean()),
+        "window_ic_std": float(window_ics.std(ddof=1)) if len(window_ics) > 1 else 0.0,
+        "positive_ic_window_ratio": float(np.mean(window_ics > 0)),
+    })
+    report = {
+        "schema_version": "alphablocks.walk-forward.v1",
+        "enabled": True,
+        "strategy": str(config.get("strategy") or "rolling"),
+        "train_years": int(config.get("train_years") or 3),
+        "valid_months": int(config.get("valid_months") or 6),
+        "test_months": int(config.get("test_months") or 12),
+        "step_months": int(config.get("step_months") or 12),
+        "embargo_days": int(config.get("embargo_days") or 5),
+        "window_count": total,
+        "windows": reports,
+        "aggregate": aggregate,
+        "prediction_date_start": windows[0]["test"][0],
+        "prediction_date_end": windows[-1]["test"][1],
+    }
+    return stitched, report
+
+
+def _walk_forward_frame(
+    prepared: PreparedDataset,
+    segments: dict[str, tuple[str, str]],
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    raw_frame = prepared.raw_frame
+    if raw_frame is None:
+        raise ValueError("Walk-Forward缺少原始特征")
+    train_start, train_end = segments["train"]
+    train_features = raw_frame.loc[
+        pd.IndexSlice[train_start:train_end, :], pd.IndexSlice["feature", :]
+    ]
+    medians = {
+        name: float(pd.to_numeric(train_features[("feature", name)], errors="coerce").median())
+        for name in prepared.feature_names
+    }
+    missing = [name for name, value in medians.items() if not np.isfinite(value)]
+    if missing:
+        raise ValueError("Walk-Forward训练段无法计算因子中位数: " + ", ".join(missing))
+    window_start = segments["train"][0]
+    window_end = segments["test"][1]
+    frame = raw_frame.loc[pd.IndexSlice[window_start:window_end, :], :].copy()
+    for name, value in medians.items():
+        frame[("feature", name)] = frame[("feature", name)].fillna(value)
+    return frame, medians
+
+
 def _fit_model(
     model_kind: str,
     model: Any,
@@ -257,6 +427,11 @@ def _fit_model(
     *,
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
+    stage: str = "training",
+    progress_start: int = 58,
+    progress_end: int = 80,
+    progress_details: dict[str, Any] | None = None,
+    metric_prefix: str = "",
 ) -> None:
     """Fit one Qlib model; LightGBM retains per-iteration cancellation points."""
     if model_kind != "lightgbm":
@@ -270,12 +445,22 @@ def _fit_model(
                 evals_result=evals_result,
             )
         else:
+            def mapped_progress(
+                _stage: str, percent: int, details: dict[str, Any],
+            ) -> None:
+                ratio = min(1.0, max(0.0, (int(percent) - 58) / 22))
+                mapped = progress_start + int((progress_end - progress_start) * ratio)
+                _progress(progress, stage, mapped, {**(progress_details or {}), **details})
+
             model.fit(
                 dataset, evals_result=evals_result,
-                cancellation=cancellation, progress=progress,
+                cancellation=cancellation, progress=mapped_progress,
             )
         _checkpoint(cancellation)
-        _progress(progress, "training", 80, {"model_kind": model_kind, "completed": True})
+        _progress(
+            progress, stage, progress_end,
+            {**(progress_details or {}), "model_kind": model_kind, "completed": True},
+        )
         return
 
     import lightgbm as lgb
@@ -289,8 +474,20 @@ def _fit_model(
         _checkpoint(cancellation)
         iteration = int(environment.iteration) + 1
         if iteration == 1 or iteration % 20 == 0:
-            percent = min(80, 58 + int(22 * iteration / total))
-            _progress(progress, "training", percent, {"iteration": iteration, "total_iterations": total})
+            percent = min(
+                progress_end,
+                progress_start + int((progress_end - progress_start) * iteration / total),
+            )
+            _progress(
+                progress,
+                stage,
+                percent,
+                {
+                    **(progress_details or {}),
+                    "iteration": iteration,
+                    "total_iterations": total,
+                },
+            )
 
     cooperative_callback.order = 0  # type: ignore[attr-defined]
     cooperative_callback.before_iteration = True  # type: ignore[attr-defined]
@@ -311,7 +508,12 @@ def _fit_model(
     for name in names:
         for metric, values in evals_result[name].items():
             for epoch, value in enumerate(values):
-                R.log_metrics(**{f"{metric}.{name}".replace("@", "_"): value}, step=epoch)
+                metric_name = f"{metric_prefix}{metric}.{name}".replace("@", "_")
+                R.log_metrics(**{metric_name: value}, step=epoch)
+    _progress(
+        progress, stage, progress_end,
+        {**(progress_details or {}), "model_kind": model_kind, "completed": True},
+    )
 
 
 def _checkpoint(cancellation: CancellationToken | None) -> None:

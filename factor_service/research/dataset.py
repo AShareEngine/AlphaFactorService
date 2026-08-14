@@ -11,8 +11,10 @@ import clickhouse_connect
 import numpy as np
 import pandas as pd
 
+from factor_service import repository as factor_repository
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.worker import build_factor_query_plan
 
 
 FACTOR_COMPUTED_CUTOFF = "computed_at <= {cutoff:DateTime}"
@@ -29,6 +31,7 @@ class PreparedDataset:
     coverage: dict[str, float]
     medians: dict[str, float]
     manifest: dict[str, Any]
+    raw_frame: pd.DataFrame | None = None
 
 
 class DatasetBuilder:
@@ -102,6 +105,11 @@ class DatasetBuilder:
             cutoff_for_clickhouse = cutoff
         date_start = str(spec["date_start"])
         date_end = str(spec["date_end"])
+        signal_close = datetime.combine(
+            pd.Timestamp(date_end).date(), datetime.min.time(),
+        ).replace(hour=15)
+        if cutoff_for_clickhouse < signal_close:
+            raise ValueError("data_cutoff不得早于训练结束日收盘时间")
         feature_frames: list[pd.DataFrame] = []
         feature_names: list[str] = []
         coverage: dict[str, float] = {}
@@ -150,13 +158,16 @@ class DatasetBuilder:
         if any(not np.isfinite(value) for value in medians.values()):
             missing = [name for name, value in medians.items() if not np.isfinite(value)]
             raise ValueError("训练段无法计算因子中位数: " + ", ".join(missing))
-        panel[feature_names] = panel[feature_names].fillna(medians)
         _checkpoint(cancellation)
-        indexed = panel.set_index(["trade_date", "instrument"])
-        indexed.index.names = ["datetime", "instrument"]
-        indexed = indexed[feature_names + ["LABEL0"]]
-        indexed.columns = pd.MultiIndex.from_tuples(
+        raw_indexed = panel.set_index(["trade_date", "instrument"])
+        raw_indexed.index.names = ["datetime", "instrument"]
+        raw_indexed = raw_indexed[feature_names + ["LABEL0"]]
+        raw_indexed.columns = pd.MultiIndex.from_tuples(
             [("feature", name) for name in feature_names] + [("label", "LABEL0")]
+        )
+        indexed = raw_indexed.copy()
+        indexed.loc[:, pd.IndexSlice["feature", :]] = (
+            indexed.loc[:, pd.IndexSlice["feature", :]].fillna(medians)
         )
         manifest = {
             "schema_version": "alphablocks.qlib-dataset.v1",
@@ -169,18 +180,27 @@ class DatasetBuilder:
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "future_function_guards": [
-                "computed_at <= data_cutoff",
-                "event_available_at <= trade_date close",
+                "factor definitions and parameters frozen before materialization",
+                "source rows limited to signal date and available by market close",
+                "data_cutoff >= final signal date close",
                 "historical index membership",
                 "five session split embargo",
                 "preprocessors fitted on train only",
             ],
+            "materialization": {
+                "mode": "on_demand",
+                "format": "parquet",
+                "persist_factor_values": False,
+            },
         }
         manifest["content_fingerprint"] = _frame_fingerprint(indexed)
         _progress(progress, "dataset_ready", 56, {
             "row_count": len(indexed), "feature_count": len(feature_names),
         })
-        return PreparedDataset(indexed, segments, feature_names, coverage, medians, manifest)
+        return PreparedDataset(
+            indexed, segments, feature_names, coverage, medians, manifest,
+            raw_frame=raw_indexed,
+        )
 
     def _membership(self, date_start: str, date_end: str) -> pd.DataFrame:
         rows = self.client.query(
@@ -214,36 +234,35 @@ class DatasetBuilder:
     def _factor_values(
         self, item: dict[str, Any], cutoff: datetime, date_start: str, date_end: str,
     ) -> pd.DataFrame:
-        rows = self.client.query(
-            f"""
-            SELECT trade_date, entity_code, score
-            FROM (
-                SELECT trade_date, entity_code, score,
-                       row_number() OVER (
-                           PARTITION BY trade_date, entity_code
-                           ORDER BY computed_at DESC, updated_at DESC
-                       ) AS row_number
-                FROM {self.settings.factor_database}.factor_values_daily
-                WHERE factor_id = {{factor_id:String}}
-                  AND factor_version = {{factor_version:UInt32}}
-                  AND params_hash = {{params_hash:String}}
-                  AND trade_date >= {{date_start:Date}}
-                  AND trade_date <= {{date_end:Date}}
-                  AND {FACTOR_COMPUTED_CUTOFF}
-                  AND {FACTOR_EVENT_CUTOFF}
-                  AND score IS NOT NULL
-            ) WHERE row_number = 1
-            ORDER BY trade_date, entity_code
-            """,
-            parameters={
-                "factor_id": item["factor_id"],
-                "factor_version": int(item["factor_version"]),
-                "params_hash": item["params_hash"],
-                "date_start": date_start,
-                "date_end": date_end,
-                "cutoff": cutoff,
-            },
-        ).result_rows
+        signal_close = datetime.combine(
+            pd.Timestamp(date_end).date(), datetime.min.time(),
+        ).replace(hour=15)
+        if cutoff < signal_close:
+            raise ValueError(f"因子{item['factor_id']}的数据截止时间早于信号日收盘")
+        factor = factor_repository.get_factor(
+            str(item["factor_id"]), version=int(item["factor_version"]),
+        )
+        if factor is None:
+            raise ValueError(
+                f"冻结因子不存在: {item['factor_id']} v{item['factor_version']}"
+            )
+        params = item.get("params")
+        if not isinstance(params, dict):
+            raise ValueError(f"冻结因子{item['factor_id']}缺少params")
+        plan = build_factor_query_plan(
+            factor,
+            overrides=params,
+            entity_type="stock",
+            date_start=pd.Timestamp(date_start).date(),
+            date_end=pd.Timestamp(date_end).date(),
+            job_id="model-dataset",
+        )
+        expected_hash = str(item.get("params_hash") or "").strip().lower()
+        if plan.params_hash != expected_hash:
+            raise ValueError(
+                f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+            )
+        rows = self.client.query(plan.sql, parameters=plan.params).result_rows
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument", "value"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
@@ -312,6 +331,69 @@ def split_trading_dates(dates: pd.Index, *, embargo_days: int = 5) -> dict[str, 
     }
 
 
+def walk_forward_segments(
+    dates: pd.Index,
+    *,
+    strategy: str = "rolling",
+    train_years: int = 3,
+    valid_months: int = 6,
+    test_months: int = 12,
+    step_months: int = 12,
+    max_windows: int = 4,
+    embargo_days: int = 5,
+) -> list[dict[str, tuple[str, str]]]:
+    """Build recent, non-overlapping walk-forward windows from trading sessions.
+
+    One year is defined as 252 observed trading sessions and one month as 21.
+    All embargoes are counted using the supplied trading calendar.  When more
+    windows are available than requested, the most recent windows are retained.
+    """
+    unique = pd.Index(sorted(pd.to_datetime(dates).unique()))
+    if strategy not in {"rolling", "expanding"}:
+        raise ValueError("Walk-Forward策略只允许rolling或expanding")
+    train_sessions = int(train_years) * 252
+    valid_sessions = int(valid_months) * 21
+    test_sessions = int(test_months) * 21
+    step_sessions = int(step_months) * 21
+    embargo = int(embargo_days)
+    limit = int(max_windows)
+    if train_sessions < 252 or valid_sessions < 21 or test_sessions < 21:
+        raise ValueError("Walk-Forward训练、验证或测试窗口长度无效")
+    if step_sessions < test_sessions:
+        raise ValueError("Walk-Forward步长不得小于测试窗口，避免样本外预测日期重叠")
+    if embargo < 1 or limit < 1:
+        raise ValueError("Walk-Forward隔离天数和窗口数必须大于0")
+
+    required = train_sessions + valid_sessions + test_sessions + embargo * 2
+    if len(unique) < required:
+        raise ValueError(
+            f"有效交易日不足{required}天，无法生成Walk-Forward训练/验证/测试窗口"
+        )
+
+    windows: list[dict[str, tuple[str, str]]] = []
+    offset = 0
+    while True:
+        train_start_index = 0 if strategy == "expanding" else offset
+        train_end_index = offset + train_sessions - 1
+        valid_start_index = train_end_index + embargo + 1
+        valid_end_index = valid_start_index + valid_sessions - 1
+        test_start_index = valid_end_index + embargo + 1
+        test_end_index = test_start_index + test_sessions - 1
+        if test_end_index >= len(unique):
+            break
+        windows.append({
+            "train": _date_range(unique, train_start_index, train_end_index),
+            "valid": _date_range(unique, valid_start_index, valid_end_index),
+            "test": _date_range(unique, test_start_index, test_end_index),
+        })
+        offset += step_sessions
+    return windows[-limit:]
+
+
+def _date_range(dates: pd.Index, start: int, end: int) -> tuple[str, str]:
+    return (dates[start].date().isoformat(), dates[end].date().isoformat())
+
+
 def _feature_name(item: dict[str, Any]) -> str:
     return f"{item['factor_id']}__v{int(item['factor_version'])}__{str(item['params_hash'])[:8]}"
 
@@ -335,6 +417,6 @@ def _progress(
 
 
 __all__ = [
-    "DatasetBuilder", "PreparedDataset", "split_trading_dates",
+    "DatasetBuilder", "PreparedDataset", "split_trading_dates", "walk_forward_segments",
     "FACTOR_COMPUTED_CUTOFF", "FACTOR_EVENT_CUTOFF",
 ]

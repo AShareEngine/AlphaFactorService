@@ -9,6 +9,7 @@ from typing import BinaryIO
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_DATASET_SCOPED_KINDS = {"dataset", "dataset_raw", "dataset_manifest"}
 
 
 class ArtifactError(ValueError):
@@ -31,7 +32,7 @@ class ModelArtifactStore:
         expected = str(expected_sha256 or "").strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected):
             raise ArtifactError("X-Artifact-SHA256必须是64位十六进制摘要")
-        if safe_kind == "dataset":
+        if safe_kind in _DATASET_SCOPED_KINDS:
             clean_dataset_hash = str(dataset_hash or "").strip().lower()
             if not re.fullmatch(r"[0-9a-f]{64}", clean_dataset_hash):
                 raise ArtifactError("数据集产物缺少有效dataset_hash")
@@ -65,7 +66,7 @@ class ModelArtifactStore:
             destination = destination_dir / safe_file
             if destination.exists():
                 existing = _file_sha256(destination)
-                if existing != actual and safe_kind == "dataset":
+                if existing != actual and safe_kind in _DATASET_SCOPED_KINDS:
                     raise ArtifactError("相同dataset_hash的冻结数据集内容不一致")
                 if existing == actual:
                     Path(temporary_name).unlink(missing_ok=True)

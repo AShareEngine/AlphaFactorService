@@ -6,6 +6,7 @@ from factor_service.model_research_repository import (
     ModelResearchError,
     _dataset_spec,
     _model_spec,
+    _walk_forward_spec,
 )
 
 
@@ -61,3 +62,18 @@ def test_all_supported_models_have_distinct_training_implementations() -> None:
         spec = _model_spec({"kind": kind, "params": {}})
         assert spec["qlib_model"] == implementation
         assert spec["params"]["seed"] == 42
+
+
+def test_walk_forward_contract_has_strict_independent_test_defaults() -> None:
+    spec = _walk_forward_spec({"enabled": True})
+
+    assert spec["strategy"] == "rolling"
+    assert spec["valid_months"] == 6
+    assert spec["test_months"] == 12
+    assert spec["step_months"] == 12
+    assert spec["embargo_days"] == 5
+
+
+def test_walk_forward_contract_rejects_overlapping_test_windows() -> None:
+    with pytest.raises(ModelResearchError, match="样本外预测重叠"):
+        _walk_forward_spec({"enabled": True, "test_months": 12, "step_months": 6})

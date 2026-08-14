@@ -87,10 +87,17 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         params_hash = str(factor.get("params_hash") or "").strip().lower()
         if not HASH.fullmatch(params_hash):
             raise PermanentJobError(f"因子{factor_id}的params_hash无效")
+        if not isinstance(factor.get("params"), dict):
+            raise PermanentJobError(f"因子{factor_id}缺少冻结params")
         key = (factor_id, version, params_hash)
         if key in seen:
             raise PermanentJobError(f"因子{factor_id}重复")
         seen.add(key)
+    materialization = spec.get("materialization")
+    if not isinstance(materialization, dict) or materialization != {
+        "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
+    }:
+        raise PermanentJobError("数据集必须使用按需计算的不可变Parquet物化方式")
     coverage = float(spec.get("minimum_factor_coverage", 0.8))
     if not 0.5 <= coverage <= 1.0:
         raise PermanentJobError("minimum_factor_coverage必须在0.5到1之间")
@@ -122,6 +129,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         _integer(params.get(field, 42), field, 0, 2_147_483_647)
     if params.get("deterministic", True) is not True:
         raise PermanentJobError("训练必须启用deterministic")
+    _validate_walk_forward(config.get("walk_forward") or {})
     result = dict(payload)
     result.update({
         "job_id": job_id, "model_id": model_id, "lease_token": lease_token,
@@ -163,6 +171,28 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _number(params.get("colsample_bytree", 0.9), "colsample_bytree", 0.01, 1.0)
         _number(params.get("reg_alpha", 0.0), "reg_alpha", 0.0, 1_000_000.0)
         _number(params.get("reg_lambda", 1.0 if kind == "xgboost" else 0.0), "reg_lambda", 0.0, 1_000_000.0)
+
+
+def _validate_walk_forward(source: Any) -> None:
+    if not isinstance(source, dict):
+        raise PermanentJobError("walk_forward必须是对象")
+    if source.get("enabled", False) is not True:
+        return
+    strategy = str(source.get("strategy") or "rolling")
+    if strategy not in {"rolling", "expanding"}:
+        raise PermanentJobError("Walk-Forward策略只允许rolling或expanding")
+    _integer(source.get("train_years", 3), "walk_forward.train_years", 1, 8)
+    _integer(source.get("valid_months", 6), "walk_forward.valid_months", 1, 36)
+    test_months = _integer(
+        source.get("test_months", 12), "walk_forward.test_months", 1, 36,
+    )
+    step_months = _integer(
+        source.get("step_months", 12), "walk_forward.step_months", 1, 36,
+    )
+    _integer(source.get("max_windows", 4), "walk_forward.max_windows", 1, 12)
+    _integer(source.get("embargo_days", 5), "walk_forward.embargo_days", 1, 20)
+    if step_months < test_months:
+        raise PermanentJobError("Walk-Forward步长不得小于测试窗口")
 
 
 def _validate_inference_config(config: dict[str, Any], *, model_id: str, version: int) -> None:

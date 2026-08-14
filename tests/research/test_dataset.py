@@ -4,7 +4,12 @@ import pandas as pd
 import pytest
 from types import SimpleNamespace
 
-from factor_service.research.dataset import DatasetBuilder, _future_rank_label, split_trading_dates
+from factor_service.research.dataset import (
+    DatasetBuilder,
+    _future_rank_label,
+    split_trading_dates,
+    walk_forward_segments,
+)
 from factor_service.research.errors import JobCanceled
 from factor_service.research.job import CancellationToken
 from tests.research.utils import valid_job
@@ -40,6 +45,48 @@ def test_split_has_five_session_embargo_between_segments() -> None:
 def test_split_rejects_too_little_history() -> None:
     with pytest.raises(ValueError, match="不足60天"):
         split_trading_dates(pd.Index(pd.date_range("2024-01-02", periods=30, freq="B")))
+
+
+def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> None:
+    dates = pd.date_range("2018-01-02", periods=1600, freq="B")
+    windows = walk_forward_segments(
+        pd.Index(dates), train_years=1, valid_months=3,
+        test_months=12, step_months=12, max_windows=3, embargo_days=5,
+    )
+
+    assert len(windows) == 3
+    for window in windows:
+        train_start = dates.get_loc(pd.Timestamp(window["train"][0]))
+        train_end = dates.get_loc(pd.Timestamp(window["train"][1]))
+        valid_start = dates.get_loc(pd.Timestamp(window["valid"][0]))
+        valid_end = dates.get_loc(pd.Timestamp(window["valid"][1]))
+        test_start = dates.get_loc(pd.Timestamp(window["test"][0]))
+        assert train_end - train_start + 1 == 252
+        assert valid_start - train_end == 6
+        assert test_start - valid_end == 6
+    for previous, current in zip(windows, windows[1:]):
+        assert pd.Timestamp(previous["test"][1]) < pd.Timestamp(current["test"][0])
+
+
+def test_walk_forward_expanding_windows_keep_original_train_start() -> None:
+    dates = pd.date_range("2018-01-02", periods=1600, freq="B")
+    windows = walk_forward_segments(
+        pd.Index(dates), strategy="expanding", train_years=1,
+        valid_months=3, test_months=6, step_months=6, max_windows=3,
+    )
+
+    assert len(windows) == 3
+    assert {window["train"][0] for window in windows} == {dates[0].date().isoformat()}
+    assert windows[0]["train"][1] < windows[-1]["train"][1]
+
+
+def test_walk_forward_rejects_overlapping_test_windows() -> None:
+    dates = pd.date_range("2018-01-02", periods=1000, freq="B")
+    with pytest.raises(ValueError, match="步长不得小于测试窗口"):
+        walk_forward_segments(
+            pd.Index(dates), train_years=1, valid_months=3,
+            test_months=12, step_months=6,
+        )
 
 
 def test_dataset_build_checks_cancellation_before_clickhouse_query() -> None:

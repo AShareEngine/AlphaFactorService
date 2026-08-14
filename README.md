@@ -151,6 +151,31 @@ AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独�
 模型任务、事件、版本和产物元数据由AlphaFactorService直接写入`control_database`，
 AlphaFactorService不再配置或回调AlphaBlocks API。
 
+### Walk-Forward滚动评估
+
+训练任务可选开启严格Walk-Forward评估。每个窗口按交易日依次执行
+`训练 → 5日隔离 → 验证 → 5日隔离 → 独立测试`，逐窗缺失值中位数仅使用该窗训练段拟合。
+各窗口测试预测按时间拼接后写入模型信号库并用于Top20研究回测；正式模型产物仍单独训练和保存，
+用于后续每日推理。滚动窗口默认按1年252个交易日、1个月21个交易日换算。
+
+```json
+{
+  "walk_forward": {
+    "enabled": true,
+    "strategy": "rolling",
+    "train_years": 1,
+    "valid_months": 3,
+    "test_months": 12,
+    "step_months": 12,
+    "max_windows": 4,
+    "embargo_days": 5
+  }
+}
+```
+
+为保证拼接后的样本外信号唯一，`step_months`不得小于`test_months`。`expanding`策略固定首个
+训练日并逐窗扩展训练段；`rolling`策略保持训练长度不变并向前滚动。
+
 安装后可用统一命令执行环境诊断：
 
 ```bash

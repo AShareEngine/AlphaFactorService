@@ -34,6 +34,36 @@ def test_job_validation_accepts_all_phase2_model_kinds() -> None:
         assert validate_job(candidate)["config_json"]["model"]["kind"] == kind
 
 
+def test_job_validation_accepts_walk_forward_contract() -> None:
+    source = valid_job()
+    source["config_json"]["walk_forward"] = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_years": 1,
+        "valid_months": 3,
+        "test_months": 12,
+        "step_months": 12,
+        "max_windows": 4,
+        "embargo_days": 5,
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["walk_forward"]["train_years"] == 1
+
+
+def test_job_validation_rejects_overlapping_walk_forward_tests() -> None:
+    source = valid_job()
+    source["config_json"]["walk_forward"] = {
+        "enabled": True,
+        "test_months": 12,
+        "step_months": 6,
+    }
+
+    with pytest.raises(PermanentJobError, match="步长不得小于测试窗口"):
+        validate_job(source)
+
+
 def test_job_validation_rejects_tampered_dataset() -> None:
     job = valid_job()
     job["dataset_spec"]["date_end"] = "2026-01-01"

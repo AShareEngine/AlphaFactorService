@@ -36,6 +36,7 @@ class ModelResearchRepository:
     def create_training_job(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         spec = _dataset_spec(payload.get("dataset") or {})
         model = _model_spec(payload.get("model") or {})
+        walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
         spec_json = _canonical_json(spec)
         spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
         dataset_id = f"dataset_{spec_hash[:24]}"
@@ -49,6 +50,7 @@ class ModelResearchRepository:
             "schema_version": "alphablocks.model-training.v1",
             "dataset": spec,
             "model": model,
+            "walk_forward": walk_forward,
             "backtest": {
                 "universe_id": "csi500",
                 "top_n": 20,
@@ -913,8 +915,11 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         factor_id = str(item.get("factor_id") or "").strip()
         version = int(item.get("factor_version") or item.get("version") or 0)
         params_hash = str(item.get("params_hash") or "").strip()
+        params = item.get("params")
         if not factor_id or version <= 0 or not params_hash:
             raise ModelResearchError("每个因子必须锁定factor_id、factor_version和params_hash")
+        if not isinstance(params, Mapping):
+            raise ModelResearchError(f"因子{factor_id}必须冻结params")
         key = (factor_id, version, params_hash)
         if key in seen:
             continue
@@ -923,6 +928,7 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "factor_id": factor_id,
             "factor_version": version,
             "params_hash": params_hash,
+            "params": dict(params),
             "label": str(item.get("label") or factor_id),
             "category": str(item.get("category") or "custom"),
         })
@@ -947,9 +953,14 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         },
         "split": {"train": 0.6, "valid": 0.2, "test": 0.2, "embargo_days": 5},
         "minimum_factor_coverage": 0.8,
+        "materialization": {
+            "mode": "on_demand",
+            "format": "parquet",
+            "persist_factor_values": False,
+        },
         "availability": {
             "event_available_at_lte_signal_close": True,
-            "computed_at_lte_data_cutoff": True,
+            "source_available_at_lte_data_cutoff": True,
         },
     }
 
@@ -1032,6 +1043,44 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         })
     defaults.update(params)
     return {"kind": kind, "qlib_model": definition["qlib_model"], "params": defaults}
+
+
+def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+    enabled = bool(source.get("enabled", False))
+    strategy = str(source.get("strategy") or "rolling").strip().lower()
+    if strategy not in {"rolling", "expanding"}:
+        raise ModelResearchError("Walk-Forward策略只允许rolling或expanding")
+
+    def integer(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(source.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError(f"Walk-Forward {name}必须是整数") from exc
+        if not minimum <= value <= maximum:
+            raise ModelResearchError(
+                f"Walk-Forward {name}必须在{minimum}到{maximum}之间"
+            )
+        return value
+
+    train_years = integer("train_years", 3, 1, 8)
+    valid_months = integer("valid_months", 6, 1, 36)
+    test_months = integer("test_months", 12, 1, 36)
+    step_months = integer("step_months", 12, 1, 36)
+    max_windows = integer("max_windows", 4, 1, 12)
+    embargo_days = integer("embargo_days", 5, 1, 20)
+    if step_months < test_months:
+        raise ModelResearchError("Walk-Forward步长不得小于测试窗口，避免样本外预测重叠")
+    return {
+        "enabled": enabled,
+        "strategy": strategy,
+        "train_years": train_years,
+        "valid_months": valid_months,
+        "test_months": test_months,
+        "step_months": step_months,
+        "max_windows": max_windows,
+        "embargo_days": embargo_days,
+        "session_convention": {"year": 252, "month": 21},
+    }
 
 
 def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:

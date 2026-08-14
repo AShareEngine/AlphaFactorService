@@ -9,6 +9,7 @@ from factor_service.research.trainer import (
     _create_model,
     _prediction_frame,
     _qlib_lgb_params,
+    _walk_forward_frame,
     predict_feature_frame,
 )
 
@@ -95,3 +96,87 @@ def test_prediction_rank_one_is_the_highest_score() -> None:
     assert str(ranked.loc["HIGH", "feature_cutoff_at"].tz) == "Asia/Shanghai"
     assert ranked.loc["HIGH", "feature_cutoff_at"].hour == 15
     assert str(ranked.loc["HIGH", "computed_at"].tz) == "Asia/Shanghai"
+
+
+def test_walk_forward_imputation_is_fitted_on_window_train_only() -> None:
+    dates = pd.date_range("2024-01-02", periods=12, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["A"]], names=["datetime", "instrument"],
+    )
+    values = [1.0] * 5 + [999.0] * 6 + [float("nan")]
+    raw = pd.DataFrame(
+        {("feature", "factor"): values, ("label", "LABEL0"): [0.0] * 12},
+        index=index,
+    )
+    prepared = SimpleNamespace(raw_frame=raw, feature_names=["factor"])
+    segments = {
+        "train": (dates[0].date().isoformat(), dates[4].date().isoformat()),
+        "valid": (dates[6].date().isoformat(), dates[7].date().isoformat()),
+        "test": (dates[9].date().isoformat(), dates[-1].date().isoformat()),
+    }
+
+    frame, medians = _walk_forward_frame(prepared, segments)
+
+    assert medians["factor"] == 1.0
+    assert frame.loc[(dates[-1], "A"), ("feature", "factor")] == 1.0
+
+
+def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
+    script = """
+        import os
+        import tempfile
+        from pathlib import Path
+        import numpy as np
+        import pandas as pd
+        import qlib
+        from qlib.data.dataset import DataHandlerLP, DatasetH
+        from qlib.workflow import R
+        from factor_service.research.dataset import PreparedDataset
+        from factor_service.research.trainer import _run_walk_forward
+
+        root = Path(tempfile.mkdtemp())
+        os.chdir(root)
+        dates = pd.date_range("2020-01-02", periods=380, freq="B")
+        index = pd.MultiIndex.from_product(
+            [dates, ["A", "B", "C", "D"]], names=["datetime", "instrument"],
+        )
+        rng = np.random.default_rng(42)
+        feature = rng.normal(size=len(index))
+        label = feature * 0.5 + rng.normal(scale=0.1, size=len(index))
+        raw = pd.DataFrame(
+            {("feature", "factor"): feature, ("label", "LABEL0"): label},
+            index=index,
+        )
+        prepared = PreparedDataset(
+            frame=raw, segments={}, feature_names=["factor"], coverage={},
+            medians={}, manifest={}, raw_frame=raw,
+        )
+        provider = root / "provider"
+        provider.mkdir()
+        qlib.init(provider_uri=str(provider), expression_cache=None, dataset_cache=None)
+        with R.start(
+            experiment_name="walk_forward_test", recorder_name="smoke",
+            uri=f"sqlite:///{(root / 'mlflow.db').as_posix()}",
+        ):
+            prediction, report = _run_walk_forward(
+                prepared,
+                {
+                    "enabled": True, "strategy": "rolling", "train_years": 1,
+                    "valid_months": 1, "test_months": 1, "step_months": 1,
+                    "max_windows": 1, "embargo_days": 5,
+                },
+                model_kind="lightgbm",
+                raw_params={"n_estimators": 2, "early_stopping_rounds": 1, "num_threads": 1},
+                DataHandlerLP=DataHandlerLP, DatasetH=DatasetH,
+                cancellation=None, progress=None,
+            )
+        assert len(prediction) == 84
+        assert not prediction.index.duplicated().any()
+        assert report["window_count"] == 1
+        assert report["aggregate"]["test_days"] == 21
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
