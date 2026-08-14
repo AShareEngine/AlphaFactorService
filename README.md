@@ -26,8 +26,8 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 - `POST /factor-values/sync-states` 批量查询因子规格的真实持久化覆盖范围，供自动全量/增量同步规划使用。
 - `POST /model-inference/availability` 按冻结因子、数据截止时间和历史交易日检查每日推理可用性。
 - `GET /model-signals` 返回指定不可变模型版本、交易日的PIT安全TopN信号，供AlphaBlocks正式策略回测读取。
-- `POST /research/api/v1/jobs` 通过统一FactorService地址下发训练或推理任务。
-- `GET /research/ready` 和 `GET /research/api/v1/status` 查询内置研究调度器状态。
+- `POST /model-research/jobs` 创建训练任务，`POST /model-research/jobs/{job_id}/dispatch` 在本服务中调度执行。
+- `GET /research/ready` 和 `GET /research/status` 查询内置研究调度器状态。
 
 聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过
 `rtk .venv/bin/python scripts/export_joinquant_factor_catalog.py` 重新生成公开目录与详情快照。
@@ -108,6 +108,16 @@ Qlib多模型训练和每日推理。模型训练在任务期间启动隔离子�
 http://127.0.0.1:8100
 ```
 
+如果AlphaBlocks运行在另一台机器，部署机的`runtime.local.yaml`需要改为：
+
+```yaml
+service:
+  host: 0.0.0.0
+  port: 8100
+```
+
+同时把AlphaBlocks的`external_services.factor_service.base_url`设为这台部署机的局域网地址。
+
 监听地址、ClickHouse、数据源与研究存储位置统一配置在：
 
 ```text
@@ -121,12 +131,16 @@ config/runtime.local.yaml
 
 ```yaml
 research:
-  api_url: http://127.0.0.1:8001/api/model-research
-  token: ""
+  scheduler:
+    enabled: true
+    refresh_seconds: 60
   storage:
     work_root: /Volumes/QuantData/alphafactor/research-work
     model_artifacts_root: /Volumes/QuantData/alphafactor/model-artifacts
 ```
+
+每日推理计划由同一个AlphaFactorService进程按`research.scheduler.refresh_seconds`检查，
+不需要AlphaBlocks再运行独立的模型推理调度进程。
 
 `research.storage.work_root`保存训练工作文件，包括冻结数据集、预测Parquet、MLflow记录、
 指标、日志、任务状态和临时文件；`research.storage.model_artifacts_root`保存经过SHA256校验并
@@ -134,6 +148,8 @@ research:
 放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 
 AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独的研究服务地址或端口。
+模型任务、事件、版本和产物元数据由AlphaFactorService直接写入`control_database`，
+AlphaFactorService不再配置或回调AlphaBlocks API。
 
 安装后可用统一命令执行环境诊断：
 

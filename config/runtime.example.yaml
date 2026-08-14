@@ -44,7 +44,9 @@ sources:
     database: starlight
 
 research:
-  token: ""
+  scheduler:
+    enabled: true
+    refresh_seconds: 60
   storage:
     # Relative paths are resolved from the AlphaFactorService project root.
     # This root contains job datasets, trained models, predictions, MLflow files,

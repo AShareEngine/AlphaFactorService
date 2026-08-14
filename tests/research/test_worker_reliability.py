@@ -15,8 +15,6 @@ from tests.research.utils import valid_job
 
 def _settings(tmp_path: Path):
     return SimpleNamespace(
-        api_url="http://127.0.0.1/api/model-research",
-        worker_token="",
         work_root=tmp_path,
         model_artifacts_root=tmp_path / "artifacts",
     )
@@ -83,7 +81,7 @@ def test_successful_job_publishes_artifact_locally_then_records_metadata(tmp_pat
     predictions.write_bytes(b"")
     worker = ResearchWorker(_settings(tmp_path / "work"))
     api = _Api()
-    worker.api = api
+    worker.control = api
     worker.trainer = _SuccessfulTrainer(artifact, predictions)
 
     worker._run_job(valid_job())
@@ -100,7 +98,7 @@ def test_successful_job_publishes_artifact_locally_then_records_metadata(tmp_pat
 def test_invalid_data_failure_is_not_retried(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
     api = _Api()
-    worker.api = api
+    worker.control = api
     worker.trainer = _FailingTrainer(ValueError("bad frozen data"))
 
     worker._run_job(valid_job())
@@ -112,7 +110,7 @@ def test_invalid_data_failure_is_not_retried(tmp_path: Path) -> None:
 def test_shutdown_failure_is_requeued(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
     api = _Api()
-    worker.api = api
+    worker.control = api
     worker.trainer = _FailingTrainer(WorkerShutdown("restart"))
 
     worker._run_job(valid_job())
@@ -134,7 +132,7 @@ def test_lease_monitor_observes_remote_cancel(tmp_path: Path) -> None:
             self.calls += 1
             return self.calls > 1
 
-    worker.api = _CancelApi()
+    worker.control = _CancelApi()
     cancellation = CancellationToken()
     worker._monitor_lease("model_job_test", "lease", cancellation, _OneTick())
 
@@ -145,7 +143,7 @@ def test_lease_monitor_observes_remote_cancel(tmp_path: Path) -> None:
 def test_restart_recovery_requeues_active_job(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
     api = _Api()
-    worker.api = api
+    worker.control = api
     job = valid_job()
     worker.state_store.save(job, "training", {"percent": 60})
     worker.recovery_pending = True
@@ -161,10 +159,10 @@ def test_restart_recovery_requeues_active_job(tmp_path: Path) -> None:
 def test_recovery_reports_original_pending_failure(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
     api = _Api()
-    worker.api = api
+    worker.control = api
     job = valid_job()
     worker.state_store.save(job, "failure_report_pending", {
-        "error_message": "[network_error] AlphaBlocks API unavailable",
+        "error_message": "[control_database_transient] PostgreSQL unavailable",
         "retryable": True,
     })
     worker.recovery_pending = True
@@ -172,12 +170,12 @@ def test_recovery_reports_original_pending_failure(tmp_path: Path) -> None:
     worker._recover_interrupted_job()
 
     assert api.failed == [("model_job_test", True)]
-    assert api.failure_messages == ["[network_error] AlphaBlocks API unavailable"]
+    assert api.failure_messages == ["[control_database_transient] PostgreSQL unavailable"]
 
 
 def test_progress_state_survives_process_boundary(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
-    worker.api = _Api()
+    worker.control = _Api()
     job = valid_job()
     cancellation = CancellationToken()
 

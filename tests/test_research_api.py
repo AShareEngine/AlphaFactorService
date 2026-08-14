@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -10,8 +8,7 @@ from factor_service.research.worker import ResearchWorker
 
 
 class _Worker(ResearchWorker):
-    def __init__(self, *, token: str = "secret") -> None:
-        self.settings = SimpleNamespace(worker_token=token)
+    def __init__(self) -> None:
         self.submitted: list[dict] = []
 
     def status(self) -> dict:
@@ -50,26 +47,16 @@ def test_health_and_ready_are_served_by_unified_api() -> None:
     }
 
 
-def test_status_and_submit_use_same_worker_and_token() -> None:
+def test_status_uses_embedded_scheduler_without_worker_auth() -> None:
     worker = _Worker()
     client = _client(worker)
 
-    assert client.get("/research/api/v1/status").status_code == 401
-    status = client.get(
-        "/research/api/v1/status",
-        headers={"Authorization": "Bearer secret"},
-    )
-    response = client.post(
-        "/research/api/v1/jobs",
-        headers={"Authorization": "Bearer secret"},
-        json={"job_id": "job-1", "lease_token": "lease-1"},
-    )
+    status = client.get("/research/status")
 
     assert status.status_code == 200
     assert status.json()["secret"] == "only-status-exposes-this"
-    assert response.status_code == 202
-    assert response.json()["job"]["job_id"] == "job-1"
-    assert worker.submitted == [{"job_id": "job-1", "lease_token": "lease-1"}]
+    assert client.post("/research/api/v1/jobs", json={"job_id": "job-1"}).status_code == 404
+    assert worker.submitted == []
 
 
 def test_research_endpoints_fail_closed_before_startup() -> None:

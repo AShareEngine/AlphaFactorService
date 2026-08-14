@@ -5,7 +5,7 @@ import sys
 
 from factor_service.model_artifacts import ModelArtifactStore
 from factor_service.model_research_repository import ModelResearchRepository
-from factor_service.research.api import ResearchControl
+from factor_service.research.control import ResearchControl
 from factor_service.research.config import load_settings
 from factor_service.research.dataset import DatasetBuilder
 

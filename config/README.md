@@ -10,11 +10,12 @@ cp config/runtime.example.yaml config/runtime.local.yaml
 
 `runtime.local.yaml`已被Git忽略，可保存本机数据库密码和绝对存储路径。配置分区：
 
-- `service`：Factor API监听地址和本机研究网关地址。
+- `service`：统一Factor API与模型研究API的监听地址。
 - `clickhouse`：因子库与模型预测库的共享连接。
+- `control_database`：模型任务、版本、事件和产物元数据的PostgreSQL控制库。
 - `sources.factor`：因子计算源表。
 - `sources.research`：模型训练行情源库。
-- `research`：训练调度服务、AlphaBlocks API及研究文件存储目录。
+- `research`：训练调度器的工作目录与正式模型产物目录。
 
 训练工作文件和正式模型产物分别由`research.storage.work_root`和
 `research.storage.model_artifacts_root`管理。推荐在服务器或旧Mac上设置为容量充足的绝对路径：

@@ -284,7 +284,7 @@ class ModelResearchRepository:
         self, job_id: str, *, lease_seconds: int = 90,
     ) -> dict[str, Any]:
         """Atomically lease one queued job for the single research service."""
-        lease_owner = "alpha-research-worker"
+        lease_owner = "alpha-factor-service"
         lease_seconds = max(30, min(int(lease_seconds), 300))
         now = _utcnow()
         expires = now + timedelta(seconds=lease_seconds)
@@ -294,7 +294,7 @@ class ModelResearchRepository:
                 self._recover_expired(conn, now)
                 conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                    ("alpha-research-worker",),
+                    ("alpha-factor-service",),
                 )
                 active = conn.execute(
                     """
@@ -390,7 +390,7 @@ class ModelResearchRepository:
                   AND cancel_requested = FALSE
                 RETURNING *
                 """,
-                (expires, Jsonb(dict(progress or {})), now, job_id, "alpha-research-worker", lease_token),
+                (expires, Jsonb(dict(progress or {})), now, job_id, "alpha-factor-service", lease_token),
             ).fetchone()
         if not row:
             raise ModelResearchConflict("任务租约失效、已取消或不属于调度服务")
@@ -406,7 +406,7 @@ class ModelResearchRepository:
         if not row:
             raise ModelResearchNotFound("模型任务不存在")
         if (
-            str(row["lease_owner"]) != "alpha-research-worker"
+            str(row["lease_owner"]) != "alpha-factor-service"
             or str(row["lease_token"]) != lease_token
         ):
             raise ModelResearchConflict("任务租约不属于模型研究调度服务")
@@ -429,7 +429,7 @@ class ModelResearchRepository:
                       AND cancel_requested = FALSE
                     RETURNING job_id
                     """,
-                    (stage, Jsonb(dict(progress or {})), _utcnow(), job_id, "alpha-research-worker", lease_token),
+                    (stage, Jsonb(dict(progress or {})), _utcnow(), job_id, "alpha-factor-service", lease_token),
                 ).fetchone()
                 if not row:
                     raise ModelResearchConflict("任务租约失效、已取消或不属于调度服务")
@@ -854,7 +854,7 @@ class ModelResearchRepository:
         if str(row.get("status")) not in ACTIVE_STATUSES:
             raise ModelResearchConflict("任务不是可完成状态")
         if (
-            str(row.get("lease_owner")) != "alpha-research-worker"
+            str(row.get("lease_owner")) != "alpha-factor-service"
             or str(row.get("lease_token")) != lease_token
         ):
             raise ModelResearchConflict("任务租约不属于模型研究调度服务")

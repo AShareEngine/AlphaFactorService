@@ -12,7 +12,6 @@ from factor_service.runtime_config import (
 
 @dataclass(frozen=True)
 class Settings:
-    worker_token: str
     clickhouse_host: str
     clickhouse_port: int
     clickhouse_user: str
@@ -22,17 +21,18 @@ class Settings:
     source_database: str
     work_root: Path
     model_artifacts_root: Path
+    scheduler_enabled: bool = True
+    scheduler_refresh_seconds: float = 60.0
 
 
 def load_settings() -> Settings:
     runtime = load_runtime_config()
-    research = section(runtime, "research")
     storage = section(runtime, "research", "storage")
+    scheduler = section(runtime, "research", "scheduler")
     clickhouse = section(runtime, "clickhouse")
     source = section(runtime, "sources", "research")
     clickhouse_host = str(clickhouse.get("host") or "127.0.0.1").strip()
     result = Settings(
-        worker_token=str(research.get("token") or ""),
         clickhouse_host=clickhouse_host,
         clickhouse_port=int(clickhouse.get("port") or 8123),
         clickhouse_user=str(clickhouse.get("username") or "default").strip(),
@@ -43,6 +43,10 @@ def load_settings() -> Settings:
         work_root=resolve_project_path(storage.get("work_root"), "data/research"),
         model_artifacts_root=resolve_project_path(
             storage.get("model_artifacts_root"), "data/model_artifacts"
+        ),
+        scheduler_enabled=bool(scheduler.get("enabled", True)),
+        scheduler_refresh_seconds=max(
+            10.0, float(scheduler.get("refresh_seconds") or 60.0),
         ),
     )
     return result

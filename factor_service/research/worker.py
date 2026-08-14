@@ -16,7 +16,7 @@ from typing import Any
 from factor_service.research import __version__
 from factor_service.model_artifacts import ModelArtifactStore
 from factor_service.model_research_repository import ModelResearchRepository
-from factor_service.research.api import ResearchControl, ResearchControlError
+from factor_service.research.control import ResearchControl, ResearchControlError
 from factor_service.research.config import Settings
 from factor_service.research.errors import classify_exception, error_payload
 from factor_service.research.inference import DailyInferenceRunner
@@ -35,7 +35,8 @@ class ResearchWorker:
         if not self.settings.work_root.is_dir():
             raise ValueError(f"研究存储根目录无效: {self.settings.work_root}")
         self.artifact_store = ModelArtifactStore(self.settings.model_artifacts_root)
-        self.api = ResearchControl(ModelResearchRepository(), self.artifact_store)
+        self.repository = ModelResearchRepository()
+        self.control = ResearchControl(self.repository, self.artifact_store)
         self.trainer: QlibTrainer | None = None
         self.inference_runner: DailyInferenceRunner | None = None
         self.state_store = JobStateStore(settings.work_root)
@@ -46,12 +47,16 @@ class ResearchWorker:
         self.last_job_id = ""
         self.last_job_status = ""
         self.last_error = ""
+        self.scheduler_last_error = ""
+        self.scheduler_last_tick_at = ""
+        self.scheduler_last_result: dict[str, Any] = {}
         self.current_progress: dict[str, Any] = {}
         self.started_at = datetime.now(timezone.utc).isoformat()
         self._shutdown_event = threading.Event()
         self._state_lock = threading.Lock()
         self._job_thread: threading.Thread | None = None
         self._recovery_thread: threading.Thread | None = None
+        self._scheduler_thread: threading.Thread | None = None
         self._active_cancellation: CancellationToken | None = None
 
     def capabilities(self) -> dict[str, object]:
@@ -63,14 +68,14 @@ class ResearchWorker:
             except importlib.metadata.PackageNotFoundError:
                 versions[module_name] = "missing"
         return {
-            "worker_version": __version__,
+            "service_version": __version__,
             "python": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
             "models": ["lightgbm", "xgboost", "catboost", "mlp"],
             "max_concurrency": 1,
             "packages": versions,
-            "dispatch_mode": "push",
+            "dispatch_mode": "local",
             "service_api_version": "v1",
             "cooperative_cancellation": True,
             "crash_recovery": True,
@@ -83,6 +88,13 @@ class ResearchWorker:
         if self.stopping:
             raise RuntimeError("研究调度器已经关闭")
         self._start_recovery_if_needed()
+        if bool(getattr(self.settings, "scheduler_enabled", True)):
+            self._scheduler_thread = threading.Thread(
+                target=self._schedule_loop,
+                name="model-inference-scheduler",
+                daemon=True,
+            )
+            self._scheduler_thread.start()
         print(
             "AlphaFactorService内置研究调度器已启动",
             flush=True,
@@ -97,6 +109,9 @@ class ResearchWorker:
         recovery_thread = self._recovery_thread
         if recovery_thread is not None and recovery_thread.is_alive():
             recovery_thread.join(timeout=6)
+        scheduler_thread = self._scheduler_thread
+        if scheduler_thread is not None and scheduler_thread.is_alive():
+            scheduler_thread.join(timeout=6)
 
     def submit(self, payload: dict[str, Any]) -> dict[str, object]:
         """Validate and accept one centrally leased job without blocking HTTP."""
@@ -113,9 +128,7 @@ class ResearchWorker:
                     or self.active_lease_token == incoming_lease_token
                 )
             ):
-                # A lost HTTP acknowledgement may cause AlphaBlocks to repeat the
-                # identical dispatch. Do not require the caller to reconstruct the
-                # entire payload merely to learn that it was already accepted.
+                # Repeated local dispatches are idempotent while the same lease is active.
                 return {"accepted": True, "duplicate": True, "job_id": incoming_job_id}
         job = validate_job(payload)
         job_id = str(job["job_id"])
@@ -134,13 +147,13 @@ class ResearchWorker:
             self.last_error = ""
             self.current_progress = {"stage": "accepted", "percent": 1}
 
-        # Persist before the remote acknowledgement. If the HTTP response is lost,
-        # restart recovery can safely requeue the lease instead of executing twice.
+        # Persist before starting the task thread so restart recovery can safely
+        # requeue the lease instead of executing twice.
         persisted = False
         try:
             self.state_store.save(job, "accepted", self.current_progress)
             persisted = True
-            self.api.stage(job_id, lease_token, "running", self.current_progress)
+            self.control.stage(job_id, lease_token, "running", self.current_progress)
             thread = threading.Thread(
                 target=self._run_job,
                 args=(job,),
@@ -163,11 +176,15 @@ class ResearchWorker:
     def status(self) -> dict[str, object]:
         with self._state_lock:
             busy = self._job_thread is not None and self._job_thread.is_alive()
-            ready = not self.stopping and not self.recovery_pending
+            scheduler_ready = (
+                not bool(getattr(self.settings, "scheduler_enabled", True))
+                or not self.scheduler_last_error
+            )
+            ready = not self.stopping and not self.recovery_pending and scheduler_ready
             return {
                 "ok": True,
                 "service": "AlphaFactorServiceResearch",
-                "worker_version": __version__,
+                "research_version": __version__,
                 "ready": ready,
                 "busy": busy,
                 "recovery_pending": self.recovery_pending,
@@ -175,10 +192,42 @@ class ResearchWorker:
                 "last_job_id": self.last_job_id,
                 "last_job_status": self.last_job_status,
                 "last_error": self.last_error,
+                "scheduler": {
+                    "enabled": bool(getattr(self.settings, "scheduler_enabled", True)),
+                    "last_tick_at": self.scheduler_last_tick_at,
+                    "last_error": self.scheduler_last_error,
+                    "last_result": dict(self.scheduler_last_result),
+                },
                 "progress": dict(self.current_progress),
                 "started_at": self.started_at,
                 "capabilities": self.capabilities(),
             }
+
+    def _schedule_loop(self) -> None:
+        from factor_service.research.schedule import run_inference_schedule_tick
+
+        refresh_seconds = max(
+            10.0,
+            float(getattr(self.settings, "scheduler_refresh_seconds", 60.0)),
+        )
+        while not self._shutdown_event.is_set():
+            try:
+                result = run_inference_schedule_tick(self.repository, self)
+                with self._state_lock:
+                    self.scheduler_last_tick_at = datetime.now(timezone.utc).isoformat()
+                    self.scheduler_last_error = ""
+                    self.scheduler_last_result = result
+                if result.get("submitted"):
+                    print(
+                        "每日推理调度: " + json.dumps(result, ensure_ascii=False, default=str),
+                        flush=True,
+                    )
+            except Exception as exc:
+                with self._state_lock:
+                    self.scheduler_last_tick_at = datetime.now(timezone.utc).isoformat()
+                    self.scheduler_last_error = str(exc)
+                print(f"每日推理调度暂不可用: {exc}", file=sys.stderr, flush=True)
+            self._shutdown_event.wait(refresh_seconds)
 
     def _run_job(self, job: dict[str, Any]) -> None:
         job_id = str(job["job_id"])
@@ -222,7 +271,7 @@ class ResearchWorker:
                 else:
                     trained = self._run_isolated_model(job, work_dir, cancellation)
             cancellation.checkpoint()
-            self.api.stage(job_id, lease_token, "uploading", {
+            self.control.stage(job_id, lease_token, "uploading", {
                 "stage": "uploading", "percent": 90,
                 "artifact_count": len(trained.artifacts),
             })
@@ -235,7 +284,7 @@ class ResearchWorker:
                     source_path=path,
                     dataset_hash=str(job.get("dataset_hash") or ""),
                 )
-                self.api.record_artifact(
+                self.control.record_artifact(
                     job_id,
                     lease_token,
                     kind=kind,
@@ -267,7 +316,7 @@ class ResearchWorker:
             self._report_progress(job, cancellation, "completing", 99, {
                 "prediction_rows": inserted,
             })
-            self.api.complete(job_id, lease_token, trained.result)
+            self.control.complete(job_id, lease_token, trained.result)
             self.state_store.clear()
             self._set_state(last_job_status="succeeded", last_error="", current_progress={
                 "stage": "succeeded", "percent": 100,
@@ -294,12 +343,12 @@ class ResearchWorker:
             except Exception as state_error:
                 print(f"失败恢复状态保存失败: {state_error}", file=sys.stderr, flush=True)
             try:
-                response = self.api.fail(job_id, lease_token, error, retryable=retryable)
-                remote_job = dict(response.get("job") or {})
+                response = self.control.fail(job_id, lease_token, error, retryable=retryable)
+                reported_job = dict(response.get("job") or {})
                 self.state_store.clear()
-                self._set_state(last_job_status=str(remote_job.get("status") or terminal))
+                self._set_state(last_job_status=str(reported_job.get("status") or terminal))
             except Exception as report_error:
-                if self._remote_job_already_succeeded(job_id, lease_token, report_error):
+                if self._job_already_succeeded(job_id, lease_token, report_error):
                     self.state_store.clear()
                     self._set_state(last_job_status="succeeded", last_error="")
                 else:
@@ -392,7 +441,7 @@ class ResearchWorker:
         self._set_state(current_progress=payload)
         # Heartbeat updates are event-free and therefore safe for granular progress.
         try:
-            self.api.renew(str(job["job_id"]), str(job["lease_token"]), payload)
+            self.control.renew(str(job["job_id"]), str(job["lease_token"]), payload)
         except ResearchControlError as exc:
             if not exc.retryable:
                 cancellation.cancel("任务已取消或租约已失效")
@@ -410,7 +459,7 @@ class ResearchWorker:
         next_renewal = time.monotonic()
         while not stop.wait(5):
             try:
-                control = self.api.control(job_id, lease_token)
+                control = self.control.control(job_id, lease_token)
                 if bool(control.get("cancel_requested")):
                     cancellation.cancel("用户已请求取消任务")
                     return
@@ -421,7 +470,7 @@ class ResearchWorker:
                 if time.monotonic() >= next_renewal:
                     with self._state_lock:
                         progress = dict(self.current_progress)
-                    self.api.renew(job_id, lease_token, progress)
+                    self.control.renew(job_id, lease_token, progress)
                     next_renewal = time.monotonic() + 30
             except ResearchControlError as exc:
                 if not exc.retryable:
@@ -464,7 +513,7 @@ class ResearchWorker:
                 job = validate_job(dict(state.get("job") or {}))
                 job_id = str(job["job_id"])
                 lease_token = str(job["lease_token"])
-                control = self.api.control(job_id, lease_token)
+                control = self.control.control(job_id, lease_token)
                 status = str(control.get("status") or "")
                 if status in ACTIVE_STATUSES:
                     canceled = bool(control.get("cancel_requested"))
@@ -472,7 +521,7 @@ class ResearchWorker:
                     report_pending = str(state.get("phase") or "") == "failure_report_pending"
                     error_message = str(progress.get("error_message") or "").strip()
                     retryable = bool(progress.get("retryable", True))
-                    response = self.api.fail(
+                    response = self.control.fail(
                         job_id,
                         lease_token,
                         error_message if report_pending and error_message else
@@ -493,7 +542,7 @@ class ResearchWorker:
                 return
             except ResearchControlError as exc:
                 if not exc.retryable:
-                    # The lease was already released/finished by AlphaBlocks.
+                    # The lease was already released or finished in the control database.
                     self.state_store.clear()
                     self._set_state(recovery_pending=False, last_job_status="released", last_error="")
                     return
@@ -506,14 +555,14 @@ class ResearchWorker:
                     return
             self._shutdown_event.wait(5)
 
-    def _remote_job_already_succeeded(
+    def _job_already_succeeded(
         self, job_id: str, lease_token: str, report_error: Exception,
     ) -> bool:
-        # Handles a lost HTTP response after AlphaBlocks committed completion.
+        # Handles a completion that was committed before the caller observed it.
         if not isinstance(report_error, ResearchControlError):
             return False
         try:
-            return str(self.api.control(job_id, lease_token).get("status") or "") == "succeeded"
+            return str(self.control.control(job_id, lease_token).get("status") or "") == "succeeded"
         except Exception:
             return False
 

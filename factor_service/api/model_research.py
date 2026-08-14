@@ -3,13 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, JSONResponse
 
 from factor_service import model_repository
-from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
+from factor_service.model_artifacts import ArtifactError
 from factor_service.model_backtest import run_model_backtest_job
 from factor_service.model_research_repository import (
     ModelResearchConflict,
@@ -18,6 +18,8 @@ from factor_service.model_research_repository import (
     ModelResearchRepository,
 )
 from factor_service.research.worker import ResearchWorker
+from factor_service.research.schedule import dispatch_job as dispatch_model_job
+from factor_service.research.schedule import run_inference_schedule_tick
 from factor_service.schemas import ModelBacktestJobCreate
 
 
@@ -37,6 +39,8 @@ def _raise(exc: Exception) -> None:
         status = HTTPStatus.NOT_FOUND
     elif isinstance(exc, ModelResearchConflict):
         status = HTTPStatus.CONFLICT
+    elif isinstance(exc, (ArtifactError, FileNotFoundError)):
+        status = HTTPStatus.NOT_FOUND
     elif isinstance(exc, (ModelResearchError, TypeError, ValueError)):
         status = HTTPStatus.BAD_REQUEST
     else:
@@ -45,31 +49,7 @@ def _raise(exc: Exception) -> None:
 
 
 def _dispatch(request: Request, job: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    status = str(job.get("status") or "")
-    if status in {"leased", "running", "uploading"}:
-        return {"ok": True, "job": job, "service": {"accepted": True}}, 202
-    if status == "succeeded":
-        return {"ok": True, "job": job, "service": {"accepted": False}}, 200
-    if status != "queued":
-        raise ModelResearchConflict(f"任务状态{status or '未知'}不可调度")
-    leased = repository.claim_specific_job(str(job["job_id"]), lease_seconds=90)
-    lease_token = str(leased.get("lease_token") or "")
-    try:
-        accepted = _worker(request).submit(leased)
-    except Exception as exc:
-        current = repository.get_job(str(job["job_id"]))
-        if str(current.get("status")) == "leased":
-            repository.release_dispatch_lease(
-                str(job["job_id"]),
-                lease_token=lease_token,
-                error_message=f"模型任务启动失败: {exc}",
-            )
-        raise
-    return {
-        "ok": True,
-        "job": repository.get_job(str(job["job_id"])),
-        "service": accepted,
-    }, 202
+    return dispatch_model_job(repository, _worker(request), job)
 
 
 @router.get("/jobs")
@@ -107,12 +87,13 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 
 
 @router.post("/jobs/{job_id}/dispatch")
-def dispatch_job(request: Request, job_id: str) -> tuple[dict[str, Any], int] | dict[str, Any]:
+def dispatch_job(request: Request, job_id: str) -> JSONResponse:
     try:
         payload, status = _dispatch(request, repository.get_job(job_id))
-        if status >= 400:
-            raise ModelResearchError(str(payload))
-        return payload
+        return JSONResponse(
+            status_code=status,
+            content=jsonable_encoder(payload),
+        )
     except Exception as exc:
         _raise(exc)
 
@@ -141,7 +122,7 @@ def download_artifact(request: Request, artifact_id: str) -> FileResponse:
         artifact = repository.get_artifact(artifact_id)
         path = _worker(request).artifact_store.resolve(str(artifact["relative_path"]))
         return FileResponse(path, media_type="application/octet-stream", filename=path.name)
-    except (ArtifactError, Exception) as exc:
+    except Exception as exc:
         _raise(exc)
 
 
@@ -229,7 +210,7 @@ def create_inference(
     model_id: str,
     version: int,
     payload: dict[str, Any] = Body(default={}),
-) -> dict[str, Any]:
+) -> JSONResponse:
     try:
         model = repository.get_model(model_id, version)
         trade_date = str(payload.get("trade_date") or "")
@@ -244,6 +225,10 @@ def create_inference(
             raise ModelResearchError(
                 f"目标日{trade_date}尚不可推理，当前共同最新交易日为{availability.get('trade_date')}"
             )
+        if not str(payload.get("trade_date") or ""):
+            availability = _inference_availability(
+                model, trade_date=trade_date, data_cutoff=data_cutoff,
+            )
         if availability.get("requested_trade_date_available") is not True:
             raise ModelResearchError(f"目标日{trade_date}不是完整可推理交易日")
         job = repository.create_inference_job(
@@ -252,10 +237,18 @@ def create_inference(
             {**payload, "trade_date": trade_date},
         )
         if str(job.get("status")) == "queued":
-            result, _ = _dispatch(request, job)
+            result, status = _dispatch(request, job)
             result["availability"] = availability
-            return result
-        return {"ok": True, "job": job, "availability": availability}
+            return JSONResponse(status_code=status, content=jsonable_encoder(result))
+        status = HTTPStatus.OK if str(job.get("status")) == "succeeded" else HTTPStatus.ACCEPTED
+        return JSONResponse(
+            status_code=int(status),
+            content=jsonable_encoder({
+                "ok": True,
+                "job": job,
+                "availability": availability,
+            }),
+        )
     except Exception as exc:
         _raise(exc)
 
@@ -393,69 +386,15 @@ def update_inference_schedule(
 def inference_scheduler_tick(
     request: Request, payload: dict[str, Any] = Body(default={}),
 ) -> dict[str, Any]:
-    force = bool(payload.get("force", False))
-    now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    submitted: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
     try:
-        schedules = repository.list_inference_schedules()
-        for schedule in schedules:
-            model_id = str(schedule["model_id"])
-            version = int(schedule["model_version"])
-            if schedule.get("enabled") is not True or str(schedule.get("state")) != "validated":
-                skipped.append({"model_id": model_id, "version": version, "reason": "disabled_or_unvalidated"})
-                continue
-            run_after = str(schedule.get("run_after_local") or "16:30")[:5]
-            if not force and now.strftime("%H:%M") < run_after:
-                skipped.append({"model_id": model_id, "version": version, "reason": "before_run_time"})
-                continue
-            prediction = dict(schedule.get("prediction_json") or {})
-            after_date = str(
-                schedule.get("last_submitted_trade_date")
-                or prediction.get("latest_trade_date")
-                or prediction.get("date_end")
-                or "1990-01-01"
-            )[:10]
-            dates = model_repository.model_inference_dates(
-                factors=list((schedule.get("dataset_spec") or {}).get("factors") or []),
-                after_date=datetime.fromisoformat(after_date).date(),
-                before_date=now.date(),
-                data_cutoff=now,
-                limit=int(schedule.get("max_catchup_days") or 20),
-            )
-            if not dates:
-                repository.record_inference_schedule_tick(model_id, version)
-                skipped.append({"model_id": model_id, "version": version, "reason": "up_to_date"})
-                continue
-            trade_date = str(dates[0])[:10]
-            job = repository.create_inference_job(
-                model_id,
-                version,
-                {"trade_date": trade_date, "data_cutoff": now.isoformat()},
-            )
-            dispatched = False
-            if str(job.get("status")) == "queued":
-                try:
-                    _dispatch(request, job)
-                    dispatched = True
-                except Exception as exc:
-                    repository.record_inference_schedule_tick(model_id, version, error=str(exc))
-                    skipped.append({
-                        "model_id": model_id,
-                        "version": version,
-                        "trade_date": trade_date,
-                        "reason": "research_service_busy",
-                    })
-                    continue
-            repository.record_inference_schedule_tick(model_id, version, trade_date=trade_date)
-            submitted.append({
-                "model_id": model_id,
-                "version": version,
-                "trade_date": trade_date,
-                "job_id": job["job_id"],
-                "dispatched": dispatched,
-            })
-        return {"ok": True, "checked": len(schedules), "submitted": submitted, "skipped": skipped}
+        return {
+            "ok": True,
+            **run_inference_schedule_tick(
+                repository,
+                _worker(request),
+                force=bool(payload.get("force", False)),
+            ),
+        }
     except Exception as exc:
         _raise(exc)
 

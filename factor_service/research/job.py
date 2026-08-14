@@ -48,7 +48,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     lease_token = str(payload.get("lease_token") or "").strip()
     if len(lease_token) < 16 or len(lease_token) > 512:
         raise PermanentJobError("lease_token长度无效")
-    if str(payload.get("lease_owner") or "alpha-research-worker") != "alpha-research-worker":
+    if str(payload.get("lease_owner") or "alpha-factor-service") != "alpha-factor-service":
         raise PermanentJobError("任务租约不属于AlphaFactorService研究调度进程")
     dataset_hash = str(payload.get("dataset_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", dataset_hash):

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from factor_service.research.api import ResearchControl
+from factor_service.research.control import ResearchControl
 from factor_service.research.config import Settings
 from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
@@ -22,9 +22,9 @@ from factor_service.research.trainer import TrainingResult, predict_feature_fram
 class DailyInferenceRunner:
     """Load an immutable training bundle and score one historical trading day."""
 
-    def __init__(self, settings: Settings, api: ResearchControl) -> None:
+    def __init__(self, settings: Settings, control: ResearchControl) -> None:
         self.settings = settings
-        self.api = api
+        self.control = control
         self.dataset_builder = DatasetBuilder(settings)
 
     def run(
@@ -44,7 +44,7 @@ class DailyInferenceRunner:
         work_dir.mkdir(parents=True, exist_ok=True)
         _checkpoint(cancellation)
         _progress(progress, "downloading_model", 10, {"artifact_id": source["artifact_id"]})
-        bundle_path = self.api.download_artifact(
+        bundle_path = self.control.download_artifact(
             str(source["artifact_id"]),
             work_dir / "source_model.tar.gz",
             str(source["artifact_sha256"]),

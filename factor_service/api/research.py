@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import hmac
 from http import HTTPStatus
-from typing import Any
 
-from fastapi import APIRouter, Body, Header, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from factor_service.research.errors import PermanentJobError
 from factor_service.research.worker import ResearchWorker
 
 
@@ -19,16 +16,6 @@ def _worker(request: Request) -> ResearchWorker:
     if worker is None:
         raise RuntimeError("研究调度器尚未启动")
     return worker
-
-
-def _authorize(worker: ResearchWorker, authorization: str) -> JSONResponse | None:
-    token = worker.settings.worker_token.strip()
-    if not token or hmac.compare_digest(authorization, f"Bearer {token}"):
-        return None
-    return JSONResponse(
-        status_code=HTTPStatus.UNAUTHORIZED,
-        content={"ok": False, "error": "研究服务认证失败"},
-    )
 
 
 @router.get("/health")
@@ -53,6 +40,8 @@ def research_ready(request: Request) -> JSONResponse:
             content={"ok": False, "error": str(exc)},
         )
     ready = bool(status["ready"])
+    scheduler = dict(status.get("scheduler") or {})
+    error = str(status.get("last_error") or scheduler.get("last_error") or "")
     return JSONResponse(
         status_code=HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE,
         content={
@@ -60,15 +49,13 @@ def research_ready(request: Request) -> JSONResponse:
             "service": "AlphaFactorServiceResearch",
             "ready": ready,
             "busy": bool(status["busy"]),
+            **({"error": error} if error else {}),
         },
     )
 
 
-@router.get("/api/v1/status")
-def research_status(
-    request: Request,
-    authorization: str = Header(default=""),
-) -> JSONResponse:
+@router.get("/status")
+def research_status(request: Request) -> JSONResponse:
     try:
         worker = _worker(request)
     except RuntimeError as exc:
@@ -76,52 +63,7 @@ def research_status(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             content={"ok": False, "error": str(exc)},
         )
-    unauthorized = _authorize(worker, authorization)
-    return unauthorized or JSONResponse(content=worker.status())
-
-
-@router.post("/api/v1/jobs")
-def research_job_submit(
-    request: Request,
-    payload: dict[str, Any] = Body(...),
-    authorization: str = Header(default=""),
-) -> JSONResponse:
-    try:
-        worker = _worker(request)
-    except RuntimeError as exc:
-        return JSONResponse(
-            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-            content={"ok": False, "error": str(exc)},
-        )
-    unauthorized = _authorize(worker, authorization)
-    if unauthorized is not None:
-        return unauthorized
-    try:
-        result = worker.submit(payload)
-    except PermanentJobError as exc:
-        return JSONResponse(
-            status_code=HTTPStatus.BAD_REQUEST,
-            content={"ok": False, "error": str(exc)},
-        )
-    except RuntimeError as exc:
-        return JSONResponse(
-            status_code=HTTPStatus.CONFLICT,
-            content={"ok": False, "error": str(exc)},
-        )
-    except (TypeError, ValueError) as exc:
-        return JSONResponse(
-            status_code=HTTPStatus.BAD_REQUEST,
-            content={"ok": False, "error": str(exc)},
-        )
-    except Exception as exc:
-        return JSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            content={"ok": False, "error": str(exc)},
-        )
-    return JSONResponse(
-        status_code=HTTPStatus.ACCEPTED,
-        content={"ok": True, "job": result},
-    )
+    return JSONResponse(content=worker.status())
 
 
 __all__ = ["router"]

@@ -59,7 +59,7 @@ class ControlDatabase:
             ),
             open=False,
             configure=self._configure_connection,
-            name="alphablocks-control",
+            name="alpha-factor-service-model-research",
         )
         _OPEN_DATABASES.append(self)
 

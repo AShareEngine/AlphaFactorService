@@ -27,7 +27,6 @@ class _ClickHouse:
 
 def test_prediction_publish_replaces_exact_inference_run(monkeypatch, tmp_path: Path) -> None:
     settings = Settings(
-        api_url="http://127.0.0.1/api/model-research", worker_token="",
         clickhouse_host="localhost", clickhouse_port=8123,
         clickhouse_user="default", clickhouse_password="",
         factor_database="ab_factor", model_database="ab_model",
@@ -70,7 +69,6 @@ def test_prediction_publish_replaces_exact_inference_run(monkeypatch, tmp_path: 
 
 def test_daily_inference_publish_replaces_only_target_date(monkeypatch, tmp_path: Path) -> None:
     settings = Settings(
-        api_url="http://127.0.0.1/api/model-research", worker_token="",
         clickhouse_host="localhost", clickhouse_port=8123,
         clickhouse_user="default", clickhouse_password="",
         factor_database="ab_factor", model_database="ab_model",

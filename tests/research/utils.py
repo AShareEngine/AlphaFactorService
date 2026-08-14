@@ -37,7 +37,7 @@ def valid_job(*, job_id: str = "model_job_test", **changes: Any) -> dict[str, An
         "job_id": job_id,
         "model_id": "test_model",
         "lease_token": "lease-token-at-least-sixteen-characters",
-        "lease_owner": "alpha-research-worker",
+        "lease_owner": "alpha-factor-service",
         "dataset_hash": dataset_hash,
         "dataset_spec": spec,
         "config_json": {
