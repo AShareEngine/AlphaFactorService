@@ -1,0 +1,43 @@
+# Copy this file to config/runtime.local.yaml and change local addresses,
+# credentials, and storage paths there. runtime.local.yaml is ignored by git.
+
+service:
+  host: 127.0.0.1
+  port: 8100
+  cors_origins:
+    - "*"
+  # The public API proxies /research to this loopback-only process.
+  research_internal_url: "http://127.0.0.1:8787"
+
+clickhouse:
+  host: 10.126.126.3
+  port: 8123
+  username: default
+  password: ""
+  secure: false
+  factor_database: ab_factor
+  model_database: ab_model
+
+sources:
+  factor:
+    database: ab_factor
+    stock_daily_table: stock_daily_factor_source
+    stock_code_column: code
+    stock_date_column: trade_time
+    stock_price_column: close
+    stock_basic_table: stock_basic_factor_source
+    stock_basic_type_column: type
+    stock_basic_stock_type_value: "1"
+  research:
+    database: starlight
+
+research:
+  api_url: "http://127.0.0.1:8001/api/model-research"
+  token: ""
+  listen_host: 127.0.0.1
+  listen_port: 8787
+  storage:
+    # Relative paths are resolved from the AlphaFactorService project root.
+    # This root contains job datasets, trained models, predictions, MLflow files,
+    # logs, manifests, and crash-recovery state.
+    root: "./data/research"

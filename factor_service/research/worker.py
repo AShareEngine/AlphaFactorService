@@ -1,0 +1,526 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import platform
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from typing import Any
+
+from factor_service.research import __version__
+from factor_service.research.api import AlphaBlocksApi, AlphaBlocksApiError
+from factor_service.research.config import Settings
+from factor_service.research.errors import classify_exception, error_payload
+from factor_service.research.inference import DailyInferenceRunner
+from factor_service.research.job import CancellationToken, safe_job_dir, validate_job
+from factor_service.research.state import JobStateStore
+from factor_service.research.trainer import QlibTrainer, TrainingResult
+
+
+ACTIVE_STATUSES = {"leased", "running", "uploading"}
+
+
+class ResearchWorker:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.settings.work_root.mkdir(parents=True, exist_ok=True)
+        if not self.settings.work_root.is_dir():
+            raise ValueError(f"研究存储根目录无效: {self.settings.work_root}")
+        self.api = AlphaBlocksApi(settings.api_url, settings.worker_token)
+        self.trainer: QlibTrainer | None = None
+        self.inference_runner: DailyInferenceRunner | None = None
+        self.state_store = JobStateStore(settings.work_root)
+        self.stopping = False
+        self.recovery_pending = False
+        self.active_job_id = ""
+        self.active_lease_token = ""
+        self.last_job_id = ""
+        self.last_job_status = ""
+        self.last_error = ""
+        self.current_progress: dict[str, Any] = {}
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self._shutdown_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._job_thread: threading.Thread | None = None
+        self._recovery_thread: threading.Thread | None = None
+        self._active_cancellation: CancellationToken | None = None
+
+    def capabilities(self) -> dict[str, object]:
+        versions: dict[str, str] = {}
+        for module_name in ("qlib", "lightgbm", "xgboost", "catboost", "torch", "pandas", "pyarrow"):
+            try:
+                package_name = "pyqlib" if module_name == "qlib" else module_name
+                versions[module_name] = importlib.metadata.version(package_name)
+            except importlib.metadata.PackageNotFoundError:
+                versions[module_name] = "missing"
+        return {
+            "worker_version": __version__,
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "models": ["lightgbm", "xgboost", "catboost", "mlp"],
+            "max_concurrency": 1,
+            "packages": versions,
+            "dispatch_mode": "push",
+            "service_api_version": "v1",
+            "cooperative_cancellation": True,
+            "crash_recovery": True,
+            "idempotent_prediction_publish": True,
+            "daily_inference": True,
+        }
+
+    def run(self) -> None:
+        """Run the single HTTP scheduling service."""
+        from factor_service.research.service import WorkerHttpService
+
+        signal.signal(signal.SIGTERM, self._stop)
+        signal.signal(signal.SIGINT, self._stop)
+        self._start_recovery_if_needed()
+        service = WorkerHttpService(self, self.settings)
+        print(
+            "AlphaFactorService研究调度进程已启动: "
+            f"listen {self.settings.service_host}:{self.settings.service_port}",
+            flush=True,
+        )
+        try:
+            service.serve_forever()
+        finally:
+            self.stopping = True
+            self._shutdown_event.set()
+            job_thread = self._job_thread
+            if job_thread is not None and job_thread.is_alive():
+                job_thread.join(timeout=30)
+            service.close()
+
+    def submit(self, payload: dict[str, Any]) -> dict[str, object]:
+        """Validate and accept one centrally leased job without blocking HTTP."""
+        incoming_job_id = str(payload.get("job_id") or "").strip() if isinstance(payload, dict) else ""
+        incoming_lease_token = str(payload.get("lease_token") or "").strip() if isinstance(payload, dict) else ""
+        with self._state_lock:
+            if (
+                incoming_job_id
+                and self._job_thread is not None
+                and self._job_thread.is_alive()
+                and self.active_job_id == incoming_job_id
+                and (
+                    not getattr(self, "active_lease_token", "")
+                    or self.active_lease_token == incoming_lease_token
+                )
+            ):
+                # A lost HTTP acknowledgement may cause AlphaBlocks to repeat the
+                # identical dispatch. Do not require the caller to reconstruct the
+                # entire payload merely to learn that it was already accepted.
+                return {"accepted": True, "duplicate": True, "job_id": incoming_job_id}
+        job = validate_job(payload)
+        job_id = str(job["job_id"])
+        lease_token = str(job["lease_token"])
+        with self._state_lock:
+            if self.stopping:
+                raise RuntimeError("调度服务正在关闭")
+            if self.recovery_pending:
+                raise RuntimeError("调度服务正在恢复上一个中断任务")
+            if self._job_thread is not None and self._job_thread.is_alive():
+                raise RuntimeError(f"调度服务正在执行任务: {self.active_job_id}")
+            self.active_job_id = job_id
+            self.active_lease_token = lease_token
+            self.last_job_id = job_id
+            self.last_job_status = "accepted"
+            self.last_error = ""
+            self.current_progress = {"stage": "accepted", "percent": 1}
+
+        # Persist before the remote acknowledgement. If the HTTP response is lost,
+        # restart recovery can safely requeue the lease instead of executing twice.
+        persisted = False
+        try:
+            self.state_store.save(job, "accepted", self.current_progress)
+            persisted = True
+            self.api.stage(job_id, lease_token, "running", self.current_progress)
+            thread = threading.Thread(
+                target=self._run_job,
+                args=(job,),
+                name=f"training-{job_id[:16]}",
+                daemon=False,
+            )
+            with self._state_lock:
+                self._job_thread = thread
+            thread.start()
+        except Exception:
+            self._set_state(
+                active_job_id="", last_job_status="dispatch_failed",
+                active_lease_token="", recovery_pending=persisted,
+            )
+            if persisted:
+                self._start_recovery_thread()
+            raise
+        return {"accepted": True, "job_id": job_id}
+
+    def status(self) -> dict[str, object]:
+        with self._state_lock:
+            busy = self._job_thread is not None and self._job_thread.is_alive()
+            ready = not self.stopping and not self.recovery_pending
+            return {
+                "ok": True,
+                "service": "AlphaFactorResearchWorker",
+                "worker_version": __version__,
+                "ready": ready,
+                "busy": busy,
+                "recovery_pending": self.recovery_pending,
+                "active_job_id": self.active_job_id,
+                "last_job_id": self.last_job_id,
+                "last_job_status": self.last_job_status,
+                "last_error": self.last_error,
+                "progress": dict(self.current_progress),
+                "started_at": self.started_at,
+                "api_url": self.settings.api_url,
+                "capabilities": self.capabilities(),
+            }
+
+    def _run_job(self, job: dict[str, Any]) -> None:
+        job_id = str(job["job_id"])
+        lease_token = str(job["lease_token"])
+        attempt = max(1, int(job.get("attempt_count") or 1))
+        work_dir = safe_job_dir(self.settings.work_root, job_id) / f"attempt-{attempt:03d}"
+        monitor_stop = threading.Event()
+        cancellation = CancellationToken(self._shutdown_event)
+        monitor_thread = threading.Thread(
+            target=self._monitor_lease,
+            args=(job_id, lease_token, cancellation, monitor_stop),
+            name=f"lease-{job_id[:8]}",
+            daemon=True,
+        )
+        report_pending = False
+        job_kind = str(job.get("kind") or "train")
+        action_label = "每日推理" if job_kind == "infer" else "训练"
+        print(f"开始{action_label} {job_id}", flush=True)
+        self._set_state(
+            active_job_id=job_id, last_job_id=job_id,
+            last_job_status="running", _active_cancellation=cancellation,
+        )
+        monitor_thread.start()
+        try:
+            self._report_progress(job, cancellation, "validating", 2, {})
+            progress_callback = lambda stage, percent, details: self._report_progress(
+                job, cancellation, stage, percent, details,
+            )
+            if job_kind == "infer":
+                if self.inference_runner is not None:
+                    trained = self.inference_runner.run(
+                        job, work_dir, cancellation=cancellation, progress=progress_callback,
+                    )
+                else:
+                    trained = self._run_isolated_model(job, work_dir, cancellation)
+            else:
+                if self.trainer is not None:
+                    trained = self.trainer.train(
+                        job, work_dir, cancellation=cancellation, progress=progress_callback,
+                    )
+                else:
+                    trained = self._run_isolated_model(job, work_dir, cancellation)
+            cancellation.checkpoint()
+            self.api.stage(job_id, lease_token, "uploading", {
+                "stage": "uploading", "percent": 90,
+                "artifact_count": len(trained.artifacts),
+            })
+            artifact_count = max(1, len(trained.artifacts))
+            for artifact_index, (kind, path) in enumerate(trained.artifacts):
+                self.api.upload(
+                    job_id,
+                    lease_token,
+                    kind,
+                    path,
+                    checkpoint=cancellation.checkpoint,
+                    progress=lambda chunk, total, index=artifact_index, artifact_kind=kind: (
+                        self._report_progress(
+                            job,
+                            cancellation,
+                            "uploading",
+                            min(96, 90 + int(6 * (index + chunk / max(1, total)) / artifact_count)),
+                            {
+                                "artifact": artifact_kind,
+                                "artifact_index": index + 1,
+                                "artifact_count": artifact_count,
+                                "chunk": chunk,
+                                "chunk_count": total,
+                            },
+                        )
+                    ),
+                )
+            self._report_progress(job, cancellation, "publishing_predictions", 97, {})
+            publisher = self.trainer or QlibTrainer(self.settings)
+            inserted = publisher.publish_predictions(
+                trained.predictions_path, job, cancellation=cancellation,
+            )
+            expected = int(trained.result["predictions"]["row_count"])
+            if inserted != expected:
+                raise ValueError(f"预测发布行数不一致: 期望{expected}，实际{inserted}")
+            self._report_progress(job, cancellation, "completing", 99, {
+                "prediction_rows": inserted,
+            })
+            self.api.complete(job_id, lease_token, trained.result)
+            self.state_store.clear()
+            self._set_state(last_job_status="succeeded", last_error="", current_progress={
+                "stage": "succeeded", "percent": 100,
+            })
+            print(f"{action_label}完成 {job_id}", flush=True)
+        except Exception as exc:
+            retryable, code = classify_exception(exc)
+            metadata = error_payload(exc)
+            error = (
+                f"[{code}] {type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            terminal = "retry_queued" if retryable else ("canceled" if code == "canceled" else "failed")
+            self._set_state(last_job_status=terminal, last_error=str(exc))
+            print(error, file=sys.stderr, flush=True)
+            try:
+                self.state_store.save(job, "failure_report_pending", {
+                    "stage": "failure_report_pending",
+                    "percent": int(self.current_progress.get("percent") or 0),
+                    "error_message": error,
+                    "error_code": code,
+                    "retryable": retryable,
+                })
+            except Exception as state_error:
+                print(f"失败恢复状态保存失败: {state_error}", file=sys.stderr, flush=True)
+            try:
+                response = self.api.fail(job_id, lease_token, error, retryable=retryable)
+                remote_job = dict(response.get("job") or {})
+                self.state_store.clear()
+                self._set_state(last_job_status=str(remote_job.get("status") or terminal))
+            except Exception as report_error:
+                if self._remote_job_already_succeeded(job_id, lease_token, report_error):
+                    self.state_store.clear()
+                    self._set_state(last_job_status="succeeded", last_error="")
+                else:
+                    report_pending = True
+                    self._set_state(recovery_pending=True)
+                    print(
+                        f"失败状态回传失败: {report_error}; 将由恢复线程重试 "
+                        f"({metadata})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        finally:
+            monitor_stop.set()
+            if monitor_thread.is_alive():
+                monitor_thread.join(timeout=6)
+            self._set_state(active_job_id="", active_lease_token="", _active_cancellation=None)
+            if report_pending:
+                self._start_recovery_thread()
+
+    def _run_isolated_model(
+        self, job: dict[str, Any], work_dir: Path, cancellation: CancellationToken,
+    ) -> TrainingResult:
+        """Keep native ML runtimes out of the long-lived scheduler process.
+
+        LightGBM, CatBoost and PyTorch each ship an OpenMP runtime. Loading them in
+        one macOS process is crash-prone, while a spawned process also ensures that
+        PyTorch initializes its CPU pool on its main thread.
+        """
+        work_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = work_dir / "isolated_job.json"
+        result_path = work_dir / "isolated_result.json"
+        stdout_path = work_dir / "isolated_stdout.log"
+        stderr_path = work_dir / "isolated_stderr.log"
+        descriptor.write_text(
+            json.dumps(job, ensure_ascii=False, sort_keys=True), encoding="utf-8",
+        )
+        result_path.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        params = dict((job.get("config_json") or {}).get("model", {}).get("params") or {})
+        thread_count = str(max(1, int(params.get("num_threads") or 4)))
+        environment.setdefault("OMP_NUM_THREADS", thread_count)
+        environment.setdefault("MKL_NUM_THREADS", thread_count)
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "factor_service.research.isolated_runner",
+                    str(job.get("kind") or "train"), str(descriptor),
+                    str(work_dir), str(result_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=environment, stdout=stdout, stderr=stderr,
+            )
+            try:
+                while process.poll() is None:
+                    cancellation.checkpoint()
+                    time.sleep(0.5)
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise
+        if process.returncode != 0:
+            error = stderr_path.read_text(encoding="utf-8", errors="replace")[-20_000:]
+            raise RuntimeError(
+                f"隔离模型进程失败(returncode={process.returncode}):\n{error}"
+            )
+        if not result_path.is_file():
+            raise RuntimeError("隔离模型进程未生成结果描述文件")
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        return TrainingResult(
+            result=dict(payload["result"]),
+            artifacts=[(str(kind), Path(path)) for kind, path in payload["artifacts"]],
+            predictions_path=Path(payload["predictions_path"]),
+        )
+
+    def _report_progress(
+        self,
+        job: dict[str, Any],
+        cancellation: CancellationToken,
+        stage: str,
+        percent: int,
+        details: dict[str, Any],
+    ) -> None:
+        cancellation.checkpoint()
+        payload = {"stage": stage, "percent": max(0, min(int(percent), 100)), **details}
+        self.state_store.save(job, stage, payload)
+        self._set_state(current_progress=payload)
+        # Heartbeat updates are event-free and therefore safe for granular progress.
+        try:
+            self.api.renew(str(job["job_id"]), str(job["lease_token"]), payload)
+        except AlphaBlocksApiError as exc:
+            if not exc.retryable:
+                cancellation.cancel("任务已取消或租约已失效")
+                cancellation.checkpoint()
+            print(f"进度回传暂时失败: {exc}", file=sys.stderr, flush=True)
+
+    def _monitor_lease(
+        self,
+        job_id: str,
+        lease_token: str,
+        cancellation: CancellationToken,
+        stop: threading.Event,
+    ) -> None:
+        """Poll cooperative cancellation and keep the 90-second lease alive."""
+        next_renewal = time.monotonic()
+        while not stop.wait(5):
+            try:
+                control = self.api.control(job_id, lease_token)
+                if bool(control.get("cancel_requested")):
+                    cancellation.cancel("用户已请求取消任务")
+                    return
+                status = str(control.get("status") or "")
+                if status not in ACTIVE_STATUSES:
+                    cancellation.cancel(f"任务状态已变为{status or '未知'}")
+                    return
+                if time.monotonic() >= next_renewal:
+                    with self._state_lock:
+                        progress = dict(self.current_progress)
+                    self.api.renew(job_id, lease_token, progress)
+                    next_renewal = time.monotonic() + 30
+            except AlphaBlocksApiError as exc:
+                if not exc.retryable:
+                    cancellation.cancel("任务租约已失效")
+                    return
+                print(f"任务控制检查暂时失败 {job_id}: {exc}", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"任务控制检查失败 {job_id}: {exc}", file=sys.stderr, flush=True)
+
+    def _start_recovery_if_needed(self) -> None:
+        try:
+            state = self.state_store.load()
+        except Exception as exc:
+            self._set_state(recovery_pending=True, last_error=f"恢复状态文件无效: {exc}")
+            print(self.last_error, file=sys.stderr, flush=True)
+            return
+        if state:
+            self._set_state(recovery_pending=True, last_job_status="recovering")
+            self._start_recovery_thread()
+
+    def _start_recovery_thread(self) -> None:
+        with self._state_lock:
+            if self._recovery_thread is not None and self._recovery_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._recover_interrupted_job,
+                name="job-recovery",
+                daemon=True,
+            )
+            self._recovery_thread = thread
+        thread.start()
+
+    def _recover_interrupted_job(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                state = self.state_store.load()
+                if not state:
+                    self._set_state(recovery_pending=False)
+                    return
+                job = validate_job(dict(state.get("job") or {}))
+                job_id = str(job["job_id"])
+                lease_token = str(job["lease_token"])
+                control = self.api.control(job_id, lease_token)
+                status = str(control.get("status") or "")
+                if status in ACTIVE_STATUSES:
+                    canceled = bool(control.get("cancel_requested"))
+                    progress = dict(state.get("progress") or {})
+                    report_pending = str(state.get("phase") or "") == "failure_report_pending"
+                    error_message = str(progress.get("error_message") or "").strip()
+                    retryable = bool(progress.get("retryable", True))
+                    response = self.api.fail(
+                        job_id,
+                        lease_token,
+                        error_message if report_pending and error_message else
+                        "AlphaFactorService研究进程在任务执行期间重启，任务已安全重新排队",
+                        retryable=(retryable if report_pending else True) and not canceled,
+                    )
+                    recovered_status = str((response.get("job") or {}).get("status") or "queued")
+                else:
+                    recovered_status = status or "released"
+                self.state_store.clear()
+                self._set_state(
+                    recovery_pending=False,
+                    last_job_id=job_id,
+                    last_job_status=recovered_status,
+                    last_error="",
+                )
+                print(f"已恢复中断任务 {job_id}: {recovered_status}", flush=True)
+                return
+            except AlphaBlocksApiError as exc:
+                if not exc.retryable:
+                    # The lease was already released/finished by AlphaBlocks.
+                    self.state_store.clear()
+                    self._set_state(recovery_pending=False, last_job_status="released", last_error="")
+                    return
+                self._set_state(last_error=f"恢复任务暂时失败: {exc}")
+            except Exception as exc:
+                retryable, _ = classify_exception(exc)
+                self._set_state(last_error=f"恢复任务失败: {exc}")
+                if not retryable:
+                    print(self.last_error, file=sys.stderr, flush=True)
+                    return
+            self._shutdown_event.wait(5)
+
+    def _remote_job_already_succeeded(
+        self, job_id: str, lease_token: str, report_error: Exception,
+    ) -> bool:
+        # Handles a lost HTTP response after AlphaBlocks committed completion.
+        if not isinstance(report_error, AlphaBlocksApiError):
+            return False
+        try:
+            return str(self.api.control(job_id, lease_token).get("status") or "") == "succeeded"
+        except Exception:
+            return False
+
+    def _stop(self, *_args: object) -> None:
+        self.stopping = True
+        self._shutdown_event.set()
+
+    def _set_state(self, **values: object) -> None:
+        with self._state_lock:
+            for name, value in values.items():
+                setattr(self, name, value)
+
+
+__all__ = ["ResearchWorker"]

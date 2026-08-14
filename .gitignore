@@ -1,9 +1,13 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-research/
 venv/
 .env
+config/runtime.local.yaml
 logs/
+data/research/

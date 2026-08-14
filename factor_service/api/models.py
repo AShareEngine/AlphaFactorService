@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
@@ -13,6 +13,7 @@ from factor_service.schemas import (
     ModelBacktestJobOut,
     ModelPredictionBatchIn,
     ModelPredictionOut,
+    ModelSignalOut,
 )
 
 
@@ -35,6 +36,69 @@ def list_predictions(
         model_id=model_id, model_version=model_version,
         trade_date=trade_date, limit=limit,
     )
+
+
+@router.get("/model-signals", response_model=list[ModelSignalOut])
+def list_signals(
+    model_id: str = Query(min_length=1),
+    model_version: int = Query(ge=1),
+    trade_date: date = Query(),
+    top_n: int = Query(default=20, ge=1, le=500),
+) -> list[ModelSignalOut]:
+    return model_repository.list_model_signals(
+        model_id=model_id, model_version=model_version,
+        trade_date=trade_date, top_n=top_n,
+    )
+
+
+@router.post("/model-paper/snapshot")
+def paper_snapshot(payload: dict[str, Any]) -> dict:
+    try:
+        return model_repository.model_paper_snapshot(
+            model_id=str(payload.get("model_id") or ""),
+            model_version=int(payload.get("model_version") or 0),
+            execution_date=date.fromisoformat(str(payload.get("execution_date") or "")),
+            current_codes=[str(item) for item in list(payload.get("current_codes") or [])],
+            top_n=int(payload.get("top_n") or 20),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/model-inference/availability")
+def inference_availability(payload: dict[str, Any]) -> dict:
+    try:
+        requested_trade_date = payload.get("trade_date")
+        if requested_trade_date:
+            requested_trade_date = date.fromisoformat(str(requested_trade_date))
+        data_cutoff = payload.get("data_cutoff")
+        if data_cutoff:
+            data_cutoff = datetime.fromisoformat(str(data_cutoff).replace("Z", "+00:00"))
+        return model_repository.model_inference_availability(
+            factors=list(payload.get("factors") or []),
+            requested_trade_date=requested_trade_date,
+            data_cutoff=data_cutoff,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/model-inference/trading-dates")
+def inference_trading_dates(payload: dict[str, Any]) -> dict:
+    try:
+        after_date = date.fromisoformat(str(payload.get("after_date") or ""))
+        before_date = payload.get("before_date")
+        cutoff = payload.get("data_cutoff")
+        dates = model_repository.model_inference_dates(
+            factors=list(payload.get("factors") or []),
+            after_date=after_date,
+            before_date=date.fromisoformat(str(before_date)) if before_date else None,
+            data_cutoff=datetime.fromisoformat(str(cutoff).replace("Z", "+00:00")) if cutoff else None,
+            limit=int(payload.get("limit") or 20),
+        )
+        return {"dates": dates, "count": len(dates)}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/model-backtests/jobs", response_model=ModelBacktestJobOut)

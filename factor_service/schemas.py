@@ -374,6 +374,16 @@ class ModelPredictionOut(ModelPredictionIn):
     inference_run_id: str
 
 
+class ModelSignalOut(BaseModel):
+    trade_date: date
+    entity_code: str
+    score: float = Field(ge=-1, le=1)
+    rank_value: int = Field(ge=1)
+    feature_cutoff_at: datetime
+    dataset_hash: str
+    inference_run_id: str
+
+
 class ModelBacktestJobCreate(BaseModel):
     model_id: str = Field(min_length=1)
     model_version: int = Field(ge=1)

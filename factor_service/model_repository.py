@@ -13,6 +13,7 @@ from factor_service.schemas import (
     ModelBacktestJobOut,
     ModelPredictionBatchIn,
     ModelPredictionOut,
+    ModelSignalOut,
 )
 
 
@@ -46,7 +47,14 @@ def list_model_predictions(
     limit: int = 500,
 ) -> list[ModelPredictionOut]:
     database = settings().model_database
-    condition = "AND trade_date = {trade_date:Date}" if trade_date else ""
+    condition = "AND trade_date = {trade_date:Date}" if trade_date else f"""
+          AND trade_date = (
+              SELECT max(trade_date)
+              FROM {database}.model_predictions_daily FINAL
+              WHERE model_id = {{model_id:String}}
+                AND model_version = {{model_version:UInt32}}
+          )
+    """
     params = {
         "model_id": model_id, "model_version": model_version,
         "limit": max(1, min(limit, 5000)),
@@ -77,6 +85,235 @@ def list_model_predictions(
         )
         for row in rows
     ]
+
+
+def list_model_signals(
+    *, model_id: str, model_version: int, trade_date: date,
+    top_n: int = 20,
+) -> list[ModelSignalOut]:
+    """Read one immutable daily signal snapshot for AlphaBlocks strategy backtests."""
+    rows = client().query(
+        f"""
+        SELECT trade_date, entity_code, score, rank_value, feature_cutoff_at,
+               dataset_hash, inference_run_id
+        FROM {settings().model_database}.model_predictions_daily FINAL
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+          AND trade_date = {{trade_date:Date}}
+          AND feature_cutoff_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+        ORDER BY score DESC, entity_code
+        LIMIT {{top_n:UInt32}}
+        """,
+        parameters={
+            "model_id": model_id, "model_version": int(model_version),
+            "trade_date": trade_date, "top_n": max(1, min(int(top_n), 500)),
+        },
+    ).result_rows
+    return [
+        ModelSignalOut(
+            trade_date=row[0], entity_code=row[1], score=row[2], rank_value=row[3],
+            feature_cutoff_at=row[4], dataset_hash=row[5], inference_run_id=row[6],
+        )
+        for row in rows
+    ]
+
+
+def model_paper_snapshot(
+    *, model_id: str, model_version: int, execution_date: date,
+    current_codes: list[str], top_n: int = 20,
+) -> dict:
+    """Resolve the last close signal and today's executable open snapshot."""
+    database = settings().model_database
+    signal_date = client().query(
+        f"""
+        SELECT max(trade_date)
+        FROM {database}.model_predictions_daily FINAL
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+          AND trade_date < {{execution_date:Date}}
+          AND feature_cutoff_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+        """,
+        parameters={
+            "model_id": model_id, "model_version": int(model_version),
+            "execution_date": execution_date,
+        },
+    ).result_rows[0][0]
+    if signal_date is None:
+        raise ValueError("执行日前没有可用模型收盘信号")
+    signals = list_model_signals(
+        model_id=model_id, model_version=model_version,
+        trade_date=signal_date, top_n=top_n,
+    )
+    target_codes = [row.entity_code for row in signals]
+    codes = sorted(set(target_codes) | {str(code) for code in current_codes if str(code)})
+    rows = client().query(
+        """
+        SELECT k.code, k.open, k.open * ifNull(a.backward_adj_factor, 1.0) AS adjusted_open,
+               toUInt8(ifNull(s.is_susp_sec, '') IN ('1','true','True')) AS is_suspended,
+               s.high_limited, s.low_limited
+        FROM starlight.ad_market_kline_daily k
+        ASOF LEFT JOIN (
+            SELECT code AS adjustment_code, toDate(divid_operate_date) AS factor_date,
+                   toFloat64OrNull(nullIf(back_adjust_factor, '')) AS backward_adj_factor
+            FROM baostock.bs_adjust_factor
+            WHERE code IN {codes:Array(String)}
+            ORDER BY code, factor_date
+        ) a ON k.code = a.adjustment_code AND toDate(k.trade_time) >= a.factor_date
+        ANY LEFT JOIN starlight.ad_history_stock_status s
+          ON k.code = s.market_code AND toDate(k.trade_time) = s.trade_date
+        WHERE k.code IN {codes:Array(String)}
+          AND toDate(k.trade_time) = {execution_date:Date}
+        ORDER BY k.code
+        """,
+        parameters={"codes": codes, "execution_date": execution_date},
+    ).result_rows
+    market = {}
+    for code, raw_open, price, suspended, high_limit, low_limit in rows:
+        value = float(price or 0.0)
+        open_value = float(raw_open or 0.0)
+        market[str(code)] = {
+            "price": value,
+            "buy_allowed": bool(value > 0 and not suspended and not (high_limit and open_value >= float(high_limit) - 1e-8)),
+            "sell_allowed": bool(value > 0 and not suspended and not (low_limit and open_value <= float(low_limit) + 1e-8)),
+        }
+    return {
+        "model_id": model_id,
+        "model_version": int(model_version),
+        "signal_date": signal_date,
+        "execution_date": execution_date,
+        "targets": [
+            {
+                "entity_code": row.entity_code, "score": row.score,
+                "rank_value": row.rank_value,
+            }
+            for row in signals
+        ],
+        "market": market,
+    }
+
+
+def model_inference_availability(
+    *, factors: list[dict], requested_trade_date: Optional[date] = None,
+    data_cutoff: Optional[datetime] = None,
+) -> dict:
+    if not factors:
+        raise ValueError("模型没有冻结因子")
+    effective_cutoff = data_cutoff or datetime.now()
+    params: dict[str, object] = {"data_cutoff": effective_cutoff}
+    branches = []
+    for index, factor in enumerate(factors):
+        params[f"factor_id_{index}"] = str(factor.get("factor_id") or "")
+        params[f"version_{index}"] = int(factor.get("factor_version") or 0)
+        params[f"params_hash_{index}"] = str(factor.get("params_hash") or "")
+        requested_count = ""
+        if requested_trade_date:
+            params["requested_trade_date"] = requested_trade_date
+            requested_count = (
+                ", toUInt8(countIf(trade_date = {requested_trade_date:Date}) > 0) "
+                "AS requested_date_available"
+            )
+        branches.append(
+            f"""
+            SELECT max(trade_date) AS latest_date{requested_count}
+            FROM {settings().clickhouse_database}.factor_values_daily
+            WHERE factor_id = {{factor_id_{index}:String}}
+              AND factor_version = {{version_{index}:UInt32}}
+              AND params_hash = {{params_hash_{index}:String}}
+              AND score IS NOT NULL
+              AND computed_at <= {{data_cutoff:DateTime}}
+              AND event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+            """
+        )
+    factor_columns = "min(latest_date)"
+    if requested_trade_date:
+        factor_columns += ", min(requested_date_available)"
+    factor_row = client().query(
+        f"SELECT {factor_columns} FROM (" + " UNION ALL ".join(branches) + ")",
+        parameters=params,
+    ).result_rows[0]
+    factor_latest = factor_row[0]
+    market_columns = "max(toDate(trade_time))"
+    market_params: dict[str, object] = {}
+    if requested_trade_date:
+        market_columns += ", toUInt8(countIf(toDate(trade_time) = {requested_trade_date:Date}) > 0)"
+        market_params["requested_trade_date"] = requested_trade_date
+    market_row = client().query(
+        f"""
+        SELECT {market_columns}
+        FROM starlight.ad_market_kline_daily
+        WHERE code = '000905.SH'
+        """,
+        parameters=market_params,
+    ).result_rows[0]
+    market_latest = market_row[0]
+    common_latest = min(factor_latest, market_latest) if factor_latest and market_latest else None
+    requested_available = None
+    if requested_trade_date:
+        requested_available = bool(factor_row[1]) and bool(market_row[1])
+    return {
+        "trade_date": common_latest,
+        "factor_latest_date": factor_latest,
+        "market_latest_date": market_latest,
+        "factor_count": len(factors),
+        "requested_trade_date": requested_trade_date,
+        "requested_trade_date_available": requested_available,
+        "data_cutoff": effective_cutoff,
+    }
+
+
+def model_inference_dates(
+    *, factors: list[dict], after_date: date, before_date: Optional[date] = None,
+    data_cutoff: Optional[datetime] = None, limit: int = 20,
+) -> list[date]:
+    """Return PIT-safe market dates for which every frozen factor is available."""
+    if not factors:
+        raise ValueError("模型没有冻结因子")
+    effective_cutoff = data_cutoff or datetime.now()
+    params: dict[str, object] = {
+        "after_date": after_date,
+        "before_date": before_date or date.max,
+        "data_cutoff": effective_cutoff,
+        "factor_count": len(factors),
+        "limit": max(1, min(int(limit), 250)),
+    }
+    branches: list[str] = []
+    for index, factor in enumerate(factors):
+        params[f"factor_id_{index}"] = str(factor.get("factor_id") or "")
+        params[f"version_{index}"] = int(factor.get("factor_version") or 0)
+        params[f"params_hash_{index}"] = str(factor.get("params_hash") or "")
+        branches.append(
+            f"""
+            SELECT DISTINCT trade_date, {index:d} AS factor_key
+            FROM {settings().clickhouse_database}.factor_values_daily
+            WHERE factor_id = {{factor_id_{index}:String}}
+              AND factor_version = {{version_{index}:UInt32}}
+              AND params_hash = {{params_hash_{index}:String}}
+              AND score IS NOT NULL
+              AND trade_date > {{after_date:Date}}
+              AND trade_date <= {{before_date:Date}}
+              AND computed_at <= {{data_cutoff:DateTime}}
+              AND event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+            """
+        )
+    rows = client().query(
+        f"""
+        SELECT factor_dates.trade_date
+        FROM ({" UNION ALL ".join(branches)}) AS factor_dates
+        INNER JOIN (
+            SELECT DISTINCT toDate(trade_time) AS trade_date
+            FROM starlight.ad_market_kline_daily
+            WHERE code = '000905.SH'
+              AND toDate(trade_time) > {{after_date:Date}}
+              AND toDate(trade_time) <= {{before_date:Date}}
+        ) market USING (trade_date)
+        GROUP BY factor_dates.trade_date
+        HAVING uniqExact(factor_key) = {{factor_count:UInt32}}
+        ORDER BY factor_dates.trade_date
+        LIMIT {{limit:UInt32}}
+        """,
+        parameters=params,
+    ).result_rows
+    return [row[0] for row in rows]
 
 
 def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJobOut:

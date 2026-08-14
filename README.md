@@ -1,11 +1,13 @@
 # AlphaFactorService
 
-独立因子服务，负责管理因子定义、因子计算任务，以及查询 ClickHouse 中的因子结果。
+AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推理、模型信号和快速回测。
 
 ## 职责边界
 
 - Studio 负责展示、编辑、创建任务、查看结果。
 - AlphaFactorService 负责保存因子定义、管理任务、执行计算、查询结果。
+- AlphaFactorService 内置独立研究Worker，负责LightGBM、XGBoost、CatBoost和PyTorch MLP训练与每日推理。
+- Factor API和研究Worker是同一仓库中的两个进程；机器学习依赖不会加载进API进程。
 - ClickHouse 的 `ab_factor` 库负责保存因子定义、计算任务和因子结果。
 - 不再用本地 SQLite 或 YAML 保存因子库，元数据和结果统一由 ClickHouse 承载。
 
@@ -22,6 +24,10 @@
 - `GET /factor-values` 查询因子结果。
 - `GET /factor-values/coverage` 查询覆盖率框架。
 - `POST /factor-values/sync-states` 批量查询因子规格的真实持久化覆盖范围，供自动全量/增量同步规划使用。
+- `POST /model-inference/availability` 按冻结因子、数据截止时间和历史交易日检查每日推理可用性。
+- `GET /model-signals` 返回指定不可变模型版本、交易日的PIT安全TopN信号，供AlphaBlocks正式策略回测读取。
+- `POST /research/api/v1/jobs` 通过统一FactorService地址向本机研究进程下发训练或推理任务。
+- `GET /research/ready` 和 `GET /research/api/v1/status` 查询研究进程状态。
 
 聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过
 `rtk .venv/bin/python scripts/export_joinquant_factor_catalog.py` 重新生成公开目录与详情快照。
@@ -71,7 +77,7 @@ cd /Users/zhao/Desktop/git/AlphaFactorService
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp .env.example .env
+cp config/runtime.example.yaml config/runtime.local.yaml
 alpha-factor-service
 ```
 
@@ -85,25 +91,52 @@ http://127.0.0.1:8100
 
 ```bash
 cd /Users/zhao/Desktop/git/AlphaFactorService
+python3.11 -m venv .venv-research
+.venv-research/bin/pip install -e '.[research]'
 pm2 start ecosystem.config.js
 ```
 
-默认只启动 API 服务，和 `AlphaBlocksSyncData` 保持同样的单 PM2 进程模型。前端创建计算任务后会调用 `POST /factor-jobs/run-pending` 触发执行。
+默认启动两个隔离进程：
 
-默认监听：
+- `alpha-factor-service`：统一API，包含因子、模型信号、回测与研究网关。
+- `alpha-factor-research-worker`：Qlib多模型训练和每日推理，只监听loopback。
+
+研究能力已经融合到`factor_service.research`模块，不再存在第二个顶层业务包。当前处于开发阶段，
+训练产物只接受新的`factor_service.research.models`类路径，不保留旧Worker包兼容层。
+
+默认只监听本机：
 
 ```text
-http://0.0.0.0:8100
+http://127.0.0.1:8100
 ```
 
-可通过环境变量覆盖：
+监听地址、ClickHouse、数据源与研究存储位置统一配置在：
 
-```bash
-PYTHON_BIN=/path/to/python \
-AB_FACTOR_HOST=0.0.0.0 \
-AB_FACTOR_PORT=8100 \
-pm2 start ecosystem.config.js
+```text
+config/runtime.local.yaml
 ```
+
+`runtime.local.yaml`已被Git忽略。部署时可以用`ALPHA_FACTOR_RUNTIME_CONFIG`显式选择
+另一份YAML；除Python解释器选择外，PM2不再通过环境变量覆盖业务配置。
+
+研究进程使用Python 3.11或3.12，并复用同一份`clickhouse`配置。研究配置示例：
+
+```yaml
+research:
+  api_url: http://127.0.0.1:8001/api/model-research
+  token: ""
+  listen_host: 127.0.0.1
+  listen_port: 8787
+  storage:
+    root: /Volumes/QuantData/alphafactor/research
+```
+
+`research.storage.root`是研究文件的统一根目录，包含冻结数据集、训练模型、预测Parquet、
+MLflow记录、指标、日志、任务状态和临时文件。相对路径从AlphaFactorService项目根目录解析；
+需要放到外置磁盘或指定数据盘时建议直接填写绝对路径。最终上传并发布的模型包由AlphaBlocks
+自己的`storage.model_artifacts_root`控制。
+
+AlphaBlocks只配置`external_services.factor_service.base_url`，不再保存单独的研究Worker地址。
 
 如果以后需要独立后台消费 pending 任务，可以单独运行：
 
@@ -113,30 +146,34 @@ python -m factor_service.worker --limit 5 --poll-interval 60
 
 ## ClickHouse 初始化
 
-ClickHouse 连接信息写在本项目 `.env`，字段和 `AlphaBlocksSyncData` 的 datasource 对齐：
+ClickHouse连接信息写在本项目`config/runtime.local.yaml`：
 
-```text
-AB_FACTOR_CLICKHOUSE_HOST
-AB_FACTOR_CLICKHOUSE_PORT
-AB_FACTOR_CLICKHOUSE_USER
-AB_FACTOR_CLICKHOUSE_PASSWORD
-AB_FACTOR_CLICKHOUSE_SECURE
-AB_FACTOR_CLICKHOUSE_DATABASE
+```yaml
+clickhouse:
+  host: 10.126.126.3
+  port: 8123
+  username: default
+  password: ""
+  secure: false
+  factor_database: ab_factor
+  model_database: ab_model
 ```
 
-其中 `AB_FACTOR_CLICKHOUSE_DATABASE` 是因子服务自己的库，默认 `ab_factor`。
+其中`factor_database`是因子服务自己的库，默认`ab_factor`。
 
 因子计算的数据源单独配置，默认读取 `baostock.stock_daily_real`：
 
-```text
-AB_FACTOR_SOURCE_DATABASE
-AB_FACTOR_STOCK_DAILY_TABLE
-AB_FACTOR_STOCK_CODE_COLUMN
-AB_FACTOR_STOCK_DATE_COLUMN
-AB_FACTOR_STOCK_PRICE_COLUMN
-AB_FACTOR_STOCK_BASIC_TABLE
-AB_FACTOR_STOCK_BASIC_TYPE_COLUMN
-AB_FACTOR_STOCK_BASIC_STOCK_TYPE_VALUE
+```yaml
+sources:
+  factor:
+    database: ab_factor
+    stock_daily_table: stock_daily_factor_source
+    stock_code_column: code
+    stock_date_column: trade_time
+    stock_price_column: close
+    stock_basic_table: stock_basic_factor_source
+    stock_basic_type_column: type
+    stock_basic_stock_type_value: "1"
 ```
 
 当前股票日频因子需要从多张实体资产表组合字段：行情来自 `starlight.ad_market_kline_daily`，
@@ -155,12 +192,6 @@ PY
 
 然后将计算源指向视图：
 
-```text
-AB_FACTOR_SOURCE_DATABASE=ab_factor
-AB_FACTOR_STOCK_DAILY_TABLE=stock_daily_factor_source
-AB_FACTOR_STOCK_BASIC_TABLE=stock_basic_factor_source
-```
-
 ```bash
 clickhouse-client < scripts/init_clickhouse.sql
 ```
@@ -178,9 +209,6 @@ clickhouse-client < scripts/seed_default_factors.sql
 可以用脚本检查源表、公式编译、worker dry-run 和已落库结果是否一致：
 
 ```bash
-AB_FACTOR_SOURCE_DATABASE=ab_factor \
-AB_FACTOR_STOCK_DAILY_TABLE=stock_daily_factor_source \
-AB_FACTOR_STOCK_BASIC_TABLE=stock_basic_factor_source \
 python scripts/validate_factor_outputs.py
 ```
 
@@ -208,6 +236,10 @@ ab_factor.factor_analysis_turnover_daily
 - `factor_analysis_*` 保存 Alphalens 生成的 IC、分位收益、换手和汇总指标。
 
 `factor_values_daily` 同时保存两套时间：`event_available_at` 是行情事件理论可用时间，`computed_at` 是因子批次实际生成时间。策略查询默认按 `computed_at` 和 DataCutoff 做严格截断；只有显式历史重建研究才按 `event_available_at` 查询。`source_vintage` 记录计算源和任务批次。Alphalens 对日频收盘因子统一延迟一个交易日后再计算 forward return，避免用当天收盘数据又假设能在当天收盘成交。
+
+`model-signals`只返回`feature_cutoff_at <= T日15:00`的模型预测，并携带
+`dataset_hash`和`inference_run_id`。接口只提供因果安全的信号截面；正式策略仍由AlphaBlocks
+执行T+1成交、涨跌停/停牌、费用和持仓规则，FactorService不会在这里复制策略引擎。
 
 后续分钟级结果可以单独增加：
 
