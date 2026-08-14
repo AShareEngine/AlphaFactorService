@@ -662,18 +662,37 @@ class ModelResearchRepository:
             raise ModelResearchNotFound("模型版本不存在")
         return dict(row)
 
-    def mark_validated(self, model_id: str, version: int, factor_backtest_job_id: str) -> dict[str, Any]:
+    def record_validation_result(
+        self,
+        model_id: str,
+        version: int,
+        factor_backtest_job_id: str,
+        *,
+        approved: bool,
+        validation: Mapping[str, Any],
+    ) -> dict[str, Any]:
         now = _utcnow()
         with self.database.connection() as conn:
-            row = conn.execute(
-                """
-                UPDATE model_versions SET state = 'validated', updated_at = %s
-                WHERE model_id = %s AND version = %s
-                RETURNING *
-                """,
-                (now, model_id, int(version)),
-            ).fetchone()
-            if row:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    UPDATE model_versions
+                    SET state = %s,
+                        manifest_json = jsonb_set(
+                            COALESCE(manifest_json, '{}'::jsonb),
+                            '{validation}', %s, TRUE
+                        ),
+                        updated_at = %s
+                    WHERE model_id = %s AND version = %s
+                    RETURNING *
+                    """,
+                    (
+                        "validated" if approved else "candidate",
+                        Jsonb(dict(validation)), now, model_id, int(version),
+                    ),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型版本不存在")
                 conn.execute(
                     """
                     UPDATE model_jobs SET factor_backtest_job_id = %s, updated_at = %s
@@ -681,19 +700,48 @@ class ModelResearchRepository:
                     """,
                     (factor_backtest_job_id, now, row["job_id"]),
                 )
-                conn.execute(
-                    """
-                    INSERT INTO model_inference_schedules(
-                        model_id, model_version, enabled, created_at, updated_at
-                    ) VALUES (%s, %s, TRUE, %s, %s)
-                    ON CONFLICT(model_id, model_version) DO UPDATE SET
-                        enabled = TRUE, updated_at = EXCLUDED.updated_at
-                    """,
-                    (model_id, int(version), now, now),
-                )
-        if not row:
-            raise ModelResearchNotFound("模型版本不存在")
+                if approved:
+                    conn.execute(
+                        """
+                        INSERT INTO model_inference_schedules(
+                            model_id, model_version, enabled, created_at, updated_at
+                        ) VALUES (%s, %s, TRUE, %s, %s)
+                        ON CONFLICT(model_id, model_version) DO UPDATE SET
+                            enabled = TRUE, updated_at = EXCLUDED.updated_at
+                        """,
+                        (model_id, int(version), now, now),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE model_inference_schedules
+                        SET enabled = FALSE, updated_at = %s
+                        WHERE model_id = %s AND model_version = %s
+                        """,
+                        (now, model_id, int(version)),
+                    )
         return dict(row)
+
+    def mark_validated(
+        self,
+        model_id: str,
+        version: int,
+        factor_backtest_job_id: str,
+        *,
+        validation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.record_validation_result(
+            model_id,
+            version,
+            factor_backtest_job_id,
+            approved=True,
+            validation=validation or {
+                "policy": "manual",
+                "passed": True,
+                "manual_override": True,
+                "backtest_job_id": factor_backtest_job_id,
+            },
+        )
 
     def list_inference_schedules(self) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
@@ -1144,6 +1192,12 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
 def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
     result.pop("lease_token", None)
+    # Repository rows are also the durable worker transport payload. psycopg
+    # returns timestamp columns as datetime objects, which cannot be written to
+    # the worker state JSON or isolated-process descriptor without conversion.
+    for key, value in tuple(result.items()):
+        if isinstance(value, datetime):
+            result[key] = value.isoformat()
     return result
 
 

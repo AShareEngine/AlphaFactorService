@@ -140,6 +140,7 @@ def test_factor_query_calculates_on_demand_without_factor_value_persistence(monk
 
     assert len(frame) == 1
     assert "source_daily" in builder.client.query_text
+    assert "score AS value" in builder.client.query_text
     assert "factor_values_daily" not in builder.client.query_text
     assert "INSERT" not in builder.client.query_text.upper()
 

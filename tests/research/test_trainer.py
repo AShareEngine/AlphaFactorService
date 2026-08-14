@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 import subprocess
 import sys
 import textwrap
@@ -7,11 +8,27 @@ import pandas as pd
 
 from factor_service.research.trainer import (
     _create_model,
+    _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
     _walk_forward_frame,
     predict_feature_frame,
 )
+
+
+def test_recorder_experiment_uses_job_local_artifact_root(tmp_path: Path) -> None:
+    from mlflow.tracking import MlflowClient
+
+    recorder_uri = f"sqlite:///{(tmp_path / 'mlflow.db').as_posix()}"
+    recorder_root = tmp_path / "mlruns"
+
+    _prepare_recorder_experiment(recorder_uri, "local_recorder", recorder_root)
+
+    experiment = MlflowClient(tracking_uri=recorder_uri).get_experiment_by_name(
+        "local_recorder"
+    )
+    assert experiment is not None
+    assert experiment.artifact_location == recorder_root.resolve().as_uri()
 
 
 def test_lightgbm_parameters_are_deterministic() -> None:

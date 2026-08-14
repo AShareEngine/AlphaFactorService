@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from factor_service.model_research_repository import (
     ModelResearchError,
     _dataset_spec,
+    _job_row,
     _model_spec,
     _walk_forward_spec,
 )
@@ -133,3 +136,16 @@ def test_walk_forward_contract_has_strict_independent_test_defaults() -> None:
 def test_walk_forward_contract_rejects_overlapping_test_windows() -> None:
     with pytest.raises(ModelResearchError, match="样本外预测重叠"):
         _walk_forward_spec({"enabled": True, "test_months": 12, "step_months": 6})
+
+
+def test_job_transport_serializes_database_timestamps() -> None:
+    row = {
+        "job_id": "model_job_test",
+        "lease_token": "secret-token",
+        "requested_at": datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc),
+    }
+
+    result = _job_row(row)
+
+    assert "lease_token" not in result
+    assert result["requested_at"] == "2026-08-14T12:00:00+00:00"

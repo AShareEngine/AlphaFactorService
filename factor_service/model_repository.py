@@ -345,6 +345,31 @@ def get_model_backtest_job(backtest_job_id: str) -> Optional[ModelBacktestJobOut
     return _job_from_row(rows[0]) if rows else None
 
 
+def latest_model_backtests(
+    models: list[tuple[str, int]],
+) -> dict[tuple[str, int], ModelBacktestJobOut]:
+    """Return the latest successful TopN backtest for each requested model."""
+    keys = list(dict.fromkeys((str(model_id), int(version)) for model_id, version in models))
+    if not keys:
+        return {}
+    database = settings().model_database
+    rows = client().query(
+        f"""
+        SELECT *
+        FROM {database}.model_backtest_jobs FINAL
+        WHERE status = 'success'
+          AND (model_id, model_version) IN {{models:Array(Tuple(String, UInt32))}}
+        ORDER BY finished_at DESC, created_at DESC
+        """,
+        parameters={"models": keys},
+    ).result_rows
+    result: dict[tuple[str, int], ModelBacktestJobOut] = {}
+    for row in rows:
+        backtest = _job_from_row(row)
+        result.setdefault((backtest.model_id, backtest.model_version), backtest)
+    return result
+
+
 def update_model_backtest_job(backtest_job_id: str, **changes) -> ModelBacktestJobOut:
     current = get_model_backtest_job(backtest_job_id)
     if current is None:

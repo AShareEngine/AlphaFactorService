@@ -287,7 +287,16 @@ class DatasetBuilder:
             raise ValueError(
                 f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
             )
-        rows = self.client.query(plan.sql, parameters=plan.params).result_rows
+        # The canonical factor query exposes raw/rank/percentile/score. Model
+        # features deliberately consume only the model-ready score, so project
+        # the six-column query back to the stable three-column dataset contract.
+        feature_sql = f"""
+        SELECT trade_date, entity_code, score AS value
+        FROM (
+            {plan.sql}
+        )
+        """
+        rows = self.client.query(feature_sql, parameters=plan.params).result_rows
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument", "value"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])

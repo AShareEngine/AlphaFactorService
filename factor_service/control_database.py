@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import re
+import threading
 from typing import Any, Iterator
 
 from psycopg import Connection, sql
@@ -50,7 +51,14 @@ class ControlDatabase:
 
     def __init__(self, config: ControlDatabaseConfig) -> None:
         self.config = _validated_config(config)
-        self._pool = ConnectionPool(
+        self._pool_lock = threading.Lock()
+        self._pool = self._build_pool()
+        self._pool_opened = False
+        self._pool_needs_rebuild = False
+        _OPEN_DATABASES.append(self)
+
+    def _build_pool(self) -> ConnectionPool:
+        return ConnectionPool(
             kwargs=_connection_kwargs(self.config),
             min_size=max(1, int(self.config.min_pool_size)),
             max_size=max(
@@ -61,21 +69,51 @@ class ControlDatabase:
             configure=self._configure_connection,
             name="alpha-factor-service-model-research",
         )
-        _OPEN_DATABASES.append(self)
 
     @property
     def schema(self) -> str:
         return self.config.schema
 
     def open(self, *, wait: bool = True) -> None:
-        self._pool.open(wait=wait, timeout=float(self.config.connect_timeout_seconds))
+        # API requests and the inference scheduler can be the first callers at
+        # exactly the same time. psycopg pools cannot be opened concurrently or
+        # reopened after close, so serialize initialization and rebuild a pool
+        # that has completed a previous lifecycle.
+        with self._pool_lock:
+            if self._pool_opened and not self._pool.closed:
+                return
+            if self._pool_needs_rebuild or (self._pool_opened and self._pool.closed):
+                self._pool = self._build_pool()
+                self._pool_opened = False
+                self._pool_needs_rebuild = False
+            try:
+                self._pool.open(
+                    wait=wait,
+                    timeout=float(self.config.connect_timeout_seconds),
+                )
+            except Exception:
+                # A failed psycopg initialization also consumes the pool's
+                # lifecycle. Rebuild it on the next attempt so callers retain
+                # the original connection error instead of receiving the
+                # misleading "pool ... cannot be reused" error forever.
+                try:
+                    self._pool.close()
+                finally:
+                    self._pool_opened = False
+                    self._pool_needs_rebuild = True
+                raise
+            self._pool_opened = True
 
     def close(self) -> None:
-        self._pool.close()
+        with self._pool_lock:
+            if self._pool_opened and not self._pool.closed:
+                self._pool.close()
+            if self._pool_opened:
+                self._pool_needs_rebuild = True
 
     @contextmanager
     def connection(self) -> Iterator[Connection[dict[str, Any]]]:
-        if self._pool.closed:
+        if not self._pool_opened or self._pool.closed:
             self.open()
         with self._pool.connection() as conn:
             yield conn

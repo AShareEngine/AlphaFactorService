@@ -80,6 +80,7 @@ class QlibTrainer:
         recorder_db = work_dir / "mlflow.db"
         recorder_uri = f"sqlite:///{recorder_db.as_posix()}"
         experiment_name = f"alphablocks_{job['model_id']}"
+        _prepare_recorder_experiment(recorder_uri, experiment_name, recorder_root)
         evals_result: dict[str, Any] = {}
         walk_forward_report: dict[str, Any] | None = None
         walk_forward_prediction: pd.Series | None = None
@@ -297,6 +298,23 @@ class QlibTrainer:
         if published != len(rows):
             raise ValueError(f"预测发布校验失败: 期望{len(rows)}，实际{published}")
         return published
+
+
+def _prepare_recorder_experiment(
+    recorder_uri: str,
+    experiment_name: str,
+    recorder_root: Path,
+) -> None:
+    """Keep Qlib Recorder artifacts inside the current job directory."""
+    from mlflow.tracking import MlflowClient
+
+    recorder_root.mkdir(parents=True, exist_ok=True)
+    client = MlflowClient(tracking_uri=recorder_uri)
+    if client.get_experiment_by_name(experiment_name) is None:
+        client.create_experiment(
+            experiment_name,
+            artifact_location=recorder_root.resolve().as_uri(),
+        )
 
 
 def _run_walk_forward(

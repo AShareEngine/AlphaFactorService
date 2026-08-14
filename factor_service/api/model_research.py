@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from factor_service import model_repository
 from factor_service.model_artifacts import ArtifactError
 from factor_service.model_backtest import run_model_backtest_job
+from factor_service.model_validation import assess_model_validation
 from factor_service.model_research_repository import (
     ModelResearchConflict,
     ModelResearchError,
@@ -50,6 +51,30 @@ def _raise(exc: Exception) -> None:
 
 def _dispatch(request: Request, job: dict[str, Any]) -> tuple[dict[str, Any], int]:
     return dispatch_model_job(repository, _worker(request), job)
+
+
+def _model_validation_view(
+    model: dict[str, Any], backtest: Any | None,
+) -> dict[str, Any]:
+    assessed = assess_model_validation(model.get("metrics_json"), backtest)
+    stored = dict((model.get("manifest_json") or {}).get("validation") or {})
+    if (
+        stored.get("manual_override") is True
+        and str(stored.get("backtest_job_id") or "")
+        == str(assessed.get("backtest_job_id") or "")
+    ):
+        return stored
+    return assessed
+
+
+def _model_response(model: dict[str, Any], backtest: Any | None) -> dict[str, Any]:
+    result = dict(model)
+    validation = _model_validation_view(model, backtest)
+    result["registry_state"] = str(model.get("state") or "candidate")
+    result["state"] = "validated" if validation.get("approved") is True else "candidate"
+    result["latest_backtest"] = backtest.model_dump() if backtest is not None else None
+    result["validation"] = validation
+    return result
 
 
 @router.get("/jobs")
@@ -129,7 +154,20 @@ def download_artifact(request: Request, artifact_id: str) -> FileResponse:
 @router.get("/models")
 def list_models(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     try:
-        return {"ok": True, "models": repository.list_models(limit=limit)}
+        models = repository.list_models(limit=limit)
+        backtests = model_repository.latest_model_backtests([
+            (str(model["model_id"]), int(model["version"])) for model in models
+        ])
+        return {
+            "ok": True,
+            "models": [
+                _model_response(
+                    model,
+                    backtests.get((str(model["model_id"]), int(model["version"]))),
+                )
+                for model in models
+            ],
+        }
     except Exception as exc:
         _raise(exc)
 
@@ -137,7 +175,11 @@ def list_models(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]
 @router.get("/models/{model_id}/versions/{version}")
 def get_model(model_id: str, version: int) -> dict[str, Any]:
     try:
-        return {"ok": True, "model": repository.get_model(model_id, version)}
+        model = repository.get_model(model_id, version)
+        backtest = model_repository.latest_model_backtests([(model_id, version)]).get(
+            (model_id, version)
+        )
+        return {"ok": True, "model": _model_response(model, backtest)}
     except Exception as exc:
         _raise(exc)
 
@@ -164,7 +206,12 @@ def record_strategy_deployment(
     payload: dict[str, Any] = Body(...),
 ) -> dict[str, Any]:
     try:
-        repository.get_model(model_id, version)
+        model = repository.get_model(model_id, version)
+        backtest = model_repository.latest_model_backtests([(model_id, version)]).get(
+            (model_id, version)
+        )
+        if _model_validation_view(model, backtest).get("approved") is not True:
+            raise ModelResearchConflict("模型尚未通过研究门槛，不能加入策略运行")
         return {
             "ok": True,
             "deployment": repository.record_strategy_deployment(
@@ -282,8 +329,11 @@ def list_signals(
 ) -> dict[str, Any]:
     try:
         model = repository.get_model(model_id, version)
-        if str(model.get("state") or "") != "validated":
-            raise ModelResearchConflict("模型尚未通过Top20快速回测验证，不能用于正式策略信号")
+        backtest = model_repository.latest_model_backtests([(model_id, version)]).get(
+            (model_id, version)
+        )
+        if _model_validation_view(model, backtest).get("approved") is not True:
+            raise ModelResearchConflict("模型尚未通过研究门槛，不能用于正式策略信号")
         rows = model_repository.list_model_signals(
             model_id=model_id,
             model_version=version,
@@ -326,9 +376,26 @@ def get_backtest(backtest_job_id: str) -> dict[str, Any]:
             raise ModelResearchNotFound("模型回测任务不存在")
         if result.status == "success":
             model = repository.get_model(result.model_id, result.model_version)
-            if str(model.get("state")) != "validated":
-                repository.mark_validated(result.model_id, result.model_version, backtest_job_id)
-        return {"ok": True, "backtest": result}
+            validation = _model_validation_view(model, result)
+            stored = dict((model.get("manifest_json") or {}).get("validation") or {})
+            already_recorded = (
+                str(stored.get("backtest_job_id") or "") == backtest_job_id
+                and bool(stored.get("manual_override")) == bool(validation.get("manual_override"))
+                and bool(stored.get("passed")) == bool(validation.get("passed"))
+            )
+            if not already_recorded:
+                repository.record_validation_result(
+                    result.model_id,
+                    result.model_version,
+                    backtest_job_id,
+                    approved=bool(validation.get("passed")),
+                    validation=validation,
+                )
+        else:
+            validation = None
+        payload = result.model_dump()
+        payload["validation"] = validation
+        return {"ok": True, "backtest": payload}
     except Exception as exc:
         _raise(exc)
 
@@ -349,13 +416,38 @@ def get_backtest_daily(
 
 
 @router.post("/models/{model_id}/versions/{version}/backtests/{backtest_job_id}/validate")
-def validate_backtest(model_id: str, version: int, backtest_job_id: str) -> dict[str, Any]:
+def validate_backtest(
+    model_id: str,
+    version: int,
+    backtest_job_id: str,
+    payload: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
     try:
         result = model_repository.get_model_backtest_job(backtest_job_id)
         if result is None or result.status != "success":
             raise ModelResearchConflict("模型回测尚未成功，不能标记为已验证")
-        model = repository.mark_validated(model_id, version, backtest_job_id)
-        return {"ok": True, "model": model, "backtest": result}
+        source = repository.get_model(model_id, version)
+        validation = assess_model_validation(source.get("metrics_json"), result)
+        override = bool(payload.get("override", False))
+        reason = str(payload.get("reason") or "").strip()
+        if validation["passed"] is not True and not override:
+            labels = [
+                str(item["label"])
+                for item in validation["checks"]
+                if item["passed"] is not True
+            ]
+            raise ModelResearchConflict("模型未通过研究门槛：" + "、".join(labels))
+        if override and not reason:
+            raise ModelResearchError("人工放行必须填写原因")
+        validation.update({
+            "approved": True,
+            "manual_override": override,
+            "override_reason": reason if override else "",
+        })
+        model = repository.mark_validated(
+            model_id, version, backtest_job_id, validation=validation,
+        )
+        return {"ok": True, "model": model, "backtest": result, "validation": validation}
     except Exception as exc:
         _raise(exc)
 

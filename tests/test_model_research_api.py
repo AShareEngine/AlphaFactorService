@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from factor_service.api import model_research
+from factor_service.schemas import ModelBacktestJobOut
 
 
 class _Repository:
@@ -13,6 +14,7 @@ class _Repository:
             "job-done": {"job_id": "job-done", "status": "succeeded"},
         }
         self.inference_payload = None
+        self.validation_payload = None
 
     def list_jobs(self, *, status, limit):
         return list(self.jobs.values())[:limit]
@@ -44,7 +46,20 @@ class _Repository:
             "model_id": model_id,
             "version": version,
             "dataset_spec": {"factors": [{"factor_id": "mom_20"}]},
+            "metrics_json": {"test_days": 80, "rank_ic": 0.04, "ic_ir": 0.6},
+            "manifest_json": {},
+            "state": "validated",
         }
+
+    def mark_validated(self, model_id, version, backtest_job_id, *, validation):
+        self.validation_payload = dict(validation)
+        return {"model_id": model_id, "version": version, "state": "validated"}
+
+    def record_validation_result(
+        self, model_id, version, backtest_job_id, *, approved, validation,
+    ):
+        self.validation_payload = {**validation, "approved_by_repository": approved}
+        return {"model_id": model_id, "version": version}
 
     def create_inference_job(self, model_id, version, payload):
         self.inference_payload = dict(payload)
@@ -123,3 +138,73 @@ def test_default_inference_date_is_rechecked_as_an_explicit_date(monkeypatch) ->
         ("2026-08-13", "2026-08-13T16:00:00+08:00"),
     ]
     assert repository.inference_payload["trade_date"] == "2026-08-13"
+
+
+def _negative_backtest() -> ModelBacktestJobOut:
+    return ModelBacktestJobOut(
+        backtest_job_id="model_backtest_negative",
+        model_id="demo",
+        model_version=1,
+        universe_id="csi500",
+        benchmark_code="000905.SH",
+        date_preset="3y",
+        status="success",
+        annual_return=-0.02,
+        excess_annual_return=-0.01,
+        sharpe_ratio=0.1,
+        turnover_rate=0.08,
+        max_drawdown=-0.12,
+        trading_days=80,
+    )
+
+
+def test_successful_backtest_does_not_auto_validate_negative_excess(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "get_model_backtest_job",
+        lambda _job_id: _negative_backtest(),
+    )
+
+    response = client.get(
+        "/model-research/model-backtests/model_backtest_negative"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["backtest"]["validation"]["passed"] is False
+    assert repository.validation_payload["approved_by_repository"] is False
+
+
+def test_model_response_uses_effective_gate_state() -> None:
+    model = _Repository().get_model("demo", 1)
+
+    response = model_research._model_response(model, _negative_backtest())
+
+    assert response["registry_state"] == "validated"
+    assert response["state"] == "candidate"
+    assert response["validation"]["failed_checks"] == ["excess_annual_return"]
+
+
+def test_failed_gate_requires_reasoned_manual_override(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "get_model_backtest_job",
+        lambda _job_id: _negative_backtest(),
+    )
+    path = "/model-research/models/demo/versions/1/backtests/model_backtest_negative/validate"
+
+    rejected = client.post(path, json={})
+    missing_reason = client.post(path, json={"override": True})
+    approved = client.post(
+        path,
+        json={"override": True, "reason": "仅用于模拟盘观察"},
+    )
+
+    assert rejected.status_code == 409
+    assert missing_reason.status_code == 400
+    assert approved.status_code == 200
+    assert repository.validation_payload["manual_override"] is True
+    assert repository.validation_payload["override_reason"] == "仅用于模拟盘观察"
