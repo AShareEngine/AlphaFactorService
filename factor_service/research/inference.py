@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from factor_service.research.api import AlphaBlocksApi
+from factor_service.research.api import ResearchControl
 from factor_service.research.config import Settings
 from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
@@ -22,7 +22,7 @@ from factor_service.research.trainer import TrainingResult, predict_feature_fram
 class DailyInferenceRunner:
     """Load an immutable training bundle and score one historical trading day."""
 
-    def __init__(self, settings: Settings, api: AlphaBlocksApi) -> None:
+    def __init__(self, settings: Settings, api: ResearchControl) -> None:
         self.settings = settings
         self.api = api
         self.dataset_builder = DatasetBuilder(settings)

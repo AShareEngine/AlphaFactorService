@@ -16,6 +16,20 @@ clickhouse:
   factor_database: ab_factor
   model_database: ab_model
 
+# AlphaFactorService owns model jobs, versions, events, and artifact metadata.
+# Point this at the existing AlphaBlocks control database to preserve old models.
+control_database:
+  host: 10.126.126.3
+  port: 5432
+  database: alphablocks
+  schema: control
+  username: postgres
+  password: ""
+  sslmode: prefer
+  connect_timeout_seconds: 5
+  min_pool_size: 1
+  max_pool_size: 5
+
 sources:
   factor:
     database: ab_factor
@@ -30,7 +44,6 @@ sources:
     database: starlight
 
 research:
-  api_url: "http://127.0.0.1:8001/api/model-research"
   token: ""
   storage:
     # Relative paths are resolved from the AlphaFactorService project root.

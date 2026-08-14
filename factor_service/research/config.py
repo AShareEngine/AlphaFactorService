@@ -12,7 +12,6 @@ from factor_service.runtime_config import (
 
 @dataclass(frozen=True)
 class Settings:
-    api_url: str
     worker_token: str
     clickhouse_host: str
     clickhouse_port: int
@@ -31,12 +30,8 @@ def load_settings() -> Settings:
     storage = section(runtime, "research", "storage")
     clickhouse = section(runtime, "clickhouse")
     source = section(runtime, "sources", "research")
-    api_url = str(
-        research.get("api_url") or "http://127.0.0.1:8001/api/model-research"
-    ).strip().rstrip("/")
     clickhouse_host = str(clickhouse.get("host") or "127.0.0.1").strip()
     result = Settings(
-        api_url=api_url,
         worker_token=str(research.get("token") or ""),
         clickhouse_host=clickhouse_host,
         clickhouse_port=int(clickhouse.get("port") or 8123),

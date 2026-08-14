@@ -15,7 +15,8 @@ from typing import Any
 
 from factor_service.research import __version__
 from factor_service.model_artifacts import ModelArtifactStore
-from factor_service.research.api import AlphaBlocksApi, AlphaBlocksApiError
+from factor_service.model_research_repository import ModelResearchRepository
+from factor_service.research.api import ResearchControl, ResearchControlError
 from factor_service.research.config import Settings
 from factor_service.research.errors import classify_exception, error_payload
 from factor_service.research.inference import DailyInferenceRunner
@@ -34,7 +35,7 @@ class ResearchWorker:
         if not self.settings.work_root.is_dir():
             raise ValueError(f"研究存储根目录无效: {self.settings.work_root}")
         self.artifact_store = ModelArtifactStore(self.settings.model_artifacts_root)
-        self.api = AlphaBlocksApi(settings.api_url, settings.worker_token)
+        self.api = ResearchControl(ModelResearchRepository(), self.artifact_store)
         self.trainer: QlibTrainer | None = None
         self.inference_runner: DailyInferenceRunner | None = None
         self.state_store = JobStateStore(settings.work_root)
@@ -176,7 +177,6 @@ class ResearchWorker:
                 "last_error": self.last_error,
                 "progress": dict(self.current_progress),
                 "started_at": self.started_at,
-                "api_url": self.settings.api_url,
                 "capabilities": self.capabilities(),
             }
 
@@ -393,7 +393,7 @@ class ResearchWorker:
         # Heartbeat updates are event-free and therefore safe for granular progress.
         try:
             self.api.renew(str(job["job_id"]), str(job["lease_token"]), payload)
-        except AlphaBlocksApiError as exc:
+        except ResearchControlError as exc:
             if not exc.retryable:
                 cancellation.cancel("任务已取消或租约已失效")
                 cancellation.checkpoint()
@@ -423,7 +423,7 @@ class ResearchWorker:
                         progress = dict(self.current_progress)
                     self.api.renew(job_id, lease_token, progress)
                     next_renewal = time.monotonic() + 30
-            except AlphaBlocksApiError as exc:
+            except ResearchControlError as exc:
                 if not exc.retryable:
                     cancellation.cancel("任务租约已失效")
                     return
@@ -491,7 +491,7 @@ class ResearchWorker:
                 )
                 print(f"已恢复中断任务 {job_id}: {recovered_status}", flush=True)
                 return
-            except AlphaBlocksApiError as exc:
+            except ResearchControlError as exc:
                 if not exc.retryable:
                     # The lease was already released/finished by AlphaBlocks.
                     self.state_store.clear()
@@ -510,7 +510,7 @@ class ResearchWorker:
         self, job_id: str, lease_token: str, report_error: Exception,
     ) -> bool:
         # Handles a lost HTTP response after AlphaBlocks committed completion.
-        if not isinstance(report_error, AlphaBlocksApiError):
+        if not isinstance(report_error, ResearchControlError):
             return False
         try:
             return str(self.api.control(job_id, lease_token).get("status") or "") == "succeeded"

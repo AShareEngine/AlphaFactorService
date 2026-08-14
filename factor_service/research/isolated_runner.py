@@ -5,7 +5,9 @@ import json
 import os
 from pathlib import Path
 
-from factor_service.research.api import AlphaBlocksApi
+from factor_service.model_artifacts import ModelArtifactStore
+from factor_service.model_research_repository import ModelResearchRepository
+from factor_service.research.api import ResearchControl
 from factor_service.research.config import load_settings
 from factor_service.research.inference import DailyInferenceRunner
 from factor_service.research.trainer import QlibTrainer, TrainingResult
@@ -22,7 +24,11 @@ def main() -> None:
     settings = load_settings()
     if args.kind == "infer":
         result = DailyInferenceRunner(
-            settings, AlphaBlocksApi(settings.api_url, settings.worker_token),
+            settings,
+            ResearchControl(
+                ModelResearchRepository(),
+                ModelArtifactStore(settings.model_artifacts_root),
+            ),
         ).run(job, args.work_dir)
     else:
         result = QlibTrainer(settings).train(job, args.work_dir)
