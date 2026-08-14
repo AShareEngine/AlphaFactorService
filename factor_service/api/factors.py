@@ -5,7 +5,14 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from factor_service import repository
-from factor_service.schemas import FactorCreate, FactorOut, FactorUpdate
+from factor_service.schemas import (
+    FactorCreate,
+    FactorOut,
+    FactorParameterIdentityOut,
+    FactorUpdate,
+    FactorValueSyncStatesRequest,
+)
+from factor_service.worker import factor_params_hash
 
 
 router = APIRouter(prefix="/factors", tags=["factors"])
@@ -17,6 +24,29 @@ def list_factors(
     enabled: Optional[bool] = Query(default=None),
 ) -> list[FactorOut]:
     return repository.list_factors(entity_type=entity_type, enabled=enabled)
+
+
+@router.post("/parameter-identities", response_model=list[FactorParameterIdentityOut])
+def parameter_identities(
+    payload: FactorValueSyncStatesRequest,
+) -> list[FactorParameterIdentityOut]:
+    identities: list[FactorParameterIdentityOut] = []
+    try:
+        for item in payload.items:
+            factor = repository.get_factor(item.factor_id, version=item.factor_version)
+            if factor is None:
+                raise ValueError(f"因子不存在: {item.factor_id}")
+            if item.entity_type != factor.asset_id:
+                raise ValueError(f"因子 {item.factor_id} 的 entity_type 与 asset_id 不一致")
+            identities.append(FactorParameterIdentityOut(
+                factor_id=factor.factor_id,
+                factor_version=factor.version,
+                entity_type=item.entity_type,
+                params_hash=factor_params_hash(factor, item.params),
+            ))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return identities
 
 
 @router.post("", response_model=FactorOut)

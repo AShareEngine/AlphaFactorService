@@ -33,6 +33,29 @@ def test_artifact_publish_rejects_traversal_and_wrong_hash(tmp_path) -> None:
             job_id="../job", artifact_kind="bundle", file_name="model.tgz",
             source=BytesIO(b"x"), expected_sha256=sha256(b"x").hexdigest(),
         )
+
+
+def test_all_dataset_snapshot_files_are_dataset_scoped_and_immutable(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    dataset_hash = "c" * 64
+    for kind, name, body in (
+        ("dataset_raw", "dataset_raw.parquet", b"raw"),
+        ("dataset_manifest", "dataset_manifest.json", b"{}"),
+    ):
+        path = tmp_path / name
+        path.write_bytes(body)
+        saved = store.publish_file(
+            job_id="job-1", artifact_kind=kind,
+            source_path=path, dataset_hash=dataset_hash,
+        )
+        assert saved["relative_path"] == f"datasets/{dataset_hash}/{name}"
+
+        path.write_bytes(body + b"changed")
+        with pytest.raises(ArtifactError, match="内容不一致"):
+            store.publish_file(
+                job_id="job-2", artifact_kind=kind,
+                source_path=path, dataset_hash=dataset_hash,
+            )
     with pytest.raises(ArtifactError, match="SHA256"):
         store.save(
             job_id="job-1", artifact_kind="bundle", file_name="model.tgz",

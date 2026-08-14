@@ -20,6 +20,7 @@ from factor_service.research.dataset import (
     walk_forward_segments,
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.snapshot import DatasetSnapshotStore
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class QlibTrainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.dataset_builder = DatasetBuilder(settings)
+        self.snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
 
     def train(
         self,
@@ -50,14 +52,16 @@ class QlibTrainer:
             raise RuntimeError("Qlib模型环境尚未安装，请执行uv sync") from exc
         work_dir.mkdir(parents=True, exist_ok=True)
         _checkpoint(cancellation)
-        prepared = self.dataset_builder.build(job, cancellation=cancellation, progress=progress)
+        snapshot = self.snapshot_store.get_or_create(
+            job, work_dir, self.dataset_builder,
+            cancellation=cancellation, progress=progress,
+        )
+        prepared = snapshot.prepared
         config = dict(job.get("config_json") or {})
         walk_forward_config = dict(config.get("walk_forward") or {})
-        dataset_path = work_dir / "dataset.parquet"
-        prepared.frame.to_parquet(dataset_path)
-        raw_dataset_path = work_dir / "dataset_raw.parquet"
-        if walk_forward_config.get("enabled") is True and prepared.raw_frame is not None:
-            prepared.raw_frame.to_parquet(raw_dataset_path)
+        dataset_path = snapshot.dataset_path
+        raw_dataset_path = snapshot.raw_dataset_path
+        dataset_manifest_path = snapshot.manifest_path
         handler = DataHandlerLP.from_df(prepared.frame)
         dataset = DatasetH(handler=handler, segments=prepared.segments)
         raw_params = dict(config.get("model", {}).get("params") or {})
@@ -136,6 +140,7 @@ class QlibTrainer:
         feature_importance = _feature_importance(model, prepared.feature_names)
         manifest = {
             **prepared.manifest,
+            "schema_version": "alphablocks.qlib-training.v1",
             "job_id": job["job_id"],
             "model_id": job["model_id"],
             "model_kind": model_kind,
@@ -167,10 +172,8 @@ class QlibTrainer:
             pickle.dump(model, target)
         bundle_path = work_dir / "qlib_experiment.tar.gz"
         with tarfile.open(bundle_path, "w:gz") as archive:
-            for path in [manifest_path, metrics_path, importance_path, config_path, model_path, predictions_path]:
+            for path in [manifest_path, metrics_path, importance_path, config_path, model_path, predictions_path, dataset_manifest_path]:
                 archive.add(path, arcname=path.name)
-            if raw_dataset_path.exists():
-                archive.add(raw_dataset_path, arcname=raw_dataset_path.name)
             if recorder_db.exists():
                 archive.add(recorder_db, arcname=recorder_db.name)
             if recorder_root.exists():
@@ -190,11 +193,11 @@ class QlibTrainer:
         artifacts = [
             ("bundle", bundle_path),
             ("dataset", dataset_path),
+            ("dataset_raw", raw_dataset_path),
+            ("dataset_manifest", dataset_manifest_path),
             ("predictions", predictions_path),
             ("manifest", manifest_path),
         ]
-        if raw_dataset_path.exists():
-            artifacts.append(("dataset_raw", raw_dataset_path))
         _checkpoint(cancellation)
         _progress(progress, "packaged", 88, {
             "artifact_count": len(artifacts), "prediction_rows": prediction_rows,

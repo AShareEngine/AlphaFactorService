@@ -142,9 +142,10 @@ research:
 每日推理计划由同一个AlphaFactorService进程按`research.scheduler.refresh_seconds`检查，
 不需要AlphaBlocks再运行独立的模型推理调度进程。
 
-`research.storage.work_root`保存训练工作文件，包括冻结数据集、预测Parquet、MLflow记录、
-指标、日志、任务状态和临时文件；`research.storage.model_artifacts_root`保存经过SHA256校验并
-原子发布的正式模型产物。两者都由AlphaFactorService管理。相对路径从项目根目录解析；需要
+`research.storage.work_root`只保存训练暂存文件、预测Parquet、MLflow记录、日志和任务状态；
+`research.storage.model_artifacts_root`保存经过SHA256校验并原子发布的正式模型产物，以及
+`datasets/{dataset_hash}`下不可变的训练Parquet快照。Qlib训练只读取正式快照，不读取暂存文件。
+两者都由AlphaFactorService管理。相对路径从项目根目录解析；需要
 放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 
 AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独的研究服务地址或端口。
@@ -280,6 +281,10 @@ ab_factor.factor_analysis_turnover_daily
 - `factor_analysis_*` 保存 Alphalens 生成的 IC、分位收益、换手和汇总指标。
 
 `factor_values_daily` 同时保存两套时间：`event_available_at` 是行情事件理论可用时间，`computed_at` 是因子批次实际生成时间。策略查询默认按 `computed_at` 和 DataCutoff 做严格截断；只有显式历史重建研究才按 `event_available_at` 查询。`source_vintage` 记录计算源和任务批次。Alphalens 对日频收盘因子统一延迟一个交易日后再计算 forward return，避免用当天收盘数据又假设能在当天收盘成交。
+
+模型训练不要求先写入`factor_values_daily`：任务会锁定因子版本、公式参数和`params_hash`，
+直接从源数据即时计算，先在`work_root`暂存，再发布为不可变Parquet。因子中心的同步、评价和
+单因子回测仍继续使用`factor_values_daily`，两条流程互不替代。
 
 `model-signals`只返回`feature_cutoff_at <= T日15:00`的模型预测，并携带
 `dataset_hash`和`inference_run_id`。接口只提供因果安全的信号截面；正式策略仍由AlphaBlocks

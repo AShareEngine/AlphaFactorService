@@ -20,6 +20,7 @@ def _source() -> dict:
             "factor_id": "mom_20",
             "factor_version": 2,
             "params_hash": "a" * 64,
+            "params": {"window": 20},
         }],
     }
 
@@ -31,7 +32,10 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["factors"][0]["factor_version"] == 2
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
-    assert spec["availability"]["computed_at_lte_data_cutoff"] is True
+    assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
+    assert spec["materialization"] == {
+        "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
+    }
 
 
 def test_dataset_contract_rejects_unlocked_factor() -> None:

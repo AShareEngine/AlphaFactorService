@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 from types import SimpleNamespace
 
+from factor_service.research import dataset as dataset_module
 from factor_service.research.dataset import (
     DatasetBuilder,
     _future_rank_label,
@@ -100,7 +101,7 @@ def test_dataset_build_checks_cancellation_before_clickhouse_query() -> None:
         builder.build(valid_job(), cancellation=cancellation)
 
 
-def test_factor_query_enforces_event_and_computation_cutoffs() -> None:
+def test_factor_query_calculates_on_demand_without_factor_value_persistence(monkeypatch) -> None:
     class _Client:
         query_text = ""
         query_params = {}
@@ -113,19 +114,55 @@ def test_factor_query_enforces_event_and_computation_cutoffs() -> None:
             ])
 
     builder = DatasetBuilder.__new__(DatasetBuilder)
-    builder.settings = SimpleNamespace(factor_database="ab_factor")
+    builder.settings = SimpleNamespace()
     builder.client = _Client()
     sentinel_cutoff = pd.Timestamp("2024-01-02 15:00:00").to_pydatetime()
+    monkeypatch.setattr(
+        dataset_module.factor_repository, "get_factor",
+        lambda factor_id, version: SimpleNamespace(factor_id=factor_id, version=version),
+    )
+    monkeypatch.setattr(
+        dataset_module, "build_factor_query_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            sql="SELECT trade_date, entity_code, score FROM source_daily",
+            params={"date_start": kwargs["date_start"], "date_end": kwargs["date_end"]},
+            params_hash="a" * 64,
+        ),
+    )
 
     frame = builder._factor_values(
-        {"factor_id": "future_sentinel", "factor_version": 1, "params_hash": "a" * 64},
+        {
+            "factor_id": "future_sentinel", "factor_version": 1,
+            "params_hash": "a" * 64, "params": {"window": 20},
+        },
         sentinel_cutoff, "2024-01-02", "2024-01-02",
     )
 
     assert len(frame) == 1
-    assert "computed_at <= {cutoff:DateTime}" in builder.client.query_text
-    assert "event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR" in builder.client.query_text
-    assert builder.client.query_params["cutoff"] == sentinel_cutoff
+    assert "source_daily" in builder.client.query_text
+    assert "factor_values_daily" not in builder.client.query_text
+    assert "INSERT" not in builder.client.query_text.upper()
+
+
+def test_factor_query_rejects_changed_frozen_params(monkeypatch) -> None:
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace()
+    builder.client = SimpleNamespace(query=lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        dataset_module.factor_repository, "get_factor",
+        lambda factor_id, version: SimpleNamespace(factor_id=factor_id, version=version),
+    )
+    monkeypatch.setattr(
+        dataset_module, "build_factor_query_plan",
+        lambda *args, **kwargs: SimpleNamespace(sql="SELECT 1", params={}, params_hash="b" * 64),
+    )
+
+    with pytest.raises(ValueError, match="params_hash"):
+        builder._factor_values(
+            {"factor_id": "mom", "factor_version": 1, "params_hash": "a" * 64, "params": {}},
+            pd.Timestamp("2024-01-02 15:00:00").to_pydatetime(),
+            "2024-01-02", "2024-01-02",
+        )
 
 
 def test_future_function_sentinel_allows_only_safe_row() -> None:

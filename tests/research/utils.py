@@ -18,6 +18,7 @@ def valid_job(*, job_id: str = "model_job_test", **changes: Any) -> dict[str, An
             "factor_id": "mean_amount",
             "factor_version": 1,
             "params_hash": "a" * 64,
+            "params": {"window": 20},
             "label": "mean amount",
             "category": "volume",
         }],
@@ -25,9 +26,14 @@ def valid_job(*, job_id: str = "model_job_test", **changes: Any) -> dict[str, An
         "label": {"kind": "future_5d_cross_sectional_rank"},
         "split": {"train": 0.6, "valid": 0.2, "test": 0.2, "embargo_days": 5},
         "minimum_factor_coverage": 0.8,
+        "materialization": {
+            "mode": "on_demand",
+            "format": "parquet",
+            "persist_factor_values": False,
+        },
         "availability": {
             "event_available_at_lte_signal_close": True,
-            "computed_at_lte_data_cutoff": True,
+            "source_available_at_lte_data_cutoff": True,
         },
     }
     dataset_hash = sha256(json.dumps(

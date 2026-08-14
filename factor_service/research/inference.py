@@ -135,8 +135,9 @@ class DailyInferenceRunner:
             "medians_source": "training_manifest",
             "row_count": len(predictions),
             "future_function_guards": [
-                "computed_at <= inference data_cutoff for source factor rows",
-                "event_available_at <= signal date close",
+                "frozen factor definitions computed on demand from source data",
+                "source rows limited to signal date and available by market close",
+                "inference data_cutoff >= signal date close",
                 "historical index membership",
                 "training-fitted medians only",
             ],

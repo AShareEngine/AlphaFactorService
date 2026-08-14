@@ -68,21 +68,17 @@ def test_inference_availability_uses_market_database_and_checks_requested_date(m
     class _Client:
         def query(self, query, parameters):
             queries.append((query, parameters))
-            if "factor_values_daily" in query:
-                return SimpleNamespace(result_rows=[(date(2026, 8, 12), 1)])
             return SimpleNamespace(result_rows=[(date(2026, 8, 10), 1)])
 
     monkeypatch.setattr(model_repository, "client", lambda: _Client())
-    monkeypatch.setattr(
-        model_repository, "settings",
-        lambda: SimpleNamespace(clickhouse_database="ab_factor"),
-    )
+    monkeypatch.setattr(model_repository, "_validate_frozen_factors", lambda factors: None)
 
     result = model_repository.model_inference_availability(
         factors=[{
             "factor_id": "period_return",
             "factor_version": 3,
             "params_hash": "frozen-hash",
+            "params": {"window": 20},
         }],
         requested_trade_date=date(2026, 8, 10),
         data_cutoff=datetime(2026, 8, 13, 15, 30),
@@ -90,10 +86,9 @@ def test_inference_availability_uses_market_database_and_checks_requested_date(m
 
     assert result["trade_date"] == date(2026, 8, 10)
     assert result["requested_trade_date_available"] is True
-    assert "starlight.ad_market_kline_daily" in queries[1][0]
-    assert "computed_at <= {data_cutoff:DateTime}" in queries[0][0]
-    assert "event_available_at <=" in queries[0][0]
-    assert queries[1][1]["requested_trade_date"] == date(2026, 8, 10)
+    assert "starlight.ad_market_kline_daily" in queries[0][0]
+    assert "factor_values_daily" not in queries[0][0]
+    assert queries[0][1]["requested_trade_date"] == date(2026, 8, 10)
 
 
 def test_inference_dates_requires_every_frozen_factor_and_market_date(monkeypatch) -> None:
@@ -106,18 +101,15 @@ def test_inference_dates_requires_every_frozen_factor_and_market_date(monkeypatc
             return SimpleNamespace(result_rows=[(date(2026, 8, 10),), (date(2026, 8, 11),)])
 
     monkeypatch.setattr(model_repository, "client", lambda: _Client())
-    monkeypatch.setattr(
-        model_repository, "settings",
-        lambda: SimpleNamespace(clickhouse_database="ab_factor"),
-    )
+    monkeypatch.setattr(model_repository, "_validate_frozen_factors", lambda factors: None)
     rows = model_repository.model_inference_dates(
         factors=[
-            {"factor_id": "a", "factor_version": 1, "params_hash": "ha"},
-            {"factor_id": "b", "factor_version": 2, "params_hash": "hb"},
+            {"factor_id": "a", "factor_version": 1, "params_hash": "ha", "params": {}},
+            {"factor_id": "b", "factor_version": 2, "params_hash": "hb", "params": {}},
         ],
         after_date=date(2026, 8, 9), limit=5,
     )
     assert rows == [date(2026, 8, 10), date(2026, 8, 11)]
-    assert "uniqExact(factor_key) = {factor_count:UInt32}" in captured["query"]
     assert "starlight.ad_market_kline_daily" in captured["query"]
-    assert captured["parameters"]["factor_count"] == 2
+    assert "factor_values_daily" not in captured["query"]
+    assert captured["parameters"]["limit"] == 5

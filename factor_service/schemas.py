@@ -153,6 +153,13 @@ class FactorValueSyncStatesRequest(BaseModel):
     items: list[FactorValueSyncStateItem] = Field(min_length=1, max_length=100)
 
 
+class FactorParameterIdentityOut(BaseModel):
+    factor_id: str
+    factor_version: int
+    entity_type: str
+    params_hash: str
+
+
 class FactorValueSyncStateOut(CoverageOut):
     factor_version: int
     entity_type: str
