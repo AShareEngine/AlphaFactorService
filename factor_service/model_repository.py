@@ -692,6 +692,160 @@ def model_prediction_comparison(
     }
 
 
+def model_prediction_reproducibility_audit(
+    *, source_model_id: str, source_model_version: int,
+    replay_model_id: str, replay_model_version: int,
+) -> dict[str, Any]:
+    """Compare two immutable prediction sets without consulting future labels.
+
+    A reproducibility audit is stricter than the regular model comparison: it
+    requires the same PIT-safe date/entity keys and checks both raw predictions
+    and published cross-sectional scores.  Tiny floating-point differences are
+    reported separately from material drift.
+    """
+    sources = [
+        {"model_id": source_model_id, "model_version": int(source_model_version)},
+        {"model_id": replay_model_id, "model_version": int(replay_model_version)},
+    ]
+    condition, parameters = _ensemble_source_condition(sources)
+    database = settings().model_database
+    rows = client().query(
+        f"""
+        SELECT model_id, model_version, trade_date, entity_code,
+               argMax(raw_prediction, tuple(updated_at, computed_at, inference_run_id))
+                   AS raw_prediction,
+               argMax(score, tuple(updated_at, computed_at, inference_run_id))
+                   AS score
+        FROM {database}.model_predictions_daily FINAL
+        WHERE ({condition})
+          AND feature_cutoff_at <=
+              toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+        GROUP BY model_id, model_version, trade_date, entity_code
+        ORDER BY trade_date, entity_code, model_id, model_version
+        """,
+        parameters=parameters,
+    ).result_rows
+    keys = [
+        _source_key(source_model_id, int(source_model_version)),
+        _source_key(replay_model_id, int(replay_model_version)),
+    ]
+    empty = {
+        "source_rows": 0,
+        "replay_rows": 0,
+        "common_rows": 0,
+        "source_only_rows": 0,
+        "replay_only_rows": 0,
+        "common_days": 0,
+        "date_start": None,
+        "date_end": None,
+        "key_set_equal": False,
+        "raw_prediction": _numeric_reproducibility_stats(pd.Series(dtype=float), pd.Series(dtype=float)),
+        "score": _numeric_reproducibility_stats(pd.Series(dtype=float), pd.Series(dtype=float)),
+        "status": "unavailable",
+        "passed": False,
+    }
+    if not rows:
+        return empty
+    frame = pd.DataFrame(rows, columns=[
+        "model_id", "model_version", "trade_date", "entity_code",
+        "raw_prediction", "score",
+    ])
+    frame["source_key"] = frame.apply(
+        lambda row: _source_key(str(row["model_id"]), int(row["model_version"])),
+        axis=1,
+    )
+    source = frame.loc[frame["source_key"] == keys[0], [
+        "trade_date", "entity_code", "raw_prediction", "score",
+    ]].rename(columns={
+        "raw_prediction": "source_raw", "score": "source_score",
+    })
+    replay = frame.loc[frame["source_key"] == keys[1], [
+        "trade_date", "entity_code", "raw_prediction", "score",
+    ]].rename(columns={
+        "raw_prediction": "replay_raw", "score": "replay_score",
+    })
+    aligned = source.merge(
+        replay, on=["trade_date", "entity_code"], how="outer", indicator=True,
+    )
+    common = aligned.loc[aligned["_merge"] == "both"].copy()
+    source_only = int((aligned["_merge"] == "left_only").sum())
+    replay_only = int((aligned["_merge"] == "right_only").sum())
+    key_set_equal = source_only == 0 and replay_only == 0 and not common.empty
+    raw = _numeric_reproducibility_stats(common["source_raw"], common["replay_raw"])
+    score = _numeric_reproducibility_stats(common["source_score"], common["replay_score"])
+    exact = (
+        key_set_equal
+        and raw["max_absolute_delta"] is not None
+        and raw["max_absolute_delta"] <= 1e-12
+        and score["max_absolute_delta"] is not None
+        and score["max_absolute_delta"] <= 1e-12
+    )
+    equivalent = (
+        key_set_equal
+        and raw["correlation"] is not None
+        and raw["correlation"] >= 0.999999
+        and score["correlation"] is not None
+        and score["correlation"] >= 0.999999
+        and score["max_absolute_delta"] is not None
+        and score["max_absolute_delta"] <= 1e-8
+    )
+    if exact:
+        status = "exact"
+    elif equivalent:
+        status = "equivalent"
+    else:
+        status = "drifted"
+    return {
+        **empty,
+        "source_rows": int(len(source)),
+        "replay_rows": int(len(replay)),
+        "common_rows": int(len(common)),
+        "source_only_rows": source_only,
+        "replay_only_rows": replay_only,
+        "common_days": int(common["trade_date"].nunique()) if not common.empty else 0,
+        "date_start": common["trade_date"].min() if not common.empty else None,
+        "date_end": common["trade_date"].max() if not common.empty else None,
+        "key_set_equal": key_set_equal,
+        "raw_prediction": raw,
+        "score": score,
+        "status": status,
+        "passed": status in {"exact", "equivalent"},
+    }
+
+
+def _numeric_reproducibility_stats(
+    source: pd.Series, replay: pd.Series,
+) -> dict[str, Any]:
+    left = pd.to_numeric(source, errors="coerce")
+    right = pd.to_numeric(replay, errors="coerce")
+    valid = left.notna() & right.notna()
+    left = left.loc[valid].astype(float)
+    right = right.loc[valid].astype(float)
+    if left.empty:
+        return {
+            "compared_rows": 0,
+            "mean_absolute_delta": None,
+            "max_absolute_delta": None,
+            "correlation": None,
+            "identical_ratio": None,
+        }
+    delta = (left - right).abs()
+    if len(left) == 1:
+        correlation = 1.0 if float(delta.iloc[0]) <= 1e-12 else None
+    elif left.nunique() <= 1 and right.nunique() <= 1:
+        correlation = 1.0 if float(delta.max()) <= 1e-12 else None
+    else:
+        value = left.corr(right, method="pearson")
+        correlation = float(value) if pd.notna(value) else None
+    return {
+        "compared_rows": int(len(left)),
+        "mean_absolute_delta": float(delta.mean()),
+        "max_absolute_delta": float(delta.max()),
+        "correlation": correlation,
+        "identical_ratio": float((delta <= 1e-12).mean()),
+    }
+
+
 def materialize_ensemble_predictions(
     *, model_id: str, model_version: int, sources: list[Mapping[str, Any]],
     dataset_hash: str, inference_run_prefix: str,

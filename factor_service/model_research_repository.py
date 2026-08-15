@@ -87,6 +87,24 @@ class ModelResearchRepository:
             str(payload.get("model_id") or ""),
             default=f"model_{uuid4().hex[:16]}",
         )
+        incremental_training: dict[str, Any] = {}
+        incremental_source = payload.get("incremental_from") or {}
+        if incremental_source:
+            if not isinstance(incremental_source, Mapping):
+                raise ModelResearchError("incremental_from必须是对象")
+            source_model_id = _required_identifier(
+                str(incremental_source.get("model_id") or ""),
+                "incremental_from.model_id",
+            )
+            source_version = int(incremental_source.get("model_version") or 0)
+            if source_version <= 0:
+                raise ModelResearchError("incremental_from.model_version无效")
+            if model_id != source_model_id:
+                raise ModelResearchConflict("增量训练必须写入来源模型的下一个版本")
+            incremental_training = self._resolve_incremental_training(
+                source_model_id, source_version,
+                dataset=spec, model=model, walk_forward=walk_forward,
+            )
         title = str(payload.get("title") or f"{model['kind']} 因子模型").strip()[:160]
         config = {
             "schema_version": "alphablocks.model-training.v1",
@@ -105,6 +123,8 @@ class ModelResearchRepository:
             config["experiment"] = experiment
         if research_origin:
             config["research_origin"] = research_origin
+        if incremental_training:
+            config["incremental_training"] = incremental_training
         now = _utcnow()
         with self.database.connection() as conn:
             with conn.transaction():
@@ -168,6 +188,54 @@ class ModelResearchRepository:
                     },
                 )
         return self.get_job(job_id)
+
+    def incremental_training_precheck(
+        self, model_id: str, version: int, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        dataset = _dataset_spec(payload.get("dataset") or {})
+        model = _model_spec(payload.get("model") or {})
+        walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
+        source_model = self.get_model(model_id, version)
+        bundle = next((
+            item for item in self.list_artifacts(str(source_model["job_id"]))
+            if str(item.get("artifact_kind") or "") == "bundle"
+        ), None)
+        return _incremental_training_assessment(
+            source_model,
+            bundle,
+            dataset=dataset,
+            model=model,
+            walk_forward=walk_forward,
+        )
+
+    def _resolve_incremental_training(
+        self,
+        model_id: str,
+        version: int,
+        *,
+        dataset: Mapping[str, Any],
+        model: Mapping[str, Any],
+        walk_forward: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        source_model = self.get_model(model_id, version)
+        bundle = next((
+            item for item in self.list_artifacts(str(source_model["job_id"]))
+            if str(item.get("artifact_kind") or "") == "bundle"
+        ), None)
+        assessment = _incremental_training_assessment(
+            source_model,
+            bundle,
+            dataset=dataset,
+            model=model,
+            walk_forward=walk_forward,
+        )
+        if assessment["passed"] is not True:
+            failed = [
+                str(item["label"])
+                for item in assessment["checks"] if item["passed"] is not True
+            ]
+            raise ModelResearchConflict("增量训练准入未通过：" + "、".join(failed))
+        return dict(assessment["contract"])
 
     def _resolve_research_origin(
         self,
@@ -1710,6 +1778,141 @@ class ModelResearchRepository:
                     conn, architecture_id, spec["engines"], now,
                 )
         return self.get_model_architecture(architecture_id)
+
+    def create_research_template(
+        self, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        spec = _research_template_spec(payload)
+        template_id = _clean_identifier(
+            str(payload.get("template_id") or ""),
+            default=f"research_template_{uuid4().hex[:16]}",
+        )
+        config_hash = sha256(
+            _canonical_json(spec["training"]).encode("utf-8")
+        ).hexdigest()
+        now = _utcnow()
+        with self.database.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_research_templates(
+                    template_id, name, description, state, revision,
+                    config_hash, config_json, created_at, updated_at
+                ) VALUES (%s, %s, %s, 'active', 1, %s, %s, %s, %s)
+                """,
+                (
+                    template_id, spec["name"], spec["description"],
+                    config_hash, Jsonb(spec), now, now,
+                ),
+            )
+        return self.get_research_template(template_id)
+
+    def list_research_templates(
+        self, *, state: str = "active", limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        normalized_state = str(state or "active").strip().lower()
+        if normalized_state not in {"active", "archived", "all"}:
+            raise ModelResearchError("研究模板state只支持active、archived或all")
+        conditions = []
+        values: list[Any] = []
+        if normalized_state != "all":
+            conditions.append("state = %s")
+            values.append(normalized_state)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        values.append(max(1, min(int(limit), 200)))
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT template_id
+                FROM model_research_templates
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                tuple(values),
+            ).fetchall()
+        return [
+            self.get_research_template(str(row["template_id"]))
+            for row in rows
+        ]
+
+    def get_research_template(self, template_id: str) -> dict[str, Any]:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM model_research_templates WHERE template_id = %s",
+                (template_id,),
+            ).fetchone()
+        if not row:
+            raise ModelResearchNotFound("研究模板不存在")
+        config = dict(row.get("config_json") or {})
+        return _json_ready_mapping({
+            **config,
+            "template_id": str(row["template_id"]),
+            "name": str(row["name"]),
+            "description": str(row["description"]),
+            "state": str(row["state"]),
+            "revision": int(row["revision"]),
+            "config_hash": str(row["config_hash"]),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        })
+
+    def update_research_template(
+        self, template_id: str, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        spec = _research_template_spec(payload)
+        expected_revision = int(payload.get("revision") or 0)
+        if expected_revision <= 0:
+            raise ModelResearchError("更新研究模板必须提供revision")
+        config_hash = sha256(
+            _canonical_json(spec["training"]).encode("utf-8")
+        ).hexdigest()
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT state, revision
+                    FROM model_research_templates
+                    WHERE template_id = %s
+                    FOR UPDATE
+                    """,
+                    (template_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("研究模板不存在")
+                if str(row["state"]) != "active":
+                    raise ModelResearchConflict("已归档研究模板不能修改")
+                if expected_revision != int(row["revision"]):
+                    raise ModelResearchConflict("研究模板已被其他请求修改，请刷新后重试")
+                conn.execute(
+                    """
+                    UPDATE model_research_templates
+                    SET name = %s, description = %s, revision = revision + 1,
+                        config_hash = %s, config_json = %s, updated_at = %s
+                    WHERE template_id = %s
+                    """,
+                    (
+                        spec["name"], spec["description"], config_hash,
+                        Jsonb(spec), now, template_id,
+                    ),
+                )
+        return self.get_research_template(template_id)
+
+    def archive_research_template(self, template_id: str) -> dict[str, Any]:
+        now = _utcnow()
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE model_research_templates
+                SET state = 'archived', revision = revision + 1, updated_at = %s
+                WHERE template_id = %s AND state = 'active'
+                RETURNING template_id
+                """,
+                (now, template_id),
+            ).fetchone()
+        if not row:
+            raise ModelResearchNotFound("研究模板不存在或已归档")
+        return self.get_research_template(template_id)
 
     def list_model_architectures(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
@@ -3497,6 +3700,232 @@ def _research_origin_spec(
         "source_config_hash": sha256(
             _canonical_json(source_snapshot).encode("utf-8")
         ).hexdigest(),
+    }
+
+
+def _incremental_training_assessment(
+    source_model: Mapping[str, Any],
+    bundle: Mapping[str, Any] | None,
+    *,
+    dataset: Mapping[str, Any],
+    model: Mapping[str, Any],
+    walk_forward: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_dataset = _dataset_spec(source_model.get("dataset_spec") or {})
+    source_config = dict(source_model.get("job_config_json") or {})
+    source_model_spec = _model_spec(source_config.get("model") or {})
+    source_walk_forward = _walk_forward_spec(
+        source_config.get("walk_forward") or {}
+    )
+
+    def factor_identity(spec: Mapping[str, Any]) -> list[tuple[str, int, str]]:
+        return [
+            (
+                str(item.get("factor_id") or ""),
+                int(item.get("factor_version") or 0),
+                str(item.get("params_hash") or ""),
+            )
+            for item in spec.get("factors") or []
+        ]
+
+    def stable_model_params(spec: Mapping[str, Any]) -> dict[str, Any]:
+        params = dict(spec.get("params") or {})
+        # These control only how many new trees may be appended and when the
+        # update stops. Every structural/objective parameter remains frozen.
+        params.pop("n_estimators", None)
+        params.pop("early_stopping_rounds", None)
+        return params
+
+    source_end = str(source_dataset.get("date_end") or "")
+    candidate_end = str(dataset.get("date_end") or "")
+    source_cutoff = str(source_dataset.get("data_cutoff") or "")
+    candidate_cutoff = str(dataset.get("data_cutoff") or "")
+    bundle_mapping = dict(bundle or {})
+    bundle_ready = bool(
+        bundle_mapping.get("artifact_id")
+        and bundle_mapping.get("relative_path")
+        and len(str(bundle_mapping.get("sha256") or "")) == 64
+    )
+    source_kind = str(source_model_spec.get("kind") or "")
+    candidate_kind = str(model.get("kind") or "")
+    label_keys = ("kind", "horizon_trading_days", "range")
+    source_label = {
+        key: (source_dataset.get("label") or {}).get(key) for key in label_keys
+    }
+    candidate_label = {
+        key: (dataset.get("label") or {}).get(key) for key in label_keys
+    }
+    checks = [
+        {
+            "key": "source_state",
+            "label": "来源模型版本仍可用于研究",
+            "passed": str(source_model.get("state") or "candidate") != "archived",
+        },
+        {
+            "key": "model_kind",
+            "label": "首版增量续训仅支持LightGBM",
+            "passed": source_kind == candidate_kind == "lightgbm",
+        },
+        {
+            "key": "source_artifact",
+            "label": "来源模型Bundle完整且哈希已登记",
+            "passed": bundle_ready,
+        },
+        {
+            "key": "feature_identity",
+            "label": "因子顺序、版本和参数哈希完全一致",
+            "passed": factor_identity(source_dataset) == factor_identity(dataset),
+        },
+        {
+            "key": "target_contract",
+            "label": "股票池、研究目标和标签周期完全一致",
+            "passed": (
+                source_dataset.get("universe_id") == dataset.get("universe_id")
+                and source_dataset.get("index_code") == dataset.get("index_code")
+                and source_dataset.get("research_target") == dataset.get("research_target")
+                and source_dataset.get("prediction_scope") == dataset.get("prediction_scope")
+                and source_label == candidate_label
+            ),
+        },
+        {
+            "key": "model_parameters",
+            "label": "模型结构和目标参数未改变",
+            "passed": (
+                stable_model_params(source_model_spec)
+                == stable_model_params(model)
+            ),
+        },
+        {
+            "key": "date_extension",
+            "label": "起始日不变且结束日向后扩展",
+            "passed": (
+                source_dataset.get("date_start") == dataset.get("date_start")
+                and bool(source_end)
+                and candidate_end > source_end
+            ),
+        },
+        {
+            "key": "data_cutoff",
+            "label": "数据截止时间晚于来源模型",
+            "passed": bool(source_cutoff) and candidate_cutoff > source_cutoff,
+        },
+        {
+            "key": "walk_forward",
+            "label": "增量续训暂不与Walk-Forward嵌套",
+            "passed": (
+                source_walk_forward.get("enabled") is not True
+                and walk_forward.get("enabled") is not True
+            ),
+        },
+    ]
+    failed = [item["key"] for item in checks if item["passed"] is not True]
+    passed = not failed
+    contract = {
+        "schema_version": "alphablocks.incremental-training.v1",
+        "mode": "lightgbm_append_trees_new_data_only",
+        "source_model_id": str(source_model.get("model_id") or ""),
+        "source_model_version": int(source_model.get("version") or 0),
+        "source_job_id": str(source_model.get("job_id") or ""),
+        "source_dataset_hash": str(source_model.get("dataset_hash") or ""),
+        "source_date_end": source_end,
+        "candidate_date_end": candidate_end,
+        "minimum_new_trading_sessions": 60,
+        "source_artifact": {
+            "artifact_id": str(bundle_mapping.get("artifact_id") or ""),
+            "relative_path": str(bundle_mapping.get("relative_path") or ""),
+            "sha256": str(bundle_mapping.get("sha256") or ""),
+            "file_name": str(bundle_mapping.get("file_name") or ""),
+        },
+        "allowed_parameter_changes": [
+            "n_estimators", "early_stopping_rounds",
+        ],
+    }
+    return {
+        "status": "ready" if passed else "blocked",
+        "passed": passed,
+        "can_submit": passed,
+        "failed_checks": failed,
+        "checks": checks,
+        "contract": contract,
+    }
+
+
+def _research_template_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+    name = str(source.get("name") or "").strip()[:120]
+    if not name:
+        raise ModelResearchError("研究模板名称不能为空")
+    training_source = source.get("training")
+    if not isinstance(training_source, Mapping):
+        raise ModelResearchError("研究模板缺少training配置")
+    dataset = _dataset_spec(training_source.get("dataset") or {})
+    model = _model_spec(training_source.get("model") or {})
+    walk_forward = _walk_forward_spec(training_source.get("walk_forward") or {})
+    design_source = training_source.get("research_design") or {}
+    if not isinstance(design_source, Mapping):
+        raise ModelResearchError("research_design必须是对象")
+    mode = str(design_source.get("mode") or "single").strip().lower()
+    if mode not in {"single", "grid", "horizon_grid", "factor_ablation"}:
+        raise ModelResearchError(
+            "研究模板mode只支持single、grid、horizon_grid或factor_ablation"
+        )
+    search_source = design_source.get("search") or {}
+    if not isinstance(search_source, Mapping):
+        raise ModelResearchError("research_design.search必须是对象")
+    if mode == "single":
+        search: dict[str, Any] = {}
+    elif mode == "grid":
+        normalized_parameters = {
+            str(key): list(values) if isinstance(values, list) else values
+            for key, values in sorted(
+                dict(search_source.get("parameters") or {}).items(),
+                key=lambda item: str(item[0]),
+            )
+        }
+        search = {
+            "strategy": "grid",
+            "parameters": normalized_parameters,
+            "max_trials": max(
+                1,
+                min(
+                    int(search_source.get("max_trials") or MAX_EXPERIMENT_TRIALS),
+                    MAX_EXPERIMENT_TRIALS,
+                ),
+            ),
+        }
+        _grid_search_trials(model, search)
+    elif mode == "horizon_grid":
+        horizons = _horizon_search_values(search_source)
+        search = {
+            "strategy": "horizon_grid",
+            "horizons": horizons,
+            "max_trials": len(horizons),
+        }
+    else:
+        trials = _factor_ablation_trials(dataset, search_source)
+        factor_ids = [
+            str(item["search_params"]["removed_factor_id"])
+            for item in trials[1:]
+        ]
+        search = {
+            "strategy": "factor_ablation",
+            "factor_ids": factor_ids,
+            "max_trials": len(factor_ids) + 1,
+        }
+    model_id = _clean_identifier(str(training_source.get("model_id") or ""))
+    training = {
+        "schema_version": "alphablocks.model-training-template.v1",
+        "title": str(training_source.get("title") or name).strip()[:160],
+        "model_id": model_id,
+        "dataset": dataset,
+        "model": model,
+        "walk_forward": walk_forward,
+        "research_design": {"mode": mode, "search": search},
+    }
+    return {
+        "schema_version": "alphablocks.research-template.v1",
+        "name": name,
+        "description": str(source.get("description") or "").strip()[:1000],
+        "training": training,
     }
 
 

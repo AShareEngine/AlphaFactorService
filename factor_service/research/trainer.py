@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
 import pickle
@@ -14,10 +15,12 @@ import numpy as np
 import pandas as pd
 
 from factor_service.model_validation import assess_walk_forward_stability
+from factor_service.model_artifacts import ModelArtifactStore
 from factor_service.research.config import Settings
 from factor_service.research.dataset import (
     DatasetBuilder,
     PreparedDataset,
+    split_trading_dates,
     walk_forward_segments,
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
@@ -61,16 +64,38 @@ class QlibTrainer:
         prepared = snapshot.prepared
         config = dict(job.get("config_json") or {})
         walk_forward_config = dict(config.get("walk_forward") or {})
+        incremental_config = dict(config.get("incremental_training") or {})
+        source_model: Any | None = None
+        source_manifest: dict[str, Any] = {}
+        training_prepared = prepared
+        if incremental_config:
+            source_model, source_manifest = _load_incremental_source(
+                self.settings, incremental_config,
+            )
+            training_prepared = _incremental_prepared_dataset(
+                prepared, incremental_config, source_manifest,
+                horizon=int(
+                    (job.get("dataset_spec") or {}).get("label", {}).get(
+                        "horizon_trading_days", 5,
+                    )
+                ),
+            )
+            _progress(progress, "incremental_dataset_ready", 57, {
+                "source_model_version": incremental_config["source_model_version"],
+                "segments": training_prepared.segments,
+            })
         dataset_path = snapshot.dataset_path
         raw_dataset_path = snapshot.raw_dataset_path
         dataset_manifest_path = snapshot.manifest_path
         raw_params = dict(config.get("model", {}).get("params") or {})
         model_kind = str(config.get("model", {}).get("kind") or "lightgbm")
-        handler = DataHandlerLP.from_df(prepared.frame)
+        handler = DataHandlerLP.from_df(training_prepared.frame)
         dataset = _dataset_for_model(
-            handler, prepared.segments, model_kind, raw_params, DatasetH,
+            handler, training_prepared.segments, model_kind, raw_params, DatasetH,
         )
-        model, model_params = _create_model(model_kind, raw_params, len(prepared.feature_names))
+        model, model_params = _create_model(
+            model_kind, raw_params, len(training_prepared.feature_names),
+        )
         recorder_root = work_dir / "mlruns"
         # DatasetH由已冻结的DataFrame驱动，不读取Qlib本地行情；0.9.7仍要求
         # provider_uri非空，因此给每个任务一个隔离的空Provider目录。
@@ -119,6 +144,7 @@ class QlibTrainer:
                 progress_start=training_start,
                 progress_end=80,
                 metric_prefix="final.",
+                initial_model=source_model,
             )
             _checkpoint(cancellation)
             _progress(progress, "predicting", 82, {})
@@ -129,13 +155,17 @@ class QlibTrainer:
         # 研究回测只允许使用完全样本外的test段；train/valid预测不得进入模型信号库。
         # 开启Walk-Forward时发布各窗口拼接后的OOS预测，正式模型仍单独保存用于后续每日推理。
         published_prediction = walk_forward_prediction if walk_forward_prediction is not None else test_prediction
-        prediction_frame = _prediction_frame(published_prediction, prepared, job)
+        prediction_frame = _prediction_frame(published_prediction, training_prepared, job)
         predictions_path = work_dir / "predictions.parquet"
         prediction_frame.to_parquet(predictions_path, index=False)
         prediction_rows = len(prediction_frame)
-        standard_metrics = _metrics(test_prediction, prepared.frame, prepared.segments["test"])
+        standard_metrics = _metrics(
+            test_prediction, training_prepared.frame,
+            training_prepared.segments["test"],
+        )
         raw_validation_metrics = _metrics(
-            valid_prediction, prepared.frame, prepared.segments["valid"],
+            valid_prediction, training_prepared.frame,
+            training_prepared.segments["valid"],
         )
         validation_metrics = {
             "rows": raw_validation_metrics["test_rows"],
@@ -159,7 +189,9 @@ class QlibTrainer:
                 "evaluation_mode": "single_split",
                 "validation": validation_metrics,
             }
-        feature_importance = _feature_importance(model, prepared.feature_names)
+        feature_importance = _feature_importance(
+            model, training_prepared.feature_names,
+        )
         training_diagnostics = build_training_diagnostics(
             model_kind, evals_result, model_params,
         )
@@ -171,7 +203,7 @@ class QlibTrainer:
             dataset_spec.get("prediction_scope") or "stock"
         )
         manifest = {
-            **prepared.manifest,
+            **training_prepared.manifest,
             "schema_version": "alphablocks.qlib-training.v1",
             "job_id": job["job_id"],
             "model_id": job["model_id"],
@@ -185,6 +217,22 @@ class QlibTrainer:
             "validation_metrics": validation_metrics,
             "training_diagnostics": training_diagnostics,
             "walk_forward": walk_forward_report,
+            "incremental_training": (
+                {
+                    **incremental_config,
+                    "source_artifact": {
+                        key: value
+                        for key, value in dict(
+                            incremental_config.get("source_artifact") or {}
+                        ).items()
+                        if key != "relative_path"
+                    },
+                    "segments": training_prepared.segments,
+                    "source_tree_count": _tree_count(source_model),
+                    "result_tree_count": _tree_count(model),
+                }
+                if incremental_config else None
+            ),
             "environment": {
                 "python": platform.python_version(),
                 "platform": platform.platform(),
@@ -492,6 +540,129 @@ def _walk_forward_frame(
     return frame, medians
 
 
+def _load_incremental_source(
+    settings: Settings,
+    contract: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    artifact = dict(contract.get("source_artifact") or {})
+    path = ModelArtifactStore(settings.model_artifacts_root).resolve(
+        str(artifact.get("relative_path") or ""),
+    )
+    expected = str(artifact.get("sha256") or "").lower()
+    digest = sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise ValueError("增量训练来源模型Bundle的SHA256不一致")
+    payloads: dict[str, bytes] = {}
+    with tarfile.open(path, "r:gz") as archive:
+        for required in ("model.pkl", "manifest.json"):
+            try:
+                member = archive.getmember(required)
+            except KeyError as exc:
+                raise ValueError(f"增量训练来源Bundle缺少{required}") from exc
+            if not member.isfile() or member.size <= 0 or member.size > 256 * 1024 * 1024:
+                raise ValueError(f"增量训练来源Bundle中的{required}无效")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise ValueError(f"增量训练来源Bundle中的{required}不可读")
+            payloads[required] = stream.read()
+    try:
+        model = pickle.loads(payloads["model.pkl"])
+        manifest = json.loads(payloads["manifest.json"].decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"增量训练来源Bundle解析失败: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("增量训练来源manifest必须是对象")
+    if str(manifest.get("model_kind") or "") != "lightgbm":
+        raise ValueError("增量训练来源Bundle不是LightGBM模型")
+    if (
+        str(manifest.get("model_id") or "") != str(contract.get("source_model_id") or "")
+        or int(manifest.get("model_version") or 0)
+        != int(contract.get("source_model_version") or 0)
+    ):
+        raise ValueError("增量训练来源Bundle与锁定模型版本不一致")
+    return model, manifest
+
+
+def _incremental_prepared_dataset(
+    prepared: PreparedDataset,
+    contract: dict[str, Any],
+    source_manifest: dict[str, Any],
+    *,
+    horizon: int,
+) -> PreparedDataset:
+    raw_frame = prepared.raw_frame
+    if raw_frame is None:
+        raise ValueError("增量训练缺少未填充的冻结数据集")
+    expected_features = list(source_manifest.get("feature_names") or [])
+    if expected_features != prepared.feature_names:
+        raise ValueError("增量训练来源模型的特征顺序与新数据集不一致")
+    source_medians = dict(source_manifest.get("medians") or {})
+    missing_medians = [
+        name for name in expected_features
+        if name not in source_medians or not np.isfinite(float(source_medians[name]))
+    ]
+    if missing_medians:
+        raise ValueError(
+            "增量训练来源模型缺少训练段中位数: " + ", ".join(missing_medians)
+        )
+    source_end = pd.Timestamp(str(contract.get("source_date_end") or ""))
+    dates = pd.to_datetime(raw_frame.index.get_level_values("datetime"))
+    new_raw = raw_frame.loc[dates > source_end].copy()
+    new_dates = pd.Index(sorted(
+        pd.to_datetime(new_raw.index.get_level_values("datetime")).unique()
+    ))
+    minimum = int(contract.get("minimum_new_trading_sessions") or 60)
+    if len(new_dates) < minimum:
+        raise ValueError(
+            f"增量训练新增有效交易日不足{minimum}天，当前只有{len(new_dates)}天"
+        )
+    segments = split_trading_dates(new_dates, embargo_days=max(1, int(horizon)))
+    frame = new_raw.copy()
+    for name in expected_features:
+        frame[("feature", name)] = frame[("feature", name)].fillna(
+            float(source_medians[name])
+        )
+    manifest = {
+        **prepared.manifest,
+        "segments": segments,
+        "medians": {name: float(source_medians[name]) for name in expected_features},
+        "incremental_training": {
+            "mode": contract.get("mode"),
+            "source_model_id": contract.get("source_model_id"),
+            "source_model_version": contract.get("source_model_version"),
+            "source_date_end": contract.get("source_date_end"),
+            "new_trading_sessions": len(new_dates),
+            "segments": segments,
+            "preprocessing": "reuse_source_train_medians",
+        },
+    }
+    return PreparedDataset(
+        frame=frame,
+        segments=segments,
+        feature_names=list(prepared.feature_names),
+        coverage=dict(prepared.coverage),
+        medians={name: float(source_medians[name]) for name in expected_features},
+        manifest=manifest,
+        raw_frame=new_raw,
+    )
+
+
+def _tree_count(model: Any | None) -> int:
+    booster = getattr(model, "model", None) if model is not None else None
+    if booster is None:
+        return 0
+    method = getattr(booster, "num_trees", None)
+    if callable(method):
+        try:
+            return int(method())
+        except Exception:
+            return 0
+    return 0
+
+
 def _fit_model(
     model_kind: str,
     model: Any,
@@ -505,8 +676,11 @@ def _fit_model(
     progress_end: int = 80,
     progress_details: dict[str, Any] | None = None,
     metric_prefix: str = "",
+    initial_model: Any | None = None,
 ) -> None:
     """Fit one Qlib model; LightGBM retains per-iteration cancellation points."""
+    if initial_model is not None and model_kind != "lightgbm":
+        raise ValueError("首版增量续训只支持LightGBM")
     if model_kind != "lightgbm":
         _checkpoint(cancellation)
         if model_kind in {"xgboost", "catboost"}:
@@ -581,6 +755,9 @@ def _fit_model(
         lgb.log_evaluation(period=20),
         lgb.record_evaluation(evals_result),
     ]
+    initial_booster = getattr(initial_model, "model", None) if initial_model is not None else None
+    if initial_model is not None and initial_booster is None:
+        raise ValueError("增量训练来源模型缺少LightGBM Booster")
     model.model = lgb.train(
         model.params,
         datasets[0],
@@ -588,6 +765,8 @@ def _fit_model(
         valid_sets=datasets,
         valid_names=names,
         callbacks=callbacks,
+        init_model=initial_booster,
+        keep_training_booster=True,
     )
     for name in names:
         for metric, values in evals_result[name].items():

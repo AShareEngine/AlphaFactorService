@@ -16,9 +16,11 @@ from factor_service.model_research_repository import (
     _factor_ablation_trials,
     _grid_search_trials,
     _horizon_search_values,
+    _incremental_training_assessment,
     _job_row,
     _model_spec,
     _research_origin_spec,
+    _research_template_spec,
     _walk_forward_spec,
 )
 
@@ -79,6 +81,116 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
     }
+
+
+def test_research_template_freezes_complete_single_training_contract() -> None:
+    spec = _research_template_spec({
+        "name": "LGBM 基线",
+        "description": "固定因子和训练边界",
+        "training": {
+            "title": "中证500基线",
+            "model_id": "stock-ranker",
+            "dataset": _source(),
+            "model": {"kind": "lightgbm", "params": {"num_leaves": 31}},
+            "walk_forward": {"enabled": True, "strategy": "expanding"},
+            "research_design": {"mode": "single"},
+        },
+    })
+
+    assert spec["schema_version"] == "alphablocks.research-template.v1"
+    training = spec["training"]
+    assert training["dataset"]["factors"][0]["params_hash"] == "a" * 64
+    assert training["dataset"]["materialization"]["format"] == "parquet"
+    assert training["model"]["params"]["seed"] == 42
+    assert training["walk_forward"]["strategy"] == "expanding"
+    assert training["research_design"] == {"mode": "single", "search": {}}
+
+
+def test_research_template_validates_and_normalizes_research_design() -> None:
+    spec = _research_template_spec({
+        "name": "参数研究",
+        "training": {
+            "dataset": _source(),
+            "model": {"kind": "lightgbm", "params": {}},
+            "research_design": {
+                "mode": "grid",
+                "search": {
+                    "parameters": {
+                        "num_leaves": [15, 31],
+                        "learning_rate": [0.03, 0.05],
+                    },
+                    "max_trials": 6,
+                },
+            },
+        },
+    })
+
+    design = spec["training"]["research_design"]
+    assert design["mode"] == "grid"
+    assert list(design["search"]["parameters"]) == [
+        "learning_rate", "num_leaves",
+    ]
+    assert design["search"]["max_trials"] == 6
+
+    with pytest.raises(ModelResearchError, match="mode只支持"):
+        _research_template_spec({
+            "name": "非法模板",
+            "training": {
+                "dataset": _source(),
+                "model": {"kind": "lightgbm", "params": {}},
+                "research_design": {"mode": "bayesian"},
+            },
+        })
+
+
+def test_incremental_training_requires_exact_lightgbm_feature_contract() -> None:
+    source = _trained_model(
+        "stock-model", 1, validation_icir=0.5, model_kind="lightgbm",
+    )
+    source.update({
+        "job_id": "model_job_source",
+        "state": "validated",
+        "dataset_hash": "d" * 64,
+    })
+    candidate_dataset = _dataset_spec({
+        **_source(),
+        "date_end": "2025-01-02",
+        "data_cutoff": "2025-01-02T15:00:00+08:00",
+    })
+    candidate_model = _model_spec({"kind": "lightgbm", "params": {}})
+    bundle = {
+        "artifact_id": "artifact-bundle",
+        "relative_path": "jobs/source/bundle.tar.gz",
+        "sha256": "b" * 64,
+        "file_name": "bundle.tar.gz",
+    }
+
+    ready = _incremental_training_assessment(
+        source, bundle,
+        dataset=candidate_dataset,
+        model=candidate_model,
+        walk_forward=_walk_forward_spec({}),
+    )
+
+    assert ready["passed"] is True
+    assert ready["contract"]["mode"] == "lightgbm_append_trees_new_data_only"
+    assert ready["contract"]["minimum_new_trading_sessions"] == 60
+
+    changed = {
+        **candidate_dataset,
+        "factors": [{
+            **candidate_dataset["factors"][0],
+            "params_hash": "c" * 64,
+        }],
+    }
+    blocked = _incremental_training_assessment(
+        source, bundle,
+        dataset=changed,
+        model=candidate_model,
+        walk_forward=_walk_forward_spec({}),
+    )
+    assert blocked["passed"] is False
+    assert "feature_identity" in blocked["failed_checks"]
 
 
 def test_dataset_contract_freezes_label_horizon_and_matching_embargo() -> None:
@@ -241,6 +353,57 @@ def test_research_origin_records_derived_study_and_declared_design_change() -> N
 
     assert result["mode"] == "derived"
     assert result["changed_sections"] == ["research_design"]
+
+
+def test_research_origin_resolver_verifies_model_version_owns_source_job() -> None:
+    source_job = _origin_source_job()
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.get_model = lambda model_id, version: {
+        "model_id": model_id,
+        "version": version,
+        "job_id": "different-job",
+    }
+
+    with pytest.raises(ModelResearchConflict, match="模型版本与来源训练任务不匹配"):
+        repository._resolve_research_origin(
+            {
+                "source_type": "model_version",
+                "source_id": "source-model.v2",
+                "source_job_id": source_job["job_id"],
+                "source_model_id": "source-model",
+                "source_model_version": 2,
+                "requested_mode": "exact_replay",
+            },
+            dataset=source_job["dataset_spec"],
+            model=source_job["config_json"]["model"],
+            walk_forward=source_job["config_json"]["walk_forward"],
+        )
+
+
+def test_research_origin_resolver_only_accepts_selected_experiment_job() -> None:
+    source_job = _origin_source_job()
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.get_training_experiment = lambda _experiment_id: {
+        "selection": {
+            "status": "selected",
+            "selected_job_id": "another-job",
+            "selected_model_id": "source-model",
+            "selected_model_version": 2,
+        },
+    }
+
+    with pytest.raises(ModelResearchConflict, match="验证集选出的入选任务"):
+        repository._resolve_research_origin(
+            {
+                "source_type": "experiment",
+                "source_id": "experiment-a",
+                "source_job_id": source_job["job_id"],
+                "requested_mode": "exact_replay",
+            },
+            dataset=source_job["dataset_spec"],
+            model=source_job["config_json"]["model"],
+            walk_forward=source_job["config_json"]["walk_forward"],
+        )
 
 
 def test_ensemble_contract_freezes_sources_and_equal_weights() -> None:

@@ -4,12 +4,15 @@ import subprocess
 import sys
 import textwrap
 
+import numpy as np
 import pandas as pd
 
+from factor_service.research.dataset import PreparedDataset
 from factor_service.research.trainer import (
     _create_model,
     _feature_importance,
     _fit_model,
+    _incremental_prepared_dataset,
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
@@ -84,6 +87,106 @@ def test_lightgbm_parameters_are_deterministic() -> None:
     assert params["seed"] == 42
     assert params["deterministic"] is True
     assert params["num_threads"] == 2
+
+
+def test_incremental_dataset_uses_only_new_dates_and_source_medians() -> None:
+    dates = pd.date_range("2024-07-01", periods=80, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["A", "B"]], names=["datetime", "instrument"],
+    )
+    raw = pd.DataFrame(
+        {
+            ("feature", "factor__v1__hash"): np.where(
+                np.arange(len(index)) % 7 == 0, np.nan, 2.0,
+            ),
+            ("label", "LABEL0"): np.linspace(-1.0, 1.0, len(index)),
+        },
+        index=index,
+    )
+    raw.columns = pd.MultiIndex.from_tuples(raw.columns)
+    prepared = PreparedDataset(
+        frame=raw.fillna(9.0),
+        segments={
+            "train": ("2024-07-01", "2024-08-01"),
+            "valid": ("2024-08-05", "2024-08-20"),
+            "test": ("2024-08-22", "2024-10-18"),
+        },
+        feature_names=["factor__v1__hash"],
+        coverage={"factor": 0.9},
+        medians={"factor__v1__hash": 9.0},
+        manifest={"schema_version": "dataset"},
+        raw_frame=raw,
+    )
+
+    incremental = _incremental_prepared_dataset(
+        prepared,
+        {
+            "mode": "lightgbm_append_trees_new_data_only",
+            "source_model_id": "demo",
+            "source_model_version": 1,
+            "source_date_end": "2024-06-28",
+            "minimum_new_trading_sessions": 60,
+        },
+        {
+            "feature_names": ["factor__v1__hash"],
+            "medians": {"factor__v1__hash": 0.5},
+        },
+        horizon=5,
+    )
+
+    assert incremental.frame.index.get_level_values("datetime").min() > pd.Timestamp("2024-06-28")
+    assert incremental.frame[("feature", "factor__v1__hash")].isna().sum() == 0
+    assert 0.5 in incremental.frame[("feature", "factor__v1__hash")].values
+    assert incremental.medians == {"factor__v1__hash": 0.5}
+    assert incremental.manifest["incremental_training"]["new_trading_sessions"] == 80
+
+
+def test_lightgbm_incremental_fit_appends_trees_to_source_booster() -> None:
+    script = """
+        import numpy as np
+        import pandas as pd
+        from qlib.data.dataset import DataHandlerLP, DatasetH
+        from qlib.workflow import R
+        from factor_service.research.trainer import _create_model, _fit_model
+
+        R.log_metrics = lambda **kwargs: None
+        dates = pd.date_range("2024-01-02", periods=80, freq="B")
+        index = pd.MultiIndex.from_product(
+            [dates, ["A", "B"]], names=["datetime", "instrument"],
+        )
+        rng = np.random.default_rng(42)
+        feature = rng.normal(size=len(index))
+        frame = pd.DataFrame(
+            np.column_stack((feature, feature * 0.4 + rng.normal(scale=0.1, size=len(index)))),
+            index=index,
+            columns=pd.MultiIndex.from_tuples([
+                ("feature", "f1"), ("label", "LABEL0"),
+            ]),
+        )
+        dataset = DatasetH(handler=DataHandlerLP.from_df(frame), segments={
+            "train": (dates[0].date().isoformat(), dates[49].date().isoformat()),
+            "valid": (dates[50].date().isoformat(), dates[64].date().isoformat()),
+            "test": (dates[65].date().isoformat(), dates[-1].date().isoformat()),
+        })
+        source, _ = _create_model("lightgbm", {
+            "n_estimators": 5, "early_stopping_rounds": 2, "num_threads": 1,
+        }, 1)
+        _fit_model("lightgbm", source, dataset, {}, cancellation=None, progress=None)
+        source_trees = source.model.num_trees()
+        updated, _ = _create_model("lightgbm", {
+            "n_estimators": 3, "early_stopping_rounds": 2, "num_threads": 1,
+        }, 1)
+        _fit_model(
+            "lightgbm", updated, dataset, {}, cancellation=None, progress=None,
+            initial_model=source,
+        )
+        assert updated.model.num_trees() > source_trees
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_supported_model_factories_are_available() -> None:

@@ -21,6 +21,7 @@ class _Repository:
         self.validation_payload = None
         self.registry_payload = None
         self.architectures = {}
+        self.research_templates = {}
 
     def list_jobs(
         self, *, status, experiment_id="", kind="", model_id="",
@@ -52,6 +53,23 @@ class _Repository:
         self.jobs[job["job_id"]] = job
         return job
 
+    def incremental_training_precheck(self, model_id, version, payload):
+        return {
+            "status": "ready",
+            "passed": True,
+            "can_submit": True,
+            "checks": [{
+                "key": "feature_identity",
+                "label": "冻结特征完全一致",
+                "passed": True,
+            }],
+            "contract": {
+                "source_model_id": model_id,
+                "source_model_version": version,
+                "candidate_date_end": payload["dataset"].get("date_end"),
+            },
+        }
+
     def create_model_architecture(self, payload):
         architecture = {
             **payload,
@@ -62,6 +80,41 @@ class _Repository:
         }
         self.architectures[architecture["architecture_id"]] = architecture
         return dict(architecture)
+
+    def create_research_template(self, payload):
+        template = {
+            **payload,
+            "template_id": "research-template-created",
+            "state": "active",
+            "revision": 1,
+            "config_hash": "frozen-config-hash",
+        }
+        self.research_templates[template["template_id"]] = template
+        return dict(template)
+
+    def list_research_templates(self, *, state, limit):
+        templates = list(self.research_templates.values())
+        if state != "all":
+            templates = [item for item in templates if item["state"] == state]
+        return templates[:limit]
+
+    def get_research_template(self, template_id):
+        return dict(self.research_templates[template_id])
+
+    def update_research_template(self, template_id, payload):
+        template = {
+            **self.research_templates[template_id],
+            **payload,
+            "template_id": template_id,
+            "revision": int(self.research_templates[template_id]["revision"]) + 1,
+        }
+        self.research_templates[template_id] = template
+        return dict(template)
+
+    def archive_research_template(self, template_id):
+        self.research_templates[template_id]["state"] = "archived"
+        self.research_templates[template_id]["revision"] += 1
+        return dict(self.research_templates[template_id])
 
     def list_model_architectures(self, *, limit):
         return list(self.architectures.values())[:limit]
@@ -455,6 +508,64 @@ def test_grid_experiments_have_a_history_endpoint(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["experiments"][0]["experiment_id"] == "model_experiment_created"
+
+
+def test_research_template_crud_routes(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    payload = {
+        "name": "中证500 LGBM 基线",
+        "description": "冻结研究配置",
+        "training": {
+            "title": "中证500 LGBM",
+            "dataset": {"factors": [{"factor_id": "mom_20"}]},
+            "model": {"kind": "lightgbm", "params": {}},
+            "research_design": {"mode": "single", "search": {}},
+        },
+    }
+
+    created = client.post("/model-research/research-templates", json=payload)
+    assert created.status_code == 201
+    template_id = created.json()["template"]["template_id"]
+
+    listed = client.get("/model-research/research-templates")
+    assert listed.status_code == 200
+    assert listed.json()["templates"][0]["template_id"] == template_id
+
+    loaded = client.get(f"/model-research/research-templates/{template_id}")
+    assert loaded.status_code == 200
+    assert loaded.json()["template"]["config_hash"] == "frozen-config-hash"
+
+    updated = client.put(
+        f"/model-research/research-templates/{template_id}",
+        json={**payload, "name": "中证500 LGBM 基线 v2", "revision": 1},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["template"]["revision"] == 2
+
+    archived = client.post(
+        f"/model-research/research-templates/{template_id}/archive",
+    )
+    assert archived.status_code == 200
+    assert archived.json()["template"]["state"] == "archived"
+
+
+def test_incremental_training_precheck_route_is_server_authoritative(monkeypatch) -> None:
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+
+    response = client.post(
+        "/model-research/models/model-1/versions/1/incremental-training-precheck",
+        json={
+            "dataset": {"date_end": "2026-08-14"},
+            "model": {"kind": "lightgbm", "params": {}},
+            "walk_forward": {"enabled": False},
+        },
+    )
+
+    assert response.status_code == 200
+    precheck = response.json()["precheck"]
+    assert precheck["passed"] is True
+    assert precheck["contract"]["source_model_version"] == 1
 
 
 def test_model_architecture_crud_and_activation_routes(monkeypatch) -> None:
@@ -1892,3 +2003,46 @@ def test_failed_gate_requires_reasoned_manual_override(monkeypatch) -> None:
     assert approved.status_code == 200
     assert repository.validation_payload["manual_override"] is True
     assert repository.validation_payload["override_reason"] == "仅用于模拟盘观察"
+
+
+def test_exact_replay_exposes_reproducibility_audit(monkeypatch) -> None:
+    class _ReplayRepository(_Repository):
+        def get_model(self, model_id, version):
+            model = super().get_model(model_id, version)
+            model.update({
+                "model_id": model_id,
+                "version": version,
+                "job_id": "source_job" if model_id == "source-model" else "replay_job",
+                "dataset_hash": "frozen-dataset",
+                "metrics_json": {"validation": {"rank_ic": 0.04, "days": 80}},
+            })
+            if model_id == "replay-model":
+                model["job_config_json"] = {
+                    "research_origin": {
+                        "mode": "exact_replay",
+                        "source_job_id": "source_job",
+                        "source_model_id": "source-model",
+                        "source_model_version": 1,
+                        "source_dataset_hash": "frozen-dataset",
+                        "source_config_hash": "source-config-hash",
+                    },
+                }
+            return model
+
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "model_prediction_reproducibility_audit",
+        lambda **_kwargs: {
+            "status": "exact", "passed": True, "key_set_equal": True,
+            "common_rows": 40000, "common_days": 80,
+        },
+    )
+    client = _client(monkeypatch, _ReplayRepository(), _Scheduler())
+
+    response = client.get(
+        "/model-research/models/replay-model/versions/1/reproducibility-audit"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["audit"]["status"] == "exact"
+    assert response.json()["audit"]["source"]["model_id"] == "source-model"

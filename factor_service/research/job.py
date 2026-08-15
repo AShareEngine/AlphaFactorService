@@ -144,6 +144,15 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     if params.get("deterministic", True) is not True:
         raise PermanentJobError("训练必须启用deterministic")
     _validate_walk_forward(config.get("walk_forward") or {})
+    if config.get("incremental_training"):
+        _validate_incremental_training(
+            config["incremental_training"],
+            model_id=model_id,
+            planned_version=version,
+            model_kind=model_kind,
+            dataset_spec=spec,
+            walk_forward=config.get("walk_forward") or {},
+        )
     result = dict(payload)
     result.update({
         "job_id": job_id, "model_id": model_id, "lease_token": lease_token,
@@ -242,6 +251,52 @@ def _validate_walk_forward(source: Any) -> None:
     _integer(source.get("embargo_days", 5), "walk_forward.embargo_days", 1, 20)
     if step_months < test_months:
         raise PermanentJobError("Walk-Forward步长不得小于测试窗口")
+
+
+def _validate_incremental_training(
+    source: Any,
+    *,
+    model_id: str,
+    planned_version: int,
+    model_kind: str,
+    dataset_spec: dict[str, Any],
+    walk_forward: dict[str, Any],
+) -> None:
+    if not isinstance(source, dict):
+        raise PermanentJobError("incremental_training必须是对象")
+    if str(source.get("schema_version") or "") != "alphablocks.incremental-training.v1":
+        raise PermanentJobError("增量训练schema_version无效")
+    if str(source.get("mode") or "") != "lightgbm_append_trees_new_data_only":
+        raise PermanentJobError("增量训练mode无效")
+    if model_kind != "lightgbm":
+        raise PermanentJobError("首版增量续训只支持LightGBM")
+    if walk_forward.get("enabled") is True:
+        raise PermanentJobError("增量续训暂不支持Walk-Forward")
+    if _identifier(source.get("source_model_id"), "source_model_id") != model_id:
+        raise PermanentJobError("增量训练来源模型ID不一致")
+    source_version = _integer(
+        source.get("source_model_version"), "source_model_version", 1, 1_000_000,
+    )
+    if source_version >= planned_version:
+        raise PermanentJobError("增量训练来源版本必须早于目标版本")
+    _identifier(source.get("source_job_id"), "source_job_id")
+    source_end = _date(source.get("source_date_end"), "source_date_end")
+    if source_end >= _date(dataset_spec.get("date_end"), "date_end"):
+        raise PermanentJobError("增量训练数据集没有新增日期")
+    _integer(
+        source.get("minimum_new_trading_sessions", 60),
+        "minimum_new_trading_sessions", 60, 504,
+    )
+    artifact = source.get("source_artifact")
+    if not isinstance(artifact, dict):
+        raise PermanentJobError("增量训练缺少来源模型产物")
+    _identifier(artifact.get("artifact_id"), "source_artifact.artifact_id")
+    digest = str(artifact.get("sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise PermanentJobError("增量训练来源模型产物SHA256无效")
+    relative = Path(str(artifact.get("relative_path") or ""))
+    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+        raise PermanentJobError("增量训练来源模型产物路径无效")
 
 
 def _validate_inference_config(config: dict[str, Any], *, model_id: str, version: int) -> None:

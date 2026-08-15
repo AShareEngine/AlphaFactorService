@@ -62,6 +62,70 @@ def test_job_validation_accepts_walk_forward_contract() -> None:
     assert job["config_json"]["walk_forward"]["train_years"] == 1
 
 
+def test_job_validation_accepts_strict_lightgbm_incremental_contract() -> None:
+    source = valid_job()
+    source["config_json"]["planned_model_version"] = 2
+    source["config_json"]["incremental_training"] = {
+        "schema_version": "alphablocks.incremental-training.v1",
+        "mode": "lightgbm_append_trees_new_data_only",
+        "source_model_id": "test_model",
+        "source_model_version": 1,
+        "source_job_id": "model_job_source",
+        "source_dataset_hash": "c" * 64,
+        "source_date_end": "2024-06-28",
+        "candidate_date_end": "2024-12-31",
+        "minimum_new_trading_sessions": 60,
+        "source_artifact": {
+            "artifact_id": "artifact_model_bundle",
+            "relative_path": "model_job_source/bundle/source.tar.gz",
+            "sha256": "b" * 64,
+            "file_name": "source.tar.gz",
+        },
+        "allowed_parameter_changes": ["n_estimators", "early_stopping_rounds"],
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["incremental_training"]["source_model_version"] == 1
+
+
+def test_job_validation_rejects_incremental_path_traversal_or_deep_model() -> None:
+    source = valid_job()
+    source["config_json"]["planned_model_version"] = 2
+    contract = {
+        "schema_version": "alphablocks.incremental-training.v1",
+        "mode": "lightgbm_append_trees_new_data_only",
+        "source_model_id": "test_model",
+        "source_model_version": 1,
+        "source_job_id": "model_job_source",
+        "source_date_end": "2024-06-28",
+        "minimum_new_trading_sessions": 60,
+        "source_artifact": {
+            "artifact_id": "artifact_model_bundle",
+            "relative_path": "../source.tar.gz",
+            "sha256": "b" * 64,
+        },
+    }
+    source["config_json"]["incremental_training"] = contract
+    with pytest.raises(PermanentJobError, match="路径无效"):
+        validate_job(source)
+
+    source = valid_job()
+    source["config_json"]["planned_model_version"] = 2
+    source["config_json"]["model"] = {
+        "kind": "lstm", "params": {"max_steps": 20, "batch_size": 32},
+    }
+    source["config_json"]["incremental_training"] = {
+        **contract,
+        "source_artifact": {
+            **contract["source_artifact"],
+            "relative_path": "models/source.tar.gz",
+        },
+    }
+    with pytest.raises(PermanentJobError, match="只支持LightGBM"):
+        validate_job(source)
+
+
 def test_job_validation_rejects_overlapping_walk_forward_tests() -> None:
     source = valid_job()
     source["config_json"]["walk_forward"] = {

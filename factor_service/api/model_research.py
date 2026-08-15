@@ -34,6 +34,7 @@ from factor_service.model_registry import (
     build_model_research_report,
     render_model_research_report_markdown,
 )
+from factor_service.model_reproducibility import build_model_reproducibility_audit
 from factor_service.research.config import load_settings as load_research_settings
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.model_research_repository import (
@@ -447,6 +448,72 @@ def get_model_leaderboard(
                 summaries.get(experiment_id),
             ))
         return {"ok": True, "leaderboard": build_model_leaderboard(responses)}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/research-templates")
+def list_research_templates(
+    state: str = Query(default="active"),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "templates": repository.list_research_templates(
+                state=state, limit=limit,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/research-templates", status_code=HTTPStatus.CREATED)
+def create_research_template(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "template": repository.create_research_template(payload),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/research-templates/{template_id}")
+def get_research_template(template_id: str) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "template": repository.get_research_template(template_id),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.put("/research-templates/{template_id}")
+def update_research_template(
+    template_id: str, payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "template": repository.update_research_template(
+                template_id, payload,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/research-templates/{template_id}/archive")
+def archive_research_template(template_id: str) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "template": repository.archive_research_template(template_id),
+        }
     except Exception as exc:
         _raise(exc)
 
@@ -1099,6 +1166,54 @@ def get_model(model_id: str, version: int) -> dict[str, Any]:
             "ok": True,
             "model": _model_response(
                 model, backtest, _experiment_summary_for_model(model),
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/models/{model_id}/versions/{version}/reproducibility-audit")
+def get_model_reproducibility_audit(
+    model_id: str, version: int,
+) -> dict[str, Any]:
+    """Verify that an exact-replay model reproduced its immutable source."""
+    try:
+        replay = repository.get_model(model_id, version)
+        origin = dict((replay.get("job_config_json") or {}).get("research_origin") or {})
+        if origin.get("mode") != "exact_replay":
+            raise ModelResearchConflict("只有服务端确认的精确复现模型可以执行一致性审计")
+        source_model_id = str(origin.get("source_model_id") or "")
+        source_model_version = int(origin.get("source_model_version") or 0)
+        if not source_model_id or source_model_version <= 0:
+            raise ModelResearchConflict("精确复现任务缺少不可变来源模型版本")
+        source = repository.get_model(source_model_id, source_model_version)
+        predictions = model_repository.model_prediction_reproducibility_audit(
+            source_model_id=source_model_id,
+            source_model_version=source_model_version,
+            replay_model_id=model_id,
+            replay_model_version=version,
+        )
+        return {
+            "ok": True,
+            "audit": build_model_reproducibility_audit(
+                source, replay, predictions,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/models/{model_id}/versions/{version}/incremental-training-precheck")
+def incremental_training_precheck(
+    model_id: str,
+    version: int,
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "precheck": repository.incremental_training_precheck(
+                model_id, version, payload,
             ),
         }
     except Exception as exc:
