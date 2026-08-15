@@ -57,6 +57,7 @@ class ResearchWorker:
         self._job_thread: threading.Thread | None = None
         self._recovery_thread: threading.Thread | None = None
         self._scheduler_thread: threading.Thread | None = None
+        self._experiment_queue_thread: threading.Thread | None = None
         self._active_cancellation: CancellationToken | None = None
 
     def capabilities(self) -> dict[str, object]:
@@ -97,6 +98,12 @@ class ResearchWorker:
                 daemon=True,
             )
             self._scheduler_thread.start()
+        self._experiment_queue_thread = threading.Thread(
+            target=self._experiment_queue_loop,
+            name="model-experiment-queue",
+            daemon=True,
+        )
+        self._experiment_queue_thread.start()
         print(
             "AlphaFactorService内置研究调度器已启动",
             flush=True,
@@ -114,6 +121,9 @@ class ResearchWorker:
         scheduler_thread = self._scheduler_thread
         if scheduler_thread is not None and scheduler_thread.is_alive():
             scheduler_thread.join(timeout=6)
+        experiment_thread = self._experiment_queue_thread
+        if experiment_thread is not None and experiment_thread.is_alive():
+            experiment_thread.join(timeout=6)
 
     def submit(self, payload: dict[str, Any]) -> dict[str, object]:
         """Validate and accept one centrally leased job without blocking HTTP."""
@@ -204,6 +214,32 @@ class ResearchWorker:
                 "started_at": self.started_at,
                 "capabilities": self.capabilities(),
             }
+
+    def _experiment_queue_loop(self) -> None:
+        """Serially drain explicitly-created parameter or horizon studies."""
+        while not self._shutdown_event.wait(1.0):
+            with self._state_lock:
+                busy = self._job_thread is not None and self._job_thread.is_alive()
+                unavailable = self.stopping or self.recovery_pending
+            if busy or unavailable:
+                continue
+            leased: dict[str, Any] | None = None
+            try:
+                leased = self.repository.claim_next_experiment_job(lease_seconds=90)
+                if leased is not None:
+                    self.submit(leased)
+            except Exception as exc:
+                if leased is not None:
+                    try:
+                        self.repository.release_dispatch_lease(
+                            str(leased["job_id"]),
+                            lease_token=str(leased.get("lease_token") or ""),
+                            error_message=f"研究实验自动调度失败: {exc}",
+                        )
+                    except Exception:
+                        pass
+                print(f"研究实验队列暂不可用: {exc}", file=sys.stderr, flush=True)
+                self._shutdown_event.wait(2.0)
 
     def _schedule_loop(self) -> None:
         from factor_service.research.schedule import run_inference_schedule_tick

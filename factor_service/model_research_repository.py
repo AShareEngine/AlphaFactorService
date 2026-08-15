@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from itertools import product
 import json
+import math
 import secrets
 from typing import Any, Mapping
 from uuid import uuid4
@@ -11,10 +13,44 @@ from zoneinfo import ZoneInfo
 from psycopg.types.json import Jsonb
 
 from factor_service.control_database import ControlDatabase, get_control_database
+from factor_service.model_validation import select_parameter_trial
+from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
 
 
 ACTIVE_STATUSES = frozenset({"leased", "running", "uploading"})
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "canceled"})
+MAX_EXPERIMENT_TRIALS = 24
+MAX_EXPERIMENT_ITERATIONS = 3
+MAX_LINEAGE_TRIALS = 24
+
+SEARCHABLE_MODEL_PARAMS: dict[str, frozenset[str]] = {
+    "lightgbm": frozenset({
+        "learning_rate", "num_leaves", "max_depth", "n_estimators",
+        "subsample", "colsample_bytree", "reg_alpha", "reg_lambda",
+        "min_child_samples",
+    }),
+    "xgboost": frozenset({
+        "learning_rate", "max_depth", "n_estimators", "subsample",
+        "colsample_bytree", "reg_alpha", "reg_lambda", "min_child_weight",
+    }),
+    "catboost": frozenset({
+        "learning_rate", "depth", "n_estimators", "l2_leaf_reg",
+        "random_strength",
+    }),
+    "mlp": frozenset({
+        "learning_rate", "hidden_layers", "max_steps", "batch_size",
+        "weight_decay",
+    }),
+    "lstm": frozenset({
+        "learning_rate", "lookback_window", "hidden_size", "num_layers",
+        "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
+    "transformer_lstm": frozenset({
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "transformer_layers", "dim_feedforward", "lstm_hidden_size",
+        "lstm_layers", "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
+}
 
 
 class ModelResearchError(ValueError):
@@ -37,6 +73,12 @@ class ModelResearchRepository:
         spec = _dataset_spec(payload.get("dataset") or {})
         model = _model_spec(payload.get("model") or {})
         walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
+        research_origin = self._resolve_research_origin(
+            payload.get("research_origin") or {},
+            dataset=spec,
+            model=model,
+            walk_forward=walk_forward,
+        )
         spec_json = _canonical_json(spec)
         spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
         dataset_id = f"dataset_{spec_hash[:24]}"
@@ -58,6 +100,11 @@ class ModelResearchRepository:
                 "benchmark_code": "000905.SH",
             },
         }
+        experiment = _experiment_ref(payload.get("experiment") or {})
+        if experiment:
+            config["experiment"] = experiment
+        if research_origin:
+            config["research_origin"] = research_origin
         now = _utcnow()
         with self.database.connection() as conn:
             with conn.transaction():
@@ -113,7 +160,622 @@ class ModelResearchRepository:
                 )
                 self._event(
                     conn, job_id, "job.queued", stage="queued",
-                    payload={"dataset_hash": spec_hash},
+                    payload={
+                        "dataset_hash": spec_hash,
+                        "experiment_id": experiment.get("experiment_id", ""),
+                        "trial_index": experiment.get("trial_index"),
+                        "trial_count": experiment.get("trial_count"),
+                    },
+                )
+        return self.get_job(job_id)
+
+    def _resolve_research_origin(
+        self,
+        source: Mapping[str, Any],
+        *,
+        dataset: Mapping[str, Any],
+        model: Mapping[str, Any],
+        walk_forward: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve and verify a historical configuration reuse request.
+
+        The browser only declares where the configuration came from.  The
+        control service resolves that source again and decides whether the new
+        task is an exact replay or a derived study.  This prevents a changed
+        task from being presented as a reproducibility run.
+        """
+        if not source:
+            return {}
+        if not isinstance(source, Mapping):
+            raise ModelResearchError("research_origin必须是对象")
+        source_type = str(source.get("source_type") or "").strip().lower()
+        if source_type not in {"experiment", "model_version"}:
+            raise ModelResearchError(
+                "research_origin.source_type只支持experiment或model_version"
+            )
+        source_id = _required_identifier(
+            str(source.get("source_id") or ""), "research_origin.source_id",
+        )
+        source_job_id = _required_identifier(
+            str(source.get("source_job_id") or ""),
+            "research_origin.source_job_id",
+        )
+        if source_type == "experiment":
+            summary = self.get_training_experiment(source_id)
+            selection = dict(summary.get("selection") or {})
+            if (
+                str(selection.get("status") or "") != "selected"
+                or str(selection.get("selected_job_id") or "") != source_job_id
+            ):
+                raise ModelResearchConflict(
+                    "只能复用实验中由验证集选出的入选任务"
+                )
+            source_model_id = str(selection.get("selected_model_id") or "")
+            source_model_version = int(
+                selection.get("selected_model_version") or 0
+            )
+        else:
+            source_model_id = _required_identifier(
+                str(source.get("source_model_id") or ""),
+                "research_origin.source_model_id",
+            )
+            try:
+                source_model_version = int(source.get("source_model_version") or 0)
+            except (TypeError, ValueError) as exc:
+                raise ModelResearchError(
+                    "research_origin.source_model_version必须是正整数"
+                ) from exc
+            if source_model_version <= 0:
+                raise ModelResearchError(
+                    "research_origin.source_model_version必须是正整数"
+                )
+            source_model = self.get_model(source_model_id, source_model_version)
+            if str(source_model.get("job_id") or "") != source_job_id:
+                raise ModelResearchConflict("模型版本与来源训练任务不匹配")
+        source_job = self.get_job(source_job_id)
+        if str(source_job.get("status") or "") != "succeeded":
+            raise ModelResearchConflict("只能复用已经成功完成的训练任务")
+        if str(source_job.get("model_id") or "") != source_model_id:
+            raise ModelResearchConflict("来源任务与来源模型不匹配")
+        if source_model_version and int(source_job.get("model_version") or 0) != source_model_version:
+            raise ModelResearchConflict("来源任务与来源模型版本不匹配")
+        return _research_origin_spec(
+            source,
+            source_type=source_type,
+            source_id=source_id,
+            source_job=source_job,
+            source_model_id=source_model_id,
+            source_model_version=source_model_version,
+            dataset=dataset,
+            model=model,
+            walk_forward=walk_forward,
+        )
+
+    def create_training_experiment(
+        self, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Create a parameter, label-horizon, or frozen-factor ablation study."""
+        dataset_source = dict(payload.get("dataset") or {})
+        walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
+        model_source = dict(payload.get("model") or {})
+        search = dict(payload.get("search") or {})
+        strategy = str(search.get("strategy") or "grid").strip().lower()
+        if strategy not in {"grid", "horizon_grid", "factor_ablation"}:
+            raise ModelResearchError(
+                "实验策略只支持grid、horizon_grid或factor_ablation"
+            )
+        experiment_id = f"model_experiment_{uuid4().hex}"
+        parent_experiment_id = str(
+            payload.get("parent_experiment_id") or ""
+        ).strip()
+        parent_job_id = str(payload.get("parent_job_id") or "").strip()
+        if parent_experiment_id:
+            parent_experiment_id = _required_identifier(
+                parent_experiment_id, "parent_experiment_id",
+            )
+        if parent_job_id:
+            parent_job_id = _required_identifier(parent_job_id, "parent_job_id")
+        iteration = int(payload.get("iteration") or (2 if parent_experiment_id else 1))
+        if not 1 <= iteration <= MAX_EXPERIMENT_ITERATIONS:
+            raise ModelResearchError(
+                f"实验迭代轮次必须在1到{MAX_EXPERIMENT_ITERATIONS}之间"
+            )
+        if not parent_experiment_id and iteration != 1:
+            raise ModelResearchError("没有父实验时只能创建第1轮研究")
+        lineage_prior_trial_count = 0
+        experiment_title = str(
+            payload.get("title") or {
+                "horizon_grid": f"{model_source.get('kind') or 'model'} 多周期研究",
+                "factor_ablation": f"{model_source.get('kind') or 'model'} 因子消融实验",
+            }.get(strategy, f"{model_source.get('kind') or 'model'} 参数实验")
+        ).strip()[:160]
+        model_id = _clean_identifier(
+            str(payload.get("model_id") or ""),
+            default=f"experiment_{experiment_id.removeprefix('model_experiment_')[:16]}",
+        )
+        if parent_experiment_id:
+            parent = self._experiment_parent_context(
+                parent_experiment_id, parent_job_id,
+            )
+            parent_summary = dict(parent["summary"])
+            parent_job = dict(parent["job"])
+            if strategy != "factor_ablation" or str(
+                parent_summary.get("strategy") or ""
+            ) != "factor_ablation":
+                raise ModelResearchConflict("多轮继承目前只支持因子消融实验")
+            expected_iteration = int(parent_summary.get("iteration") or 1) + 1
+            if iteration != expected_iteration:
+                raise ModelResearchConflict(
+                    f"下一轮实验轮次必须为第{expected_iteration}轮"
+                )
+            if iteration > MAX_EXPERIMENT_ITERATIONS:
+                raise ModelResearchConflict(
+                    f"同一研究谱系最多允许{MAX_EXPERIMENT_ITERATIONS}轮，防止反复适配验证集"
+                )
+            if model_id != str(parent_job.get("model_id") or ""):
+                raise ModelResearchConflict("下一轮实验必须沿用父任务的model_id")
+            parent_dataset = _dataset_spec(parent_job.get("dataset_spec") or {})
+            child_dataset = _dataset_spec(dataset_source)
+            if _canonical_json(child_dataset) != _canonical_json(parent_dataset):
+                raise ModelResearchConflict(
+                    "下一轮实验必须完整继承父任务的冻结因子、样本范围、标签和data_cutoff"
+                )
+            parent_config = dict(parent_job.get("config_json") or {})
+            if _canonical_json(_model_spec(model_source)) != _canonical_json(
+                _model_spec(parent_config.get("model") or {})
+            ):
+                raise ModelResearchConflict("下一轮实验必须完整继承父任务的模型参数")
+            if _canonical_json(walk_forward) != _canonical_json(
+                _walk_forward_spec(parent_config.get("walk_forward") or {})
+            ):
+                raise ModelResearchConflict(
+                    "下一轮实验必须完整继承父任务的Walk-Forward配置"
+                )
+            lineage_prior_trial_count = int(parent["trial_count"])
+        if strategy == "horizon_grid":
+            horizons = _horizon_search_values(search)
+            model = _model_spec(model_source)
+            normalized_trials = [
+                {
+                    "dataset": _dataset_spec({
+                        **dataset_source,
+                        "label_horizon_trading_days": horizon,
+                    }),
+                    "model": model,
+                    "search_params": {
+                        "label_horizon_trading_days": horizon,
+                    },
+                }
+                for horizon in horizons
+            ]
+        elif strategy == "factor_ablation":
+            model = _model_spec(model_source)
+            normalized_trials = _factor_ablation_trials(dataset_source, search)
+            for trial in normalized_trials:
+                trial["model"] = model
+        else:
+            dataset = _dataset_spec(dataset_source)
+            trials = _grid_search_trials(model_source, search)
+            # Validate every trial before writing any job so a bad combination
+            # does not leave a partially-created experiment in the control DB.
+            normalized_trials = [
+                {
+                    "dataset": dataset,
+                    "model": _model_spec({
+                        "kind": model_source.get("kind"), "params": params,
+                    }),
+                    "search_params": {},
+                }
+                for params in trials
+            ]
+            for trial in normalized_trials:
+                trial["search_params"] = {
+                    key: trial["model"]["params"][key]
+                    for key in sorted(search.get("parameters") or {})
+                }
+        jobs: list[dict[str, Any]] = []
+        trial_count = len(normalized_trials)
+        if lineage_prior_trial_count + trial_count > MAX_LINEAGE_TRIALS:
+            raise ModelResearchConflict(
+                f"同一研究谱系累计最多允许{MAX_LINEAGE_TRIALS}组试验，防止验证集多重比较过拟合"
+            )
+        for index, trial in enumerate(normalized_trials, start=1):
+            horizon = int(
+                dict(trial["dataset"].get("label") or {}).get(
+                    "horizon_trading_days"
+                ) or 5
+            )
+            jobs.append(self.create_training_job({
+                "title": (
+                    f"{experiment_title} · T+{horizon}"
+                    if strategy == "horizon_grid"
+                    else f"{experiment_title} · {index}/{trial_count} · "
+                    f"{trial['search_params']['removed_factor_id']}"
+                    if strategy == "factor_ablation"
+                    else f"{experiment_title} · {index}/{trial_count}"
+                ),
+                "model_id": model_id,
+                "dataset": trial["dataset"],
+                "model": trial["model"],
+                "walk_forward": {
+                    **walk_forward,
+                    "embargo_days": horizon,
+                },
+                "research_origin": payload.get("research_origin") or {},
+                "experiment": {
+                    "experiment_id": experiment_id,
+                    "title": experiment_title,
+                    "strategy": strategy,
+                    "parent_experiment_id": parent_experiment_id,
+                    "parent_job_id": parent_job_id,
+                    "iteration": iteration,
+                    "lineage_prior_trial_count": lineage_prior_trial_count,
+                    "lineage_trial_budget": MAX_LINEAGE_TRIALS,
+                    "lineage_iteration_budget": MAX_EXPERIMENT_ITERATIONS,
+                    "trial_index": index,
+                    "trial_count": trial_count,
+                    "search_params": trial["search_params"],
+                    "auto_dispatch": True,
+                },
+            }))
+        return _experiment_summary(experiment_id, jobs)
+
+    def _experiment_parent_context(
+        self, parent_experiment_id: str, parent_job_id: str,
+    ) -> dict[str, Any]:
+        if not parent_job_id:
+            raise ModelResearchConflict("下一轮实验必须指定父实验的入选任务")
+        seen: set[str] = set()
+        lineage: list[dict[str, Any]] = []
+        current_id = parent_experiment_id
+        while current_id:
+            if current_id in seen:
+                raise ModelResearchConflict("实验谱系存在循环引用")
+            seen.add(current_id)
+            summary = self.get_training_experiment(current_id)
+            lineage.append(summary)
+            if len(lineage) > MAX_EXPERIMENT_ITERATIONS:
+                raise ModelResearchConflict("实验谱系超过允许的最大迭代轮次")
+            current_id = str(summary.get("parent_experiment_id") or "")
+        direct_parent = lineage[0]
+        selection = dict(direct_parent.get("selection") or {})
+        selected_job_id = str(selection.get("selected_job_id") or "")
+        if str(selection.get("status") or "") != "selected" or not selected_job_id:
+            raise ModelResearchConflict("父实验尚未选出验证集最佳任务")
+        if parent_job_id != selected_job_id:
+            raise ModelResearchConflict("parent_job_id必须是父实验的验证集入选任务")
+        parent_job = next((
+            dict(job) for job in direct_parent.get("jobs") or []
+            if str(job.get("job_id") or "") == parent_job_id
+        ), None)
+        if parent_job is None or str(parent_job.get("status") or "") != "succeeded":
+            raise ModelResearchConflict("父实验入选任务不存在或尚未成功完成")
+        return {
+            "summary": direct_parent,
+            "job": parent_job,
+            "trial_count": sum(int(item.get("trial_count") or 0) for item in lineage),
+        }
+
+    def reserve_ensemble_model(
+        self, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Reserve an immutable ensemble version before ClickHouse materialization."""
+        source_refs = payload.get("sources")
+        if (
+            not isinstance(source_refs, list)
+            or not 2 <= len(source_refs) <= 8
+            or any(not isinstance(item, Mapping) for item in source_refs)
+        ):
+            raise ModelResearchError("融合模型必须选择2到8个有效源模型版本")
+        source_models = [
+            self.get_model(
+                str((item or {}).get("model_id") or ""),
+                int((item or {}).get("model_version") or (item or {}).get("version") or 0),
+            )
+            for item in source_refs
+        ]
+        ensemble = _ensemble_spec(payload, source_models)
+        dataset = dict(ensemble.pop("dataset"))
+        spec_json = _canonical_json(dataset)
+        spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
+        dataset_id = f"dataset_{spec_hash[:24]}"
+        job_id = f"model_job_{uuid4().hex}"
+        now = _utcnow()
+        config = {
+            "schema_version": "alphablocks.model-ensemble.v1",
+            "dataset": dataset,
+            "model": {"kind": "ensemble", "params": {}},
+            "ensemble": ensemble,
+            "backtest": {
+                "universe_id": dataset["universe_id"],
+                "top_n": 20,
+                "rebalance_every": 5,
+                "benchmark_code": dataset["index_code"],
+            },
+        }
+        with self.database.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO model_dataset_specs(
+                        dataset_id, spec_hash, name, universe_id, factor_count,
+                        data_cutoff, spec_json, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (spec_hash) DO NOTHING
+                    """,
+                    (
+                        dataset_id, spec_hash, dataset["name"],
+                        dataset["universe_id"], len(dataset.get("factors") or []),
+                        dataset["data_cutoff"], Jsonb(dataset), now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT dataset_id FROM model_dataset_specs WHERE spec_hash = %s",
+                    (spec_hash,),
+                ).fetchone()
+                dataset_id = str(row["dataset_id"])
+                model_id = str(ensemble["model_id"])
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"model:{model_id}",),
+                )
+                version_row = conn.execute(
+                    """
+                    SELECT GREATEST(
+                        COALESCE((SELECT max(version) FROM model_versions WHERE model_id = %s), 0),
+                        COALESCE((SELECT max(model_version) FROM model_jobs
+                                  WHERE model_id = %s AND status NOT IN ('failed', 'canceled')), 0)
+                    ) + 1 AS version
+                    """,
+                    (model_id, model_id),
+                ).fetchone()
+                version = int(version_row["version"])
+                config["planned_model_version"] = version
+                conn.execute(
+                    """
+                    INSERT INTO model_jobs(
+                        job_id, dataset_id, model_id, kind, model_kind, title,
+                        status, config_json, attempt_count, max_attempts,
+                        model_version, requested_at, started_at, updated_at
+                    ) VALUES (%s, %s, %s, 'ensemble', 'ensemble', %s,
+                              'running', %s, 1, 1, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id, dataset_id, model_id, ensemble["name"],
+                        Jsonb(config), version, now, now, now,
+                    ),
+                )
+                self._event(
+                    conn, job_id, "job.running", stage="materializing",
+                    message="正在融合源模型历史预测",
+                    payload={
+                        "model_id": model_id, "model_version": version,
+                        "source_count": len(ensemble["sources"]),
+                        "weight_strategy": ensemble["weight_strategy"],
+                    },
+                )
+        return self.get_job(job_id)
+
+    def complete_ensemble_model(
+        self, job_id: str, predictions: Mapping[str, Any],
+        evaluation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        now = _utcnow()
+        prediction_summary = _json_ready_mapping(predictions)
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("融合模型任务不存在")
+                if str(row["status"]) == "succeeded":
+                    return self.get_model(str(row["model_id"]), int(row["model_version"]))
+                if str(row["kind"]) != "ensemble" or str(row["status"]) != "running":
+                    raise ModelResearchConflict("融合模型任务状态不允许完成")
+                config = dict(row["config_json"] or {})
+                ensemble = dict(config.get("ensemble") or {})
+                dataset = dict(config.get("dataset") or {})
+                model_id = str(row["model_id"])
+                version = int(row["model_version"] or 0)
+                manifest = {
+                    "schema_version": "alphablocks.model-manifest.v1",
+                    "model_kind": "ensemble",
+                    "artifactless": True,
+                    "ensemble": ensemble,
+                    "feature_names": [
+                        f"{item['model_id']}__v{item['model_version']}__score"
+                        for item in ensemble.get("sources") or []
+                    ],
+                    "future_function_guards": [
+                        "每个源模型版本、数据集哈希和融合权重均已冻结",
+                        "自动权重只读取源模型验证集ICIR，不读取测试集指标",
+                        "只融合所有源模型共同存在且feature_cutoff不晚于T日15:00的预测",
+                        "融合后按交易日重新排名并映射到[-1, 1]",
+                    ],
+                    "created_at": now.isoformat(),
+                }
+                metrics = {
+                    **_json_ready_mapping(evaluation),
+                    "evaluation_mode": "ensemble_oos",
+                    "source_count": len(ensemble.get("sources") or []),
+                    "selection_split": "validation",
+                    "test_metrics_role": "report_only",
+                }
+                conn.execute(
+                    """
+                    INSERT INTO model_versions(
+                        model_id, version, job_id, dataset_id, name, model_kind,
+                        state, metrics_json, feature_importance_json,
+                        prediction_json, manifest_json, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, 'ensemble', 'candidate',
+                              %s, '[]'::jsonb, %s, %s, %s, %s)
+                    """,
+                    (
+                        model_id, version, job_id, row["dataset_id"], row["title"],
+                        Jsonb(metrics), Jsonb(prediction_summary), Jsonb(manifest),
+                        now, now,
+                    ),
+                )
+                result = {
+                    "metrics": metrics,
+                    "feature_importance": [],
+                    "predictions": prediction_summary,
+                    "manifest": manifest,
+                }
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET status = 'succeeded', result_json = %s,
+                        finished_at = %s, updated_at = %s
+                    WHERE job_id = %s
+                    """,
+                    (Jsonb(result), now, now, job_id),
+                )
+                self._event(
+                    conn, job_id, "job.succeeded", stage="succeeded",
+                    message="融合模型已注册",
+                    payload={
+                        "model_id": model_id, "model_version": version,
+                        "prediction_rows": int(prediction_summary.get("row_count") or 0),
+                    },
+                )
+        return self.get_model(model_id, version)
+
+    def fail_ensemble_model(self, job_id: str, error_message: str) -> None:
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT status FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row or str(row["status"]) != "running":
+                    return
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET status = 'failed', error_message = %s,
+                        finished_at = %s, updated_at = %s
+                    WHERE job_id = %s
+                    """,
+                    (str(error_message)[:4000], now, now, job_id),
+                )
+                self._event(
+                    conn, job_id, "job.failed", stage="failed",
+                    message=str(error_message)[:1000],
+                )
+
+    def record_ensemble_inference(
+        self, model_id: str, version: int, *, trade_date: str,
+        data_cutoff: str, predictions: Mapping[str, Any], trigger: str = "manual",
+    ) -> dict[str, Any]:
+        """Record a synchronous score-fusion run without dispatching a trainer."""
+        model = self.get_model(model_id, version)
+        if str(model.get("model_kind")) != "ensemble":
+            raise ModelResearchConflict("当前模型不是融合模型")
+        target_date = _iso_date(trade_date, "trade_date")
+        cutoff = _iso_datetime(data_cutoff or _utcnow().isoformat(), "data_cutoff")
+        prediction_result = _json_ready_mapping(predictions)
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"inference:{model_id}:{version}:{target_date}",),
+                )
+                existing = conn.execute(
+                    """
+                    SELECT job_id FROM model_jobs
+                    WHERE model_id = %s AND model_version = %s AND kind = 'infer'
+                      AND config_json -> 'inference' ->> 'trade_date' = %s
+                      AND status = 'succeeded'
+                    ORDER BY requested_at DESC LIMIT 1
+                    """,
+                    (model_id, int(version), target_date),
+                ).fetchone()
+                job_id = str(existing["job_id"]) if existing else f"model_job_{uuid4().hex}"
+                config = {
+                    "schema_version": "alphablocks.model-inference.v1",
+                    "dataset": dict(model["dataset_spec"]),
+                    "planned_model_version": int(version),
+                    "source_model": {
+                        "model_id": model_id,
+                        "model_version": int(version),
+                        "training_job_id": str(model["job_id"]),
+                        "artifactless": True,
+                    },
+                    "inference": {
+                        "trade_date": target_date,
+                        "data_cutoff": cutoff,
+                        "mode": "ensemble_score_fusion",
+                        "trigger": (
+                            "schedule" if str(trigger).lower() == "schedule" else "manual"
+                        ),
+                    },
+                }
+                result = {"predictions": prediction_result}
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE model_jobs
+                        SET result_json = %s, updated_at = %s
+                        WHERE job_id = %s
+                        """,
+                        (Jsonb(result), now, job_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO model_jobs(
+                            job_id, dataset_id, model_id, kind, model_kind, title,
+                            status, config_json, result_json, attempt_count,
+                            max_attempts, model_version, requested_at, started_at,
+                            finished_at, updated_at
+                        ) VALUES (%s, %s, %s, 'infer', 'ensemble', %s, 'succeeded',
+                                  %s, %s, 1, 1, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            job_id, model["dataset_id"], model_id,
+                            f"{model['name']} · {target_date}融合预测",
+                            Jsonb(config), Jsonb(result), int(version),
+                            now, now, now, now,
+                        ),
+                    )
+                current_summary = dict(model.get("prediction_json") or {})
+                current_summary.update({
+                    "last_inference_run_id": prediction_result.get("inference_run_id"),
+                    "last_inference_rows": int(prediction_result.get("row_count") or 0),
+                    "last_inference_trade_date": target_date,
+                    "last_inference_at": now.isoformat(),
+                })
+                if target_date >= str(current_summary.get("latest_trade_date") or ""):
+                    current_summary.update({
+                        "latest_trade_date": target_date,
+                        "latest_cross_section_rows": int(
+                            prediction_result.get("latest_cross_section_rows")
+                            or prediction_result.get("row_count") or 0
+                        ),
+                        "latest_inference_run_id": prediction_result.get("inference_run_id"),
+                        "latest_inference_rows": int(prediction_result.get("row_count") or 0),
+                        "latest_inference_at": now.isoformat(),
+                    })
+                conn.execute(
+                    """
+                    UPDATE model_versions SET prediction_json = %s, updated_at = %s
+                    WHERE model_id = %s AND version = %s
+                    """,
+                    (Jsonb(current_summary), now, model_id, int(version)),
+                )
+                self._event(
+                    conn, job_id, "job.succeeded", stage="succeeded",
+                    message="融合模型每日预测已生成",
+                    payload={
+                        "model_id": model_id, "model_version": int(version),
+                        "trade_date": target_date,
+                        "prediction_rows": int(prediction_result.get("row_count") or 0),
+                    },
                 )
         return self.get_job(job_id)
 
@@ -161,6 +823,11 @@ class ModelResearchRepository:
                 "trade_date": trade_date,
                 "data_cutoff": data_cutoff,
                 "feature_cutoff_at": signal_close.isoformat(),
+                "trigger": (
+                    "schedule"
+                    if str(payload.get("trigger") or "manual").lower() == "schedule"
+                    else "manual"
+                ),
             },
         }
         now = _utcnow()
@@ -204,12 +871,32 @@ class ModelResearchRepository:
                 )
         return self.get_job(job_id)
 
-    def list_jobs(self, *, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def list_jobs(
+        self, *, status: str = "", experiment_id: str = "", kind: str = "",
+        model_id: str = "", model_version: int | None = None,
+        trade_date: str = "", limit: int = 100,
+    ) -> list[dict[str, Any]]:
         values: list[Any] = []
-        where = ""
+        clauses: list[str] = []
         if status:
-            where = "WHERE jobs.status = %s"
+            clauses.append("jobs.status = %s")
             values.append(status)
+        if experiment_id:
+            clauses.append("jobs.config_json -> 'experiment' ->> 'experiment_id' = %s")
+            values.append(_required_identifier(experiment_id, "experiment_id"))
+        if kind:
+            clauses.append("jobs.kind = %s")
+            values.append(_required_identifier(kind, "kind"))
+        if model_id:
+            clauses.append("jobs.model_id = %s")
+            values.append(_required_identifier(model_id, "model_id"))
+        if model_version is not None:
+            clauses.append("jobs.model_version = %s")
+            values.append(max(1, int(model_version)))
+        if trade_date:
+            clauses.append("jobs.config_json -> 'inference' ->> 'trade_date' = %s")
+            values.append(_iso_date(trade_date, "trade_date"))
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
         values.append(max(1, min(int(limit), 500)))
         with self.database.connection() as conn:
             rows = conn.execute(
@@ -225,6 +912,112 @@ class ModelResearchRepository:
                 tuple(values),
             ).fetchall()
         return [_job_row(row) for row in rows]
+
+    def list_inference_runs(
+        self, *, status: str = "", model_id: str = "",
+        model_version: int | None = None, trade_date: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return compact inference history without the frozen dataset payload."""
+        values: list[Any] = []
+        clauses = ["jobs.kind = 'infer'"]
+        if status:
+            clauses.append("jobs.status = %s")
+            values.append(_required_identifier(status, "status"))
+        if model_id:
+            clauses.append("jobs.model_id = %s")
+            values.append(_required_identifier(model_id, "model_id"))
+        if model_version is not None:
+            clauses.append("jobs.model_version = %s")
+            values.append(max(1, int(model_version)))
+        if trade_date:
+            clauses.append("jobs.config_json -> 'inference' ->> 'trade_date' = %s")
+            values.append(_iso_date(trade_date, "trade_date"))
+        values.append(max(1, min(int(limit), 500)))
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT jobs.job_id, jobs.model_id, jobs.model_version,
+                       jobs.model_kind, jobs.title, jobs.status,
+                       jobs.config_json, jobs.result_json, jobs.progress_json,
+                       jobs.attempt_count, jobs.max_attempts,
+                       jobs.cancel_requested, jobs.error_message,
+                       jobs.requested_at, jobs.started_at, jobs.finished_at,
+                       jobs.updated_at, versions.name AS model_name,
+                       versions.state AS model_state,
+                       COALESCE(versions.is_default, FALSE) AS is_default
+                FROM model_jobs jobs
+                LEFT JOIN model_versions versions
+                  ON versions.model_id = jobs.model_id
+                 AND versions.version = jobs.model_version
+                WHERE {' AND '.join(clauses)}
+                ORDER BY jobs.requested_at DESC
+                LIMIT %s
+                """,
+                tuple(values),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = _job_row(row)
+            config = dict(item.pop("config_json", {}) or {})
+            inference = dict(config.get("inference") or {})
+            job_result = dict(item.pop("result_json", {}) or {})
+            predictions = dict(job_result.get("predictions") or {})
+            progress = dict(item.pop("progress_json", {}) or {})
+            item.update({
+                "trade_date": str(inference.get("trade_date") or "")[:10],
+                "data_cutoff": inference.get("data_cutoff"),
+                "feature_cutoff_at": inference.get("feature_cutoff_at"),
+                "trigger": str(inference.get("trigger") or "unknown"),
+                "run_mode": str(inference.get("mode") or "model_inference"),
+                "inference_run_id": str(
+                    predictions.get("inference_run_id") or item["job_id"]
+                ),
+                "prediction_rows": int(
+                    predictions.get("latest_cross_section_rows")
+                    or predictions.get("row_count") or 0
+                ),
+                "stage": str(progress.get("stage") or item.get("status") or ""),
+            })
+            result.append(item)
+        return result
+
+    def get_training_experiment(self, experiment_id: str) -> dict[str, Any]:
+        experiment_id = _required_identifier(experiment_id, "experiment_id")
+        jobs = self.list_jobs(experiment_id=experiment_id, limit=MAX_EXPERIMENT_TRIALS)
+        if not jobs:
+            raise ModelResearchNotFound("参数实验不存在")
+        return _experiment_summary(experiment_id, jobs)
+
+    def list_training_experiments(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT config_json -> 'experiment' ->> 'experiment_id' AS experiment_id,
+                       max(requested_at) AS last_requested_at
+                FROM model_jobs
+                WHERE kind = 'train'
+                  AND config_json -> 'experiment' ->> 'experiment_id' IS NOT NULL
+                GROUP BY config_json -> 'experiment' ->> 'experiment_id'
+                ORDER BY max(requested_at) DESC
+                LIMIT %s
+                """,
+                (safe_limit,),
+            ).fetchall()
+        experiments = []
+        for row in rows:
+            summary = self.get_training_experiment(str(row["experiment_id"]))
+            # 历史列表只返回卡片/表格所需的摘要。完整任务结果、产物清单和
+            # trial_assessments 留在实验详情接口，避免实验增多后列表响应膨胀。
+            summary.pop("jobs", None)
+            summary.pop("comparison", None)
+            selection = dict(summary.get("selection") or {})
+            selection.pop("trial_assessments", None)
+            summary["selection"] = selection
+            summary["last_requested_at"] = _job_row(row)["last_requested_at"]
+            experiments.append(summary)
+        return experiments
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.database.connection() as conn:
@@ -337,6 +1130,69 @@ class ModelResearchRepository:
                     payload={
                         "lease_expires_at": expires.isoformat(),
                         "dispatch_mode": "push",
+                    },
+                )
+        claimed = self.get_job(job_id)
+        claimed["lease_token"] = token
+        return claimed
+
+    def claim_next_experiment_job(
+        self, *, lease_seconds: int = 90,
+    ) -> dict[str, Any] | None:
+        """Lease the next auto-dispatched research trial, never legacy jobs."""
+        lease_owner = "alpha-factor-service"
+        lease_seconds = max(30, min(int(lease_seconds), 300))
+        now = _utcnow()
+        expires = now + timedelta(seconds=lease_seconds)
+        token = secrets.token_urlsafe(32)
+        with self.database.connection() as conn:
+            with conn.transaction():
+                self._recover_expired(conn, now)
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    ("alpha-factor-service",),
+                )
+                active = conn.execute(
+                    """
+                    SELECT job_id FROM model_jobs
+                    WHERE lease_owner = %s
+                      AND status IN ('leased', 'running', 'uploading')
+                      AND lease_expires_at >= %s
+                    LIMIT 1 FOR UPDATE
+                    """,
+                    (lease_owner, now),
+                ).fetchone()
+                if active:
+                    return None
+                row = conn.execute(
+                    """
+                    SELECT * FROM model_jobs
+                    WHERE status = 'queued' AND cancel_requested = FALSE
+                      AND attempt_count < max_attempts
+                      AND config_json -> 'experiment' ->> 'auto_dispatch' = 'true'
+                    ORDER BY requested_at, job_id
+                    LIMIT 1 FOR UPDATE SKIP LOCKED
+                    """
+                ).fetchone()
+                if not row:
+                    return None
+                job_id = str(row["job_id"])
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET status = 'leased', lease_owner = %s, lease_token = %s,
+                        lease_expires_at = %s, attempt_count = attempt_count + 1,
+                        started_at = COALESCE(started_at, %s), updated_at = %s,
+                        error_message = ''
+                    WHERE job_id = %s
+                    """,
+                    (lease_owner, token, expires, now, now, job_id),
+                )
+                self._event(
+                    conn, job_id, "job.leased", stage="leased",
+                    payload={
+                        "lease_expires_at": expires.isoformat(),
+                        "dispatch_mode": "experiment_queue",
                     },
                 )
         claimed = self.get_job(job_id)
@@ -631,9 +1487,12 @@ class ModelResearchRepository:
         with self.database.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT versions.*, specs.spec_hash AS dataset_hash
+                SELECT versions.*, specs.spec_hash AS dataset_hash,
+                       specs.spec_json AS dataset_spec,
+                       jobs.config_json AS job_config_json
                 FROM model_versions versions
                 JOIN model_dataset_specs specs USING(dataset_id)
+                JOIN model_jobs jobs ON jobs.job_id = versions.job_id
                 ORDER BY versions.created_at DESC
                 LIMIT %s
                 """,
@@ -651,16 +1510,386 @@ class ModelResearchRepository:
             row = conn.execute(
                 """
                 SELECT versions.*, specs.spec_hash AS dataset_hash,
-                       specs.spec_json AS dataset_spec
+                       specs.spec_json AS dataset_spec,
+                       jobs.config_json AS job_config_json
                 FROM model_versions versions
                 JOIN model_dataset_specs specs USING(dataset_id)
-                WHERE model_id = %s AND version = %s
+                JOIN model_jobs jobs ON jobs.job_id = versions.job_id
+                WHERE versions.model_id = %s AND versions.version = %s
                 """,
                 (model_id, int(version)),
             ).fetchone()
         if not row:
             raise ModelResearchNotFound("模型版本不存在")
         return dict(row)
+
+    def update_model_registry(
+        self,
+        model_id: str,
+        version: int,
+        *,
+        action: str,
+        validation_approved: bool,
+        note: str = "",
+    ) -> dict[str, Any]:
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action not in {
+            "set_default", "clear_default", "archive", "restore", "update_note",
+        }:
+            raise ModelResearchError(
+                "模型池操作只支持set_default、clear_default、archive、restore或update_note"
+            )
+        clean_note = str(note or "").strip()[:1000]
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT versions.*, specs.spec_json AS dataset_spec
+                    FROM model_versions versions
+                    JOIN model_dataset_specs specs USING(dataset_id)
+                    WHERE versions.model_id = %s AND versions.version = %s
+                    FOR UPDATE OF versions
+                    """,
+                    (model_id, int(version)),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型版本不存在")
+                current = dict(row)
+                current_state = str(current.get("state") or "candidate")
+                scope = str(current.get("registry_scope") or "").strip()
+                if not scope:
+                    dataset = dict(current.get("dataset_spec") or {})
+                    scope = (
+                        f"{dataset.get('research_target') or 'stock_selection'}:"
+                        f"{dataset.get('universe_id') or 'csi500'}"
+                    )
+
+                if normalized_action == "set_default":
+                    if current_state == "archived":
+                        raise ModelResearchConflict("已归档模型必须先恢复，才能设为主模型")
+                    if not validation_approved:
+                        raise ModelResearchConflict("只有通过研究门槛的模型才能设为主模型")
+                    conn.execute(
+                        """
+                        UPDATE model_versions
+                        SET is_default = FALSE, updated_at = %s
+                        WHERE registry_scope = %s AND is_default = TRUE
+                          AND NOT (model_id = %s AND version = %s)
+                        """,
+                        (now, scope, model_id, int(version)),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE model_versions
+                        SET is_default = TRUE, registry_scope = %s,
+                            registry_note = CASE WHEN %s = '' THEN registry_note ELSE %s END,
+                            updated_at = %s
+                        WHERE model_id = %s AND version = %s
+                        """,
+                        (scope, clean_note, clean_note, now, model_id, int(version)),
+                    )
+                elif normalized_action == "clear_default":
+                    conn.execute(
+                        """
+                        UPDATE model_versions
+                        SET is_default = FALSE,
+                            registry_note = CASE WHEN %s = '' THEN registry_note ELSE %s END,
+                            updated_at = %s
+                        WHERE model_id = %s AND version = %s
+                        """,
+                        (clean_note, clean_note, now, model_id, int(version)),
+                    )
+                elif normalized_action == "archive":
+                    if bool(current.get("is_default")):
+                        raise ModelResearchConflict("主模型不能直接归档；请先取消主模型或切换其他版本")
+                    if current_state != "archived":
+                        conn.execute(
+                            """
+                            UPDATE model_versions
+                            SET state = 'archived', is_default = FALSE,
+                                registry_scope = %s, registry_note = %s,
+                                archived_at = %s, updated_at = %s
+                            WHERE model_id = %s AND version = %s
+                            """,
+                            (scope, clean_note, now, now, model_id, int(version)),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE model_inference_schedules
+                            SET enabled = FALSE, updated_at = %s
+                            WHERE model_id = %s AND model_version = %s
+                            """,
+                            (now, model_id, int(version)),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE model_strategy_deployments
+                            SET state = 'paused', updated_at = %s
+                            WHERE model_id = %s AND model_version = %s
+                              AND state = 'active'
+                            """,
+                            (now, model_id, int(version)),
+                        )
+                elif normalized_action == "restore":
+                    if current_state == "archived":
+                        conn.execute(
+                            """
+                            UPDATE model_versions
+                            SET state = %s, is_default = FALSE,
+                                registry_scope = %s, registry_note = %s,
+                                archived_at = NULL, updated_at = %s
+                            WHERE model_id = %s AND version = %s
+                            """,
+                            (
+                                "validated" if validation_approved else "candidate",
+                                scope, clean_note, now, model_id, int(version),
+                            ),
+                        )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE model_versions
+                        SET registry_scope = %s, registry_note = %s, updated_at = %s
+                        WHERE model_id = %s AND version = %s
+                        """,
+                        (scope, clean_note, now, model_id, int(version)),
+                    )
+                self._event(
+                    conn,
+                    str(current["job_id"]),
+                    "model.registry_updated",
+                    stage="registry",
+                    message=normalized_action,
+                    payload={
+                        "model_id": model_id,
+                        "model_version": int(version),
+                        "action": normalized_action,
+                        "registry_scope": scope,
+                        "validation_approved": bool(validation_approved),
+                    },
+                )
+        return self.get_model(model_id, version)
+
+    def create_model_architecture(
+        self, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        engines = payload.get("engines")
+        if not isinstance(engines, list):
+            raise ModelResearchError("模型架构engines必须是数组")
+        models = [
+            self.get_model(
+                str((item or {}).get("model_id") or ""),
+                int((item or {}).get("model_version") or (item or {}).get("version") or 0),
+            )
+            for item in engines
+        ]
+        spec = _architecture_spec(payload, models)
+        architecture_id = _clean_identifier(
+            str(payload.get("architecture_id") or ""),
+            default=f"architecture_{uuid4().hex[:16]}",
+        )
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    INSERT INTO model_architectures(
+                        architecture_id, name, description, state, revision,
+                        universe_id, merge_method, top_n, rebalance_every,
+                        config_json, created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'draft', 1, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        architecture_id, spec["name"], spec["description"],
+                        spec["universe_id"], spec["merge_method"], spec["top_n"],
+                        spec["rebalance_every"], Jsonb(spec), now, now,
+                    ),
+                )
+                self._replace_architecture_engines(
+                    conn, architecture_id, spec["engines"], now,
+                )
+        return self.get_model_architecture(architecture_id)
+
+    def list_model_architectures(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT architecture_id
+                FROM model_architectures
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [
+            self.get_model_architecture(str(row["architecture_id"]))
+            for row in rows
+        ]
+
+    def get_model_architecture(self, architecture_id: str) -> dict[str, Any]:
+        with self.database.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM model_architectures WHERE architecture_id = %s",
+                (architecture_id,),
+            ).fetchone()
+        if not row:
+            raise ModelResearchNotFound("模型架构不存在")
+        config = dict(row.get("config_json") or {})
+        current_models: list[dict[str, Any]] = []
+        for engine in config.get("engines") or []:
+            try:
+                current_models.append(self.get_model(
+                    str(engine.get("model_id") or ""),
+                    int(engine.get("model_version") or 0),
+                ))
+            except ModelResearchNotFound:
+                continue
+        result = {
+            **config,
+            "architecture_id": str(row["architecture_id"]),
+            "state": str(row["state"]),
+            "revision": int(row["revision"]),
+            "activated_at": row.get("activated_at"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        result["readiness"] = _architecture_readiness(config, current_models)
+        return _json_ready_mapping(result)
+
+    def update_model_architecture(
+        self, architecture_id: str, payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        engines = payload.get("engines")
+        if not isinstance(engines, list):
+            raise ModelResearchError("模型架构engines必须是数组")
+        models = [
+            self.get_model(
+                str((item or {}).get("model_id") or ""),
+                int((item or {}).get("model_version") or (item or {}).get("version") or 0),
+            )
+            for item in engines
+        ]
+        spec = _architecture_spec(payload, models)
+        expected_revision = int(payload.get("revision") or 0)
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_architectures WHERE architecture_id = %s FOR UPDATE",
+                    (architecture_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型架构不存在")
+                if str(row["state"]) != "draft":
+                    raise ModelResearchConflict("只有草稿架构可以修改；已激活版本必须新建架构")
+                if expected_revision and expected_revision != int(row["revision"]):
+                    raise ModelResearchConflict("模型架构已被其他请求修改，请刷新后重试")
+                revision = int(row["revision"]) + 1
+                conn.execute(
+                    """
+                    UPDATE model_architectures
+                    SET name = %s, description = %s, revision = %s,
+                        universe_id = %s, merge_method = %s, top_n = %s,
+                        rebalance_every = %s, config_json = %s, updated_at = %s
+                    WHERE architecture_id = %s
+                    """,
+                    (
+                        spec["name"], spec["description"], revision,
+                        spec["universe_id"], spec["merge_method"], spec["top_n"],
+                        spec["rebalance_every"], Jsonb(spec), now, architecture_id,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM model_architecture_engines WHERE architecture_id = %s",
+                    (architecture_id,),
+                )
+                self._replace_architecture_engines(
+                    conn, architecture_id, spec["engines"], now,
+                )
+        return self.get_model_architecture(architecture_id)
+
+    def activate_model_architecture(self, architecture_id: str) -> dict[str, Any]:
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_architectures WHERE architecture_id = %s FOR UPDATE",
+                    (architecture_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型架构不存在")
+                if str(row["state"]) != "draft":
+                    raise ModelResearchConflict("只有草稿架构可以激活")
+                config = dict(row.get("config_json") or {})
+                engine_rows = conn.execute(
+                    """
+                    SELECT engines.model_id, engines.model_version,
+                           versions.state, versions.prediction_json
+                    FROM model_architecture_engines engines
+                    JOIN model_versions versions
+                      ON versions.model_id = engines.model_id
+                     AND versions.version = engines.model_version
+                    WHERE engines.architecture_id = %s AND engines.enabled = TRUE
+                    ORDER BY engines.priority, engines.engine_key
+                    """,
+                    (architecture_id,),
+                ).fetchall()
+                readiness = _architecture_readiness(config, [dict(item) for item in engine_rows])
+                if readiness["ready"] is not True:
+                    failed = [
+                        str(item["label"])
+                        for item in readiness["checks"] if item["passed"] is not True
+                    ]
+                    raise ModelResearchConflict("模型架构尚不可激活：" + "、".join(failed))
+                conn.execute(
+                    """
+                    UPDATE model_architectures
+                    SET state = 'active', activated_at = %s, updated_at = %s
+                    WHERE architecture_id = %s
+                    """,
+                    (now, now, architecture_id),
+                )
+        return self.get_model_architecture(architecture_id)
+
+    def archive_model_architecture(self, architecture_id: str) -> dict[str, Any]:
+        now = _utcnow()
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE model_architectures
+                SET state = 'archived', updated_at = %s
+                WHERE architecture_id = %s AND state <> 'archived'
+                RETURNING architecture_id
+                """,
+                (now, architecture_id),
+            ).fetchone()
+        if not row:
+            raise ModelResearchNotFound("模型架构不存在或已归档")
+        return self.get_model_architecture(architecture_id)
+
+    @staticmethod
+    def _replace_architecture_engines(
+        conn: Any, architecture_id: str, engines: list[Mapping[str, Any]],
+        now: datetime,
+    ) -> None:
+        for engine in engines:
+            conn.execute(
+                """
+                INSERT INTO model_architecture_engines(
+                    architecture_id, engine_key, display_name, role,
+                    model_id, model_version, priority, enabled, weight,
+                    score_threshold, top_n, snapshot_json, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    architecture_id, engine["engine_key"], engine["display_name"],
+                    engine["role"], engine["model_id"], engine["model_version"],
+                    engine["priority"], engine["enabled"], engine["weight"],
+                    engine["score_threshold"], engine["top_n"], Jsonb(dict(engine)),
+                    now, now,
+                ),
+            )
 
     def record_validation_result(
         self,
@@ -677,7 +1906,7 @@ class ModelResearchRepository:
                 row = conn.execute(
                     """
                     UPDATE model_versions
-                    SET state = %s,
+                    SET state = CASE WHEN state = 'archived' THEN state ELSE %s END,
                         manifest_json = jsonb_set(
                             COALESCE(manifest_json, '{}'::jsonb),
                             '{validation}', %s, TRUE
@@ -700,7 +1929,7 @@ class ModelResearchRepository:
                     """,
                     (factor_backtest_job_id, now, row["job_id"]),
                 )
-                if approved:
+                if approved and str(row.get("state") or "") != "archived":
                     conn.execute(
                         """
                         INSERT INTO model_inference_schedules(
@@ -748,7 +1977,11 @@ class ModelResearchRepository:
             rows = conn.execute(
                 """
                 SELECT schedules.*, versions.name, versions.model_kind, versions.state,
-                       versions.prediction_json, specs.spec_json AS dataset_spec
+                       versions.is_default,
+                       versions.metrics_json, versions.prediction_json,
+                       versions.manifest_json,
+                       specs.spec_hash AS dataset_hash,
+                       specs.spec_json AS dataset_spec
                 FROM model_inference_schedules schedules
                 JOIN model_versions versions
                   ON versions.model_id = schedules.model_id
@@ -950,6 +2183,1323 @@ class ModelResearchRepository:
         )
 
 
+def _horizon_search_values(search_source: Mapping[str, Any]) -> list[int]:
+    values = search_source.get("horizons")
+    if not isinstance(values, list) or not 2 <= len(values) <= 4:
+        raise ModelResearchError("多周期研究必须选择2到4个标签周期")
+    horizons: list[int] = []
+    for value in values:
+        try:
+            horizon = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError("标签周期只支持T+1、T+3、T+5或T+10") from exc
+        if horizon not in {1, 3, 5, 10}:
+            raise ModelResearchError("标签周期只支持T+1、T+3、T+5或T+10")
+        if horizon not in horizons:
+            horizons.append(horizon)
+    if len(horizons) < 2:
+        raise ModelResearchError("多周期研究至少需要两个不同标签周期")
+    return sorted(horizons)
+
+
+def _factor_ablation_trials(
+    dataset_source: Mapping[str, Any], search_source: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Freeze one baseline and one single-factor removal per requested factor.
+
+    The variants intentionally keep model parameters fixed. Selection remains
+    validation-only; any enabled Walk-Forward report is a later eligibility gate,
+    never the ranking signal for choosing an ablation winner.
+    """
+    dataset = _dataset_spec(dataset_source)
+    factors = list(dataset.get("factors") or [])
+    if len(factors) < 2:
+        raise ModelResearchError("因子消融实验至少需要两个冻结因子")
+    values = search_source.get("factor_ids")
+    if not isinstance(values, list) or not 1 <= len(values) <= 8:
+        raise ModelResearchError("因子消融实验必须选择1到8个待检验因子")
+    available = {str(item.get("factor_id") or "") for item in factors}
+    factor_ids: list[str] = []
+    for value in values:
+        factor_id = str(value or "").strip()
+        if not factor_id or factor_id not in available:
+            raise ModelResearchError(f"待消融因子不存在于冻结数据集: {factor_id or value}")
+        if factor_id not in factor_ids:
+            factor_ids.append(factor_id)
+    if not factor_ids:
+        raise ModelResearchError("因子消融实验至少需要一个不同的待检验因子")
+    max_trials = int(search_source.get("max_trials") or 9)
+    max_trials = max(2, min(max_trials, MAX_EXPERIMENT_TRIALS))
+    if len(factor_ids) + 1 > max_trials:
+        raise ModelResearchError(
+            f"消融方案共{len(factor_ids) + 1}组，超过本次上限{max_trials}组"
+        )
+    trials = [{
+        "dataset": dataset,
+        "search_params": {"removed_factor_id": "__baseline__"},
+    }]
+    for factor_id in factor_ids:
+        trials.append({
+            "dataset": _dataset_spec({
+                **dataset_source,
+                "factors": [
+                    item for item in factors
+                    if str(item.get("factor_id") or "") != factor_id
+                ],
+            }),
+            "search_params": {"removed_factor_id": factor_id},
+        })
+    return trials
+
+
+def _grid_search_trials(
+    model_source: Mapping[str, Any], search_source: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    kind = str(model_source.get("kind") or "lightgbm").strip().lower()
+    base = _model_spec(model_source)
+    strategy = str(search_source.get("strategy") or "grid").strip().lower()
+    if strategy != "grid":
+        raise ModelResearchError("首版参数搜索只支持grid")
+    parameters = search_source.get("parameters")
+    if not isinstance(parameters, Mapping) or not parameters:
+        raise ModelResearchError("参数实验至少需要一个搜索参数")
+    unsupported = set(parameters) - SEARCHABLE_MODEL_PARAMS.get(kind, frozenset())
+    if unsupported:
+        raise ModelResearchError(
+            f"{kind}不允许搜索参数: {', '.join(sorted(unsupported))}"
+        )
+    if len(parameters) > 4:
+        raise ModelResearchError("一次参数实验最多搜索4个维度")
+    keys = sorted(str(key) for key in parameters)
+    value_sets: list[list[Any]] = []
+    for key in keys:
+        values = parameters[key]
+        if not isinstance(values, list) or not 1 <= len(values) <= 8:
+            raise ModelResearchError(f"搜索参数{key}必须包含1到8个候选值")
+        unique: list[Any] = []
+        fingerprints: set[str] = set()
+        for value in values:
+            fingerprint = _canonical_json(value)
+            if fingerprint not in fingerprints:
+                fingerprints.add(fingerprint)
+                unique.append(value)
+        value_sets.append(unique)
+    trial_count = 1
+    for values in value_sets:
+        trial_count *= len(values)
+    max_trials = int(search_source.get("max_trials") or MAX_EXPERIMENT_TRIALS)
+    max_trials = max(1, min(max_trials, MAX_EXPERIMENT_TRIALS))
+    if trial_count > max_trials:
+        raise ModelResearchError(
+            f"参数组合共{trial_count}组，超过本次上限{max_trials}组"
+        )
+    trials: list[dict[str, Any]] = []
+    for values in product(*value_sets):
+        overrides = dict(zip(keys, values, strict=True))
+        normalized = _model_spec({
+            "kind": kind,
+            "params": {**base["params"], **overrides},
+        })
+        trials.append(dict(normalized["params"]))
+    return trials
+
+
+def _experiment_ref(source: Mapping[str, Any]) -> dict[str, Any]:
+    if not source:
+        return {}
+    experiment_id = _required_identifier(
+        str(source.get("experiment_id") or ""), "experiment_id",
+    )
+    trial_index = int(source.get("trial_index") or 0)
+    trial_count = int(source.get("trial_count") or 0)
+    if not 1 <= trial_index <= trial_count <= MAX_EXPERIMENT_TRIALS:
+        raise ModelResearchError("参数实验试验序号无效")
+    search_params = source.get("search_params")
+    if not isinstance(search_params, Mapping) or not search_params:
+        raise ModelResearchError("参数实验缺少search_params")
+    strategy = str(source.get("strategy") or "grid").strip().lower()
+    if strategy not in {"grid", "horizon_grid", "factor_ablation"}:
+        raise ModelResearchError(
+            "实验策略只支持grid、horizon_grid或factor_ablation"
+        )
+    parent_experiment_id = str(source.get("parent_experiment_id") or "").strip()
+    parent_job_id = str(source.get("parent_job_id") or "").strip()
+    if parent_experiment_id:
+        parent_experiment_id = _required_identifier(
+            parent_experiment_id, "parent_experiment_id",
+        )
+    if parent_job_id:
+        parent_job_id = _required_identifier(parent_job_id, "parent_job_id")
+    iteration = int(source.get("iteration") or (2 if parent_experiment_id else 1))
+    if not 1 <= iteration <= MAX_EXPERIMENT_ITERATIONS:
+        raise ModelResearchError(
+            f"实验迭代轮次必须在1到{MAX_EXPERIMENT_ITERATIONS}之间"
+        )
+    lineage_prior_trial_count = int(source.get("lineage_prior_trial_count") or 0)
+    lineage_trial_budget = int(
+        source.get("lineage_trial_budget") or MAX_LINEAGE_TRIALS
+    )
+    lineage_iteration_budget = int(
+        source.get("lineage_iteration_budget") or MAX_EXPERIMENT_ITERATIONS
+    )
+    if not 0 <= lineage_prior_trial_count <= MAX_LINEAGE_TRIALS:
+        raise ModelResearchError("实验谱系历史试验数量无效")
+    if lineage_trial_budget != MAX_LINEAGE_TRIALS:
+        raise ModelResearchError("实验谱系试验预算无效")
+    if lineage_iteration_budget != MAX_EXPERIMENT_ITERATIONS:
+        raise ModelResearchError("实验谱系轮次预算无效")
+    return {
+        "experiment_id": experiment_id,
+        "title": str(source.get("title") or "参数实验")[:160],
+        "strategy": strategy,
+        "parent_experiment_id": parent_experiment_id,
+        "parent_job_id": parent_job_id,
+        "iteration": iteration,
+        "lineage_prior_trial_count": lineage_prior_trial_count,
+        "lineage_trial_budget": lineage_trial_budget,
+        "lineage_iteration_budget": lineage_iteration_budget,
+        "trial_index": trial_index,
+        "trial_count": trial_count,
+        "search_params": dict(search_params),
+        "auto_dispatch": source.get("auto_dispatch") is True,
+    }
+
+
+def _experiment_summary(
+    experiment_id: str, jobs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    statuses: dict[str, int] = {}
+    for job in jobs:
+        status = str(job.get("status") or "unknown")
+        statuses[status] = statuses.get(status, 0) + 1
+    first_experiment = dict(
+        (jobs[0].get("config_json") or {}).get("experiment") or {}
+    ) if jobs else {}
+    first_job = jobs[0] if jobs else {}
+    first_dataset = dict(first_job.get("dataset_spec") or {})
+    search_parameters = sorted({
+        str(key)
+        for job in jobs
+        for key in dict(
+            ((job.get("config_json") or {}).get("experiment") or {}).get(
+                "search_params"
+            ) or {}
+        )
+    })
+    completed_count = sum(
+        count for status, count in statuses.items() if status in TERMINAL_STATUSES
+    )
+    strategy = str(first_experiment.get("strategy") or "grid")
+    selection = select_parameter_trial(
+        jobs, complete=bool(jobs) and completed_count == len(jobs),
+    )
+    if strategy == "horizon_grid":
+        selection = {
+            **selection,
+            "policy": "alphablocks.horizon-selection.v1",
+            "selection_unit": "label_horizon_trading_days",
+        }
+    elif strategy == "factor_ablation":
+        selection = {
+            **selection,
+            "policy": "alphablocks.factor-ablation-selection.v1",
+            "selection_unit": "removed_factor_id",
+        }
+    dataset_hashes = sorted({
+        str(job.get("dataset_hash") or "") for job in jobs
+        if str(job.get("dataset_hash") or "")
+    })
+    label_horizons = sorted({
+        int(dict(job.get("dataset_spec") or {}).get("label", {}).get(
+            "horizon_trading_days"
+        ) or 5)
+        for job in jobs
+    })
+    lineage_prior_trial_count = int(
+        first_experiment.get("lineage_prior_trial_count") or 0
+    )
+    lineage_trial_budget = int(
+        first_experiment.get("lineage_trial_budget") or MAX_LINEAGE_TRIALS
+    )
+    lineage_iteration_budget = int(
+        first_experiment.get("lineage_iteration_budget")
+        or MAX_EXPERIMENT_ITERATIONS
+    )
+    lineage_trial_count = lineage_prior_trial_count + len(jobs)
+    return {
+        "experiment_id": experiment_id,
+        "title": str(first_experiment.get("title") or "参数实验"),
+        "strategy": strategy,
+        "parent_experiment_id": str(
+            first_experiment.get("parent_experiment_id") or ""
+        ),
+        "parent_job_id": str(first_experiment.get("parent_job_id") or ""),
+        "iteration": int(first_experiment.get("iteration") or 1),
+        "lineage_prior_trial_count": lineage_prior_trial_count,
+        "lineage_trial_count": lineage_trial_count,
+        "lineage_trial_budget": lineage_trial_budget,
+        "lineage_trial_remaining": max(0, lineage_trial_budget - lineage_trial_count),
+        "lineage_iteration_budget": lineage_iteration_budget,
+        "can_iterate": (
+            int(first_experiment.get("iteration") or 1) < lineage_iteration_budget
+            and lineage_trial_count + 2 <= lineage_trial_budget
+        ),
+        "model_id": str(first_job.get("model_id") or ""),
+        "model_kind": str(first_job.get("model_kind") or ""),
+        "dataset_hash": dataset_hashes[0] if len(dataset_hashes) == 1 else "",
+        "dataset_hashes": dataset_hashes,
+        "dataset_count": len(dataset_hashes),
+        "shared_dataset": len(dataset_hashes) == 1,
+        "label_horizons": label_horizons,
+        "date_start": str(first_dataset.get("date_start") or ""),
+        "date_end": str(first_dataset.get("date_end") or ""),
+        "factor_count": len(first_dataset.get("factors") or []),
+        "search_parameters": search_parameters,
+        "created_at": min(
+            (str(job.get("requested_at") or "") for job in jobs), default="",
+        ),
+        "updated_at": max(
+            (str(job.get("updated_at") or "") for job in jobs), default="",
+        ),
+        "trial_count": len(jobs),
+        "statuses": statuses,
+        "completed_count": completed_count,
+        "selection": selection,
+        "comparison": _experiment_comparison(jobs, selection),
+        "jobs": jobs,
+    }
+
+
+def _experiment_comparison(
+    jobs: list[dict[str, Any]], selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a stable experiment comparison contract for the research UI.
+
+    Validation metrics are always visible because they drive parameter selection.
+    Test metrics remain hidden until every trial reaches a terminal state, preventing
+    users from informally choosing parameters by repeatedly looking at the test set.
+    """
+    complete = bool(selection.get("complete"))
+    assessments = {
+        str(item.get("job_id") or ""): dict(item)
+        for item in selection.get("trial_assessments") or []
+    }
+    rows = []
+    for job in sorted(
+        jobs,
+        key=lambda item: int(
+            ((item.get("config_json") or {}).get("experiment") or {}).get(
+                "trial_index"
+            ) or 0
+        ),
+    ):
+        experiment = dict(
+            (job.get("config_json") or {}).get("experiment") or {}
+        )
+        metrics = dict((job.get("result_json") or {}).get("metrics") or {})
+        validation = _comparison_metric_values(metrics.get("validation") or {})
+        test = _comparison_metric_values(metrics) if complete else None
+        job_id = str(job.get("job_id") or "")
+        assessment = assessments.get(job_id, {})
+        rows.append({
+            "job_id": job_id,
+            "model_id": str(job.get("model_id") or ""),
+            "model_version": int(job.get("model_version") or 0),
+            "trial_index": int(experiment.get("trial_index") or 0),
+            "status": str(job.get("status") or "unknown"),
+            "search_params": dict(experiment.get("search_params") or {}),
+            "dataset_hash": str(job.get("dataset_hash") or ""),
+            "label_horizon_trading_days": int(
+                dict(job.get("dataset_spec") or {}).get("label", {}).get(
+                    "horizon_trading_days"
+                ) or 5
+            ),
+            "validation": validation,
+            "test": test,
+            "gate_passed": assessment.get("passed") is True,
+            "gate_checks": list(assessment.get("checks") or []),
+            "failed_checks": list(assessment.get("failed_checks") or []),
+            "is_selected": job_id == str(selection.get("selected_job_id") or ""),
+            "is_best_observed": job_id == str(
+                selection.get("best_observed_job_id") or ""
+            ),
+        })
+    summary = _experiment_metric_summary(rows)
+    return {
+        "schema_version": "alphablocks.experiment-comparison.v1",
+        "selection_split": "validation",
+        "selection_metric": "rank_ic",
+        "test_metrics_role": "report_only",
+        "test_metrics_disclosed": complete,
+        "summary": summary,
+        "parameter_effects": _experiment_parameter_effects(
+            rows, test_metrics_disclosed=complete,
+        ),
+        "trials": rows,
+    }
+
+
+def _comparison_metric_values(source: Mapping[str, Any]) -> dict[str, Any]:
+    values = dict(source or {})
+    return {
+        "days": values.get("days", values.get("test_days")),
+        "rows": values.get("rows", values.get("test_rows")),
+        "ic": values.get("ic"),
+        "rank_ic": values.get("rank_ic"),
+        "ic_ir": values.get("ic_ir"),
+        "rmse": values.get("rmse"),
+    }
+
+
+def _experiment_metric_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    validation_rank_ic = [
+        value for row in rows
+        if (value := _finite_number(
+            dict(row.get("validation") or {}).get("rank_ic")
+        )) is not None
+    ]
+    validation_ic_ir = [
+        value for row in rows
+        if (value := _finite_number(
+            dict(row.get("validation") or {}).get("ic_ir")
+        )) is not None
+    ]
+    qualified_count = sum(row.get("gate_passed") is True for row in rows)
+    return {
+        "trial_count": len(rows),
+        "evaluated_count": len(validation_rank_ic),
+        "qualified_count": qualified_count,
+        "qualified_ratio": (
+            qualified_count / len(rows) if rows else 0.0
+        ),
+        "validation_rank_ic": _number_distribution(validation_rank_ic),
+        "validation_ic_ir": _number_distribution(validation_ic_ir),
+    }
+
+
+def _experiment_parameter_effects(
+    rows: list[Mapping[str, Any]], *, test_metrics_disclosed: bool,
+) -> list[dict[str, Any]]:
+    parameter_names = sorted({
+        str(name)
+        for row in rows
+        for name in dict(row.get("search_params") or {})
+    })
+    effects: list[dict[str, Any]] = []
+    for parameter_name in parameter_names:
+        groups: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            params = dict(row.get("search_params") or {})
+            if parameter_name not in params:
+                continue
+            value = params[parameter_name]
+            fingerprint = _canonical_json(value)
+            group = groups.setdefault(fingerprint, {
+                "value": value,
+                "value_label": fingerprint,
+                "trial_count": 0,
+                "evaluated_count": 0,
+                "qualified_count": 0,
+                "validation_rank_ic_values": [],
+                "validation_ic_ir_values": [],
+                "test_rank_ic_values": [],
+            })
+            group["trial_count"] += 1
+            validation = dict(row.get("validation") or {})
+            rank_ic = _finite_number(validation.get("rank_ic"))
+            ic_ir = _finite_number(validation.get("ic_ir"))
+            if rank_ic is not None:
+                group["evaluated_count"] += 1
+                group["validation_rank_ic_values"].append(rank_ic)
+            if ic_ir is not None:
+                group["validation_ic_ir_values"].append(ic_ir)
+            if row.get("gate_passed") is True:
+                group["qualified_count"] += 1
+            if test_metrics_disclosed:
+                test_rank_ic = _finite_number(
+                    dict(row.get("test") or {}).get("rank_ic")
+                )
+                if test_rank_ic is not None:
+                    group["test_rank_ic_values"].append(test_rank_ic)
+
+        values = []
+        for fingerprint in sorted(groups):
+            group = groups[fingerprint]
+            validation_distribution = _number_distribution(
+                group.pop("validation_rank_ic_values")
+            )
+            ic_ir_distribution = _number_distribution(
+                group.pop("validation_ic_ir_values")
+            )
+            test_distribution = _number_distribution(
+                group.pop("test_rank_ic_values")
+            ) if test_metrics_disclosed else None
+            values.append({
+                **group,
+                "qualified_ratio": (
+                    group["qualified_count"] / group["trial_count"]
+                    if group["trial_count"] else 0.0
+                ),
+                "validation_rank_ic": validation_distribution,
+                "validation_ic_ir": ic_ir_distribution,
+                "test_rank_ic": test_distribution,
+            })
+        eligible = [
+            item for item in values
+            if item["validation_rank_ic"]["mean"] is not None
+        ]
+        best = max(
+            eligible,
+            key=lambda item: item["validation_rank_ic"]["mean"],
+            default=None,
+        )
+        for item in values:
+            item["is_best_validation"] = (
+                best is not None and item["value_label"] == best["value_label"]
+            )
+        means = [
+            item["validation_rank_ic"]["mean"] for item in eligible
+        ]
+        effects.append({
+            "parameter": parameter_name,
+            "value_count": len(values),
+            "best_value": best["value"] if best is not None else None,
+            "best_value_label": best["value_label"] if best is not None else "",
+            "validation_rank_ic_spread": (
+                max(means) - min(means) if len(means) >= 2 else 0.0
+            ),
+            "values": values,
+        })
+    return effects
+
+
+def _number_distribution(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return {
+        "count": len(values),
+        "mean": mean,
+        "std": math.sqrt(variance),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _model_prediction_range(
+    model: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    prediction = dict(model.get("prediction_json") or {})
+    starts = [
+        str(value)[:10] for value in [prediction.get("date_start")]
+        if value and len(str(value)) >= 10
+    ]
+    ends = [
+        str(value)[:10] for value in [
+            prediction.get("date_end"), prediction.get("latest_trade_date"),
+            prediction.get("last_inference_trade_date"),
+        ]
+        if value and len(str(value)) >= 10
+    ]
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def _compact_walk_forward(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(manifest.get("walk_forward") or {})
+    if source.get("enabled") is not True:
+        return {"enabled": False, "window_count": 0, "windows": []}
+    windows: list[dict[str, Any]] = []
+    for position, item in enumerate(source.get("windows") or [], start=1):
+        window = dict(item or {})
+        test = list((window.get("segments") or {}).get("test") or [])
+        if len(test) != 2:
+            continue
+        metrics = dict(window.get("metrics") or {})
+        windows.append({
+            "window": int(window.get("window") or position),
+            "test_start": str(test[0])[:10],
+            "test_end": str(test[1])[:10],
+            "rank_ic": _finite_number(metrics.get("rank_ic", metrics.get("ic"))),
+            "ic_ir": _finite_number(metrics.get("ic_ir")),
+            "test_days": int(metrics.get("test_days") or 0),
+        })
+    return {
+        "enabled": True,
+        "strategy": str(source.get("strategy") or "rolling"),
+        "window_count": len(windows),
+        "windows": windows,
+        "stability_status": str((source.get("stability") or {}).get("status") or ""),
+    }
+
+
+def _architecture_walk_forward_contract(
+    engines: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    enabled = [dict(item) for item in engines if item.get("enabled") is True]
+    all_enabled = bool(enabled) and all(
+        (item.get("walk_forward") or {}).get("enabled") is True
+        for item in enabled
+    )
+    signatures = [
+        tuple(
+            (
+                str(window.get("test_start") or ""),
+                str(window.get("test_end") or ""),
+            )
+            for window in (item.get("walk_forward") or {}).get("windows") or []
+        )
+        for item in enabled
+    ]
+    aligned = (
+        all_enabled and bool(signatures) and bool(signatures[0])
+        and len(set(signatures)) == 1
+    )
+    if not all_enabled:
+        reason = "至少一个启用引擎不是Walk-Forward模型"
+    elif not aligned:
+        reason = "启用引擎的Walk-Forward测试窗口不一致"
+    else:
+        reason = ""
+    return {
+        "eligible": aligned,
+        "source_count": len(enabled),
+        "window_count": len(signatures[0]) if aligned else 0,
+        "strategy": str(
+            ((enabled[0].get("walk_forward") or {}).get("strategy") or "rolling")
+        ) if enabled else "rolling",
+        "windows": [
+            {"window": index, "test_start": start, "test_end": end}
+            for index, (start, end) in enumerate(signatures[0], start=1)
+        ] if aligned else [],
+        "reason": reason,
+        "policy": "alphablocks.architecture-walk-forward.v1",
+    }
+
+
+def _architecture_spec(
+    payload: Mapping[str, Any], source_models: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    engine_payloads = payload.get("engines")
+    if not isinstance(engine_payloads, list) or not 1 <= len(engine_payloads) <= 8:
+        raise ModelResearchError("模型架构必须包含1到8个引擎槽位")
+    if len(source_models) != len(engine_payloads):
+        raise ModelResearchError("模型架构的模型版本信息不完整")
+    name = str(payload.get("name") or "").strip()[:160]
+    if not name:
+        raise ModelResearchError("模型架构名称不能为空")
+    merge_method = str(payload.get("merge_method") or "priority").strip().lower()
+    if merge_method not in {"priority", "weighted_score", "union"}:
+        raise ModelResearchError("架构合并方式只支持priority、weighted_score或union")
+    pipeline_mode = str(payload.get("pipeline_mode") or "flat").strip().lower()
+    if pipeline_mode not in {"flat", "hierarchical"}:
+        raise ModelResearchError("架构流程只支持flat或hierarchical")
+    top_n = int(payload.get("top_n") or 20)
+    rebalance_every = int(payload.get("rebalance_every") or 5)
+    if not 1 <= top_n <= 100:
+        raise ModelResearchError("架构TopN必须在1到100之间")
+    if not 1 <= rebalance_every <= 60:
+        raise ModelResearchError("架构调仓周期必须在1到60个交易日之间")
+
+    seen_keys: set[str] = set()
+    seen_models: set[tuple[str, int]] = set()
+    priorities: list[int] = []
+    universe_ids: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, (source, model) in enumerate(
+        zip(engine_payloads, source_models, strict=True), start=1,
+    ):
+        if not isinstance(source, Mapping):
+            raise ModelResearchError(f"第{index}个引擎槽位格式无效")
+        model_id = str(model.get("model_id") or "").strip()
+        model_version = int(model.get("version") or 0)
+        expected = (
+            str(source.get("model_id") or "").strip(),
+            int(source.get("model_version") or source.get("version") or 0),
+        )
+        if (model_id, model_version) != expected:
+            raise ModelResearchConflict("引擎引用的模型版本在读取过程中发生变化")
+        model_key = (model_id, model_version)
+        if model_key in seen_models:
+            raise ModelResearchError("同一模型版本不能重复加入一个架构")
+        seen_models.add(model_key)
+        engine_key = _clean_identifier(
+            str(source.get("engine_key") or ""), default=f"engine_{index}",
+        )
+        if engine_key in seen_keys:
+            raise ModelResearchError("引擎标识不能重复")
+        seen_keys.add(engine_key)
+        priority = int(source.get("priority") or index)
+        if not 1 <= priority <= 100:
+            raise ModelResearchError("引擎优先级必须在1到100之间")
+        priorities.append(priority)
+        weight = _finite_number(source.get("weight", 1.0))
+        if weight is None or weight <= 0:
+            raise ModelResearchError("引擎权重必须大于0")
+        threshold = _finite_number(source.get("score_threshold", 0.0))
+        if threshold is None or not -1.0 <= threshold <= 1.0:
+            raise ModelResearchError("引擎Score阈值必须在-1到1之间")
+        engine_top_n = int(source.get("top_n") or top_n)
+        if not 1 <= engine_top_n <= 100:
+            raise ModelResearchError("引擎TopN必须在1到100之间")
+        role = str(source.get("role") or "stock_selection").strip().lower()
+        if not role or len(role) > 64:
+            raise ModelResearchError(f"第{index}个引擎职责无效")
+        dataset = dict(model.get("dataset_spec") or {})
+        universe_id = str(dataset.get("universe_id") or "").strip()
+        if not universe_id:
+            raise ModelResearchError("模型版本缺少冻结股票池")
+        universe_ids.add(universe_id)
+        factors = list(dataset.get("factors") or [])
+        research_target = str(
+            dataset.get("research_target") or "stock_selection"
+        ).strip().lower()
+        expected_target = {
+            "market_style": "market_style",
+            "industry_rotation": "industry_rotation",
+        }.get(role, "stock_selection")
+        if research_target != expected_target:
+            raise ModelResearchError(
+                f"引擎{engine_key}职责{role}与模型训练目标{research_target}不匹配"
+            )
+        categories = sorted({
+            str((factor or {}).get("category") or "custom") for factor in factors
+        })
+        manifest = dict(model.get("manifest_json") or {})
+        prediction = dict(model.get("prediction_json") or {})
+        prediction_range = _model_prediction_range(model)
+        stage = {
+            "market_style": "style_gate",
+            "industry_rotation": "industry_gate",
+            "risk_filter": "risk_gate",
+        }.get(role, "stock_rank")
+        normalized.append({
+            "engine_key": engine_key,
+            "display_name": str(
+                source.get("display_name") or source.get("name")
+                or model.get("name") or f"引擎{index}"
+            ).strip()[:120],
+            "role": role,
+            "stage": stage,
+            "model_id": model_id,
+            "model_version": model_version,
+            "model_name": str(model.get("name") or model_id),
+            "model_kind": str(model.get("model_kind") or ""),
+            "dataset_hash": str(model.get("dataset_hash") or ""),
+            "universe_id": universe_id,
+            "research_target": research_target,
+            "prediction_scope": str(
+                dataset.get("prediction_scope")
+                or (
+                    "market_style" if research_target == "market_style"
+                    else "industry" if research_target == "industry_rotation"
+                    else "stock"
+                )
+            ),
+            "label_horizon_trading_days": int(
+                (dataset.get("label") or {}).get("horizon_trading_days") or 5
+            ),
+            "factor_count": len(factors),
+            "factor_ids": [str((factor or {}).get("factor_id") or "") for factor in factors],
+            "factor_categories": categories,
+            "architecture": dict(manifest.get("model_params") or {}),
+            "walk_forward": _compact_walk_forward(manifest),
+            "registry_state": str(model.get("state") or "candidate"),
+            "prediction_rows": int(prediction.get("row_count") or 0),
+            "prediction_date_start": prediction_range[0] if prediction_range else "",
+            "prediction_date_end": prediction_range[1] if prediction_range else "",
+            "priority": priority,
+            "enabled": bool(source.get("enabled", True)),
+            "weight": float(weight),
+            "score_threshold": float(threshold),
+            "top_n": engine_top_n,
+        })
+    if len(universe_ids) != 1:
+        raise ModelResearchError("同一架构的模型必须使用相同冻结股票池")
+    priority_engines = (
+        normalized if pipeline_mode == "flat"
+        else [item for item in normalized if item["stage"] == "stock_rank"]
+    )
+    merge_priorities = [item["priority"] for item in priority_engines]
+    if (
+        merge_method == "priority"
+        and len(merge_priorities) != len(set(merge_priorities))
+    ):
+        raise ModelResearchError("优先级合并模式要求每个个股引擎使用不同优先级")
+    enabled = [item for item in normalized if item["enabled"]]
+    if pipeline_mode == "hierarchical":
+        stage_counts = {
+            stage: sum(item["stage"] == stage for item in enabled)
+            for stage in ("style_gate", "industry_gate", "stock_rank")
+        }
+        if stage_counts["style_gate"] != 1:
+            raise ModelResearchError("三级门控架构必须且只能启用1个市场风格引擎")
+        if stage_counts["industry_gate"] < 1:
+            raise ModelResearchError("三级门控架构至少需要1个行业轮动引擎")
+        if stage_counts["stock_rank"] < 1:
+            raise ModelResearchError("三级门控架构至少需要1个个股选股引擎")
+    weighted_engines = [
+        item for item in normalized
+        if item["enabled"]
+        and (pipeline_mode == "flat" or item["stage"] == "stock_rank")
+    ]
+    enabled_weights = sum(item["weight"] for item in weighted_engines)
+    for item in normalized:
+        item["normalized_weight"] = (
+            item["weight"] / enabled_weights
+            if item in weighted_engines and enabled_weights > 0 else 0.0
+        )
+    normalized.sort(key=lambda item: (item["priority"], item["engine_key"]))
+    fingerprint = sha256(_canonical_json({
+        "schema_version": "alphablocks.model-architecture.v2",
+        "universe_id": next(iter(universe_ids)),
+        "pipeline_mode": pipeline_mode,
+        "merge_method": merge_method,
+        "top_n": top_n,
+        "rebalance_every": rebalance_every,
+        "engines": [{
+            key: item[key] for key in (
+                "engine_key", "role", "stage", "model_id", "model_version", "dataset_hash",
+                "priority", "enabled", "normalized_weight", "score_threshold", "top_n",
+            )
+        } for item in normalized],
+    }).encode("utf-8")).hexdigest()
+    return {
+        "schema_version": "alphablocks.model-architecture.v2",
+        "name": name,
+        "description": str(payload.get("description") or "").strip()[:2000],
+        "universe_id": next(iter(universe_ids)),
+        "pipeline_mode": pipeline_mode,
+        "merge_method": merge_method,
+        "top_n": top_n,
+        "rebalance_every": rebalance_every,
+        "engine_count": len(normalized),
+        "enabled_engine_count": sum(item["enabled"] for item in normalized),
+        "engines": normalized,
+        "walk_forward": _architecture_walk_forward_contract(normalized),
+        "fingerprint": fingerprint,
+        "execution_contract": {
+            "signal_time": "trade_date_close",
+            "execution_time": "next_trade_date_open",
+            "score_field": "score",
+            "score_range": [-1.0, 1.0],
+            "engine_features": "locked_by_model_version",
+            "runtime_status": "research_backtest_ready",
+            "pipeline_mode": pipeline_mode,
+            "stage_order": (
+                ["style_gate", "industry_gate", "risk_gate", "stock_rank"]
+                if pipeline_mode == "hierarchical" else ["parallel_stock_rank"]
+            ),
+            "gate_semantics": (
+                "each_enabled_gate_must_cover_entity_and_score_at_or_above_threshold"
+                if pipeline_mode == "hierarchical" else "not_applicable"
+            ),
+        },
+    }
+
+
+def _architecture_readiness(
+    config: Mapping[str, Any], current_models: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    engines = [dict(item) for item in config.get("engines") or []]
+    enabled = [item for item in engines if item.get("enabled") is True]
+    current = {
+        (str(item.get("model_id") or ""), int(item.get("version") or item.get("model_version") or 0)): item
+        for item in current_models
+    }
+    references = [
+        (str(item.get("model_id") or ""), int(item.get("model_version") or 0))
+        for item in enabled
+    ]
+    present = [current.get(key) for key in references]
+    validated_count = sum(
+        item is not None and str(item.get("state") or "") == "validated"
+        for item in present
+    )
+    prediction_count = sum(
+        item is not None
+        and int((item.get("prediction_json") or {}).get("row_count") or 0) > 0
+        for item in present
+    )
+    ranges = [
+        _model_prediction_range(item) if item is not None else None
+        for item in present
+    ]
+    complete_ranges = [item for item in ranges if item is not None]
+    common_start = (
+        max(item[0] for item in complete_ranges)
+        if len(complete_ranges) == len(enabled) and enabled else ""
+    )
+    common_end = (
+        min(item[1] for item in complete_ranges)
+        if len(complete_ranges) == len(enabled) and enabled else ""
+    )
+    common_range_ready = bool(
+        enabled and common_start and common_end and common_start < common_end
+    )
+    pipeline_mode = str(config.get("pipeline_mode") or "flat")
+    stage_counts = {
+        stage: sum(str(item.get("stage") or "stock_rank") == stage for item in enabled)
+        for stage in ("style_gate", "industry_gate", "stock_rank")
+    }
+    topology_ready = (
+        pipeline_mode == "flat"
+        or (
+            pipeline_mode == "hierarchical"
+            and stage_counts["style_gate"] == 1
+            and stage_counts["industry_gate"] >= 1
+            and stage_counts["stock_rank"] >= 1
+        )
+    )
+    checks = [
+        {
+            "key": "enabled_engines", "label": "至少启用一个引擎",
+            "actual": len(enabled), "operator": ">=", "threshold": 1,
+            "passed": len(enabled) >= 1,
+        },
+        {
+            "key": "model_versions_present", "label": "模型版本完整",
+            "actual": sum(item is not None for item in present), "operator": "=",
+            "threshold": len(enabled),
+            "passed": bool(enabled) and all(item is not None for item in present),
+        },
+        {
+            "key": "models_validated", "label": "启用模型均已验证",
+            "actual": validated_count, "operator": "=", "threshold": len(enabled),
+            "passed": bool(enabled) and validated_count == len(enabled),
+        },
+        {
+            "key": "predictions_ready", "label": "启用模型均有样本外预测",
+            "actual": prediction_count, "operator": "=", "threshold": len(enabled),
+            "passed": bool(enabled) and prediction_count == len(enabled),
+        },
+        {
+            "key": "common_prediction_range",
+            "label": "样本外预测日期存在共同区间",
+            "actual": (
+                f"{common_start} 至 {common_end}"
+                if common_range_ready else "无可回测共同区间"
+            ),
+            "operator": "overlap", "threshold": "至少2个交易日",
+            "passed": common_range_ready,
+        },
+        {
+            "key": "single_universe", "label": "冻结股票池一致",
+            "actual": len({str(item.get("universe_id") or "") for item in enabled}),
+            "operator": "=", "threshold": 1,
+            "passed": bool(enabled) and len({
+                str(item.get("universe_id") or "") for item in enabled
+            }) == 1,
+        },
+        {
+            "key": "pipeline_topology", "label": "决策链角色完整",
+            "actual": (
+                "平行融合"
+                if pipeline_mode == "flat"
+                else (
+                    f"风格{stage_counts['style_gate']} / "
+                    f"行业{stage_counts['industry_gate']} / "
+                    f"个股{stage_counts['stock_rank']}"
+                )
+            ),
+            "operator": "valid", "threshold": (
+                "无角色约束" if pipeline_mode == "flat" else "1 / >=1 / >=1"
+            ),
+            "passed": topology_ready,
+        },
+    ]
+    failed = [item for item in checks if item["passed"] is not True]
+    research_check_keys = {
+        "enabled_engines", "model_versions_present", "predictions_ready",
+        "common_prediction_range", "single_universe", "pipeline_topology",
+    }
+    research_failed = [
+        item for item in checks
+        if item["key"] in research_check_keys and item["passed"] is not True
+    ]
+    research_ready = not research_failed
+    activation_ready = not failed
+    return {
+        "policy": "alphablocks.model-architecture-activation.v1",
+        "backtest_policy": "alphablocks.model-architecture-backtest.v1",
+        "ready": activation_ready,
+        "checks": checks,
+        "failed_checks": [item["key"] for item in failed],
+        "research_backtest_ready": research_ready,
+        "research_failed_checks": [item["key"] for item in research_failed],
+        "definition_only": False,
+        "pipeline_mode": pipeline_mode,
+        "stage_counts": stage_counts,
+        "runtime_message": (
+            "架构定义已就绪，可运行组合信号回测；仍未接入实盘"
+            if activation_ready
+            else (
+                "候选模型可运行组合研究回测；全部源模型验证后才能激活"
+                if research_ready
+                else "请先完成未通过的数据、预测日期与股票池检查"
+            )
+        ),
+    }
+
+
+def _ensemble_spec(
+    payload: Mapping[str, Any], source_models: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    source_payloads = payload.get("sources")
+    if not isinstance(source_payloads, list) or not 2 <= len(source_payloads) <= 8:
+        raise ModelResearchError("融合模型必须选择2到8个源模型版本")
+    if len(source_models) != len(source_payloads):
+        raise ModelResearchError("源模型信息不完整")
+    seen: set[tuple[str, int]] = set()
+    universe_ids: set[str] = set()
+    label_fingerprints: set[str] = set()
+    research_targets: set[str] = set()
+    prediction_scopes: set[str] = set()
+    factor_fingerprints: set[str] = set()
+    model_kinds: set[str] = set()
+    model_param_fingerprints: set[str] = set()
+    source_horizons: set[int] = set()
+    normalized_sources: list[dict[str, Any]] = []
+    for index, (source_payload, model) in enumerate(
+        zip(source_payloads, source_models, strict=True)
+    ):
+        if not isinstance(source_payload, Mapping):
+            raise ModelResearchError(f"第{index + 1}个源模型格式无效")
+        model_id = str(model.get("model_id") or "")
+        model_version = int(model.get("version") or 0)
+        expected_id = str(source_payload.get("model_id") or "")
+        expected_version = int(
+            source_payload.get("model_version") or source_payload.get("version") or 0
+        )
+        if (model_id, model_version) != (expected_id, expected_version):
+            raise ModelResearchConflict("源模型版本在读取过程中发生变化")
+        key = (model_id, model_version)
+        if key in seen:
+            raise ModelResearchError("不能重复选择同一个源模型版本")
+        if str(model.get("model_kind") or "") == "ensemble":
+            raise ModelResearchError("首版不支持嵌套融合模型")
+        seen.add(key)
+        dataset = dict(model.get("dataset_spec") or {})
+        universe_ids.add(str(dataset.get("universe_id") or ""))
+        label = dict(dataset.get("label") or {})
+        label_fingerprints.add(_canonical_json(label))
+        horizon = int(label.get("horizon_trading_days") or 5)
+        source_horizons.add(horizon)
+        research_targets.add(str(dataset.get("research_target") or "stock_selection"))
+        prediction_scopes.add(str(dataset.get("prediction_scope") or "stock"))
+        factor_fingerprints.add(_canonical_json([
+            {
+                "factor_id": str((factor or {}).get("factor_id") or ""),
+                "factor_version": int((factor or {}).get("factor_version") or 0),
+                "params_hash": str((factor or {}).get("params_hash") or ""),
+            }
+            for factor in dataset.get("factors") or []
+        ]))
+        model_kind = str(model.get("model_kind") or "")
+        model_kinds.add(model_kind)
+        job_config = dict(model.get("job_config_json") or model.get("config_json") or {})
+        model_param_fingerprints.add(_canonical_json(
+            dict((job_config.get("model") or {}).get("params") or {})
+        ))
+        validation = dict((model.get("metrics_json") or {}).get("validation") or {})
+        normalized_sources.append({
+            "model_id": model_id,
+            "model_version": model_version,
+            "name": str(model.get("name") or model_id),
+            "model_kind": model_kind,
+            "dataset_hash": str(model.get("dataset_hash") or ""),
+            "label_horizon_trading_days": horizon,
+            "validation": {
+                "rank_ic": _finite_number(validation.get("rank_ic")),
+                "ic_ir": _finite_number(
+                    validation.get("ic_ir", validation.get("rank_ic_ir"))
+                ),
+                "days": int(validation.get("days") or 0),
+            },
+        })
+    if len(universe_ids) != 1 or "" in universe_ids:
+        raise ModelResearchError("源模型必须使用相同股票池")
+    ensemble_mode = str(
+        payload.get("ensemble_mode") or "same_horizon"
+    ).strip().lower()
+    if ensemble_mode not in {"same_horizon", "multi_horizon"}:
+        raise ModelResearchError("融合模式只支持same_horizon或multi_horizon")
+    if ensemble_mode == "same_horizon" and len(label_fingerprints) != 1:
+        raise ModelResearchError("源模型必须使用相同标签定义和预测周期")
+    if ensemble_mode == "multi_horizon":
+        if len(source_horizons) < 2:
+            raise ModelResearchError("多周期融合至少需要两个不同标签周期")
+        if len(research_targets) != 1 or len(prediction_scopes) != 1:
+            raise ModelResearchError("多周期融合必须使用相同训练目标和预测实体")
+        if len(factor_fingerprints) != 1:
+            raise ModelResearchError("多周期融合必须使用完全相同的冻结因子集合")
+        if len(model_kinds) != 1 or len(model_param_fingerprints) != 1:
+            raise ModelResearchError("多周期融合必须使用相同算法和模型参数")
+    raw_evaluation_horizon = payload.get("evaluation_horizon_trading_days")
+    if raw_evaluation_horizon is None:
+        evaluation_horizon = 5 if 5 in source_horizons else min(source_horizons)
+    else:
+        try:
+            evaluation_horizon = int(raw_evaluation_horizon)
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError("融合评价周期必须是源模型已冻结的标签周期") from exc
+    if evaluation_horizon not in source_horizons:
+        raise ModelResearchError("融合评价周期必须是源模型已冻结的标签周期")
+
+    strategy = str(payload.get("weight_strategy") or "equal").strip().lower()
+    if strategy == "icir":
+        strategy = "validation_icir"
+    if strategy not in {"equal", "validation_icir", "manual"}:
+        raise ModelResearchError("权重策略只支持equal、validation_icir或manual")
+    raw_weights: list[float]
+    fallback_reason = ""
+    if strategy == "equal":
+        raw_weights = [1.0] * len(normalized_sources)
+    elif strategy == "validation_icir":
+        raw_weights = [
+            max(float(item["validation"]["ic_ir"] or 0.0), 0.0)
+            for item in normalized_sources
+        ]
+        if sum(raw_weights) <= 0:
+            raw_weights = [1.0] * len(normalized_sources)
+            fallback_reason = "所有源模型验证集ICIR均不为正，已回退为等权"
+    else:
+        manual = payload.get("manual_weights")
+        manual = manual if isinstance(manual, Mapping) else {}
+        raw_weights = []
+        for source_payload, item in zip(
+            source_payloads, normalized_sources, strict=True
+        ):
+            source_payload = source_payload if isinstance(source_payload, Mapping) else {}
+            key = f"{item['model_id']}:{item['model_version']}"
+            value = source_payload.get(
+                "weight", manual.get(key, manual.get(item["model_id"])),
+            )
+            weight = _finite_number(value)
+            if weight is None or weight <= 0:
+                raise ModelResearchError("手动权重要求每个源模型权重大于0")
+            raw_weights.append(weight)
+    total = sum(raw_weights)
+    if not math.isfinite(total) or total <= 0:
+        raise ModelResearchError("融合权重合计必须大于0")
+    for item, weight in zip(normalized_sources, raw_weights, strict=True):
+        item["weight"] = weight / total
+
+    fingerprint = sha256(_canonical_json({
+        "schema_version": "alphablocks.model-ensemble.v1",
+        "ensemble_mode": ensemble_mode,
+        "evaluation_horizon_trading_days": evaluation_horizon,
+        "fusion_method": "linear_score",
+        "weight_strategy": strategy,
+        "sources": [
+            {
+                "model_id": item["model_id"],
+                "model_version": item["model_version"],
+                "dataset_hash": item["dataset_hash"],
+                "weight": item["weight"],
+            }
+            for item in normalized_sources
+        ],
+    }).encode("utf-8")).hexdigest()
+    model_id = _clean_identifier(
+        str(payload.get("model_id") or ""),
+        default=f"ensemble_{fingerprint[:16]}",
+    )
+    if model_id in {item["model_id"] for item in normalized_sources}:
+        raise ModelResearchError("融合模型ID不能与源模型ID相同")
+    default_name = " + ".join(item["model_kind"] for item in normalized_sources)
+    name = str(payload.get("name") or payload.get("display_name") or f"融合模型 · {default_name}").strip()[:160]
+    dataset = _ensemble_dataset_spec(
+        fingerprint, source_models, normalized_sources,
+        ensemble_mode=ensemble_mode,
+        evaluation_horizon=evaluation_horizon,
+    )
+    return {
+        "schema_version": "alphablocks.ensemble-config.v1",
+        "model_id": model_id,
+        "name": name,
+        "fusion_method": "linear_score",
+        "ensemble_mode": ensemble_mode,
+        "evaluation_horizon_trading_days": evaluation_horizon,
+        "source_horizons": sorted(source_horizons),
+        "weight_strategy": strategy,
+        "weight_metric": "validation.ic_ir" if strategy == "validation_icir" else "",
+        "weight_fallback_reason": fallback_reason,
+        "source_count": len(normalized_sources),
+        "sources": normalized_sources,
+        "fingerprint": fingerprint,
+        "dataset": dataset,
+    }
+
+
+def _ensemble_dataset_spec(
+    fingerprint: str, source_models: list[Mapping[str, Any]],
+    sources: list[Mapping[str, Any]],
+    *, ensemble_mode: str = "same_horizon", evaluation_horizon: int = 5,
+) -> dict[str, Any]:
+    datasets = [dict(model.get("dataset_spec") or {}) for model in source_models]
+    date_start = max(_iso_date(item.get("date_start"), "date_start") for item in datasets)
+    date_end = min(_iso_date(item.get("date_end"), "date_end") for item in datasets)
+    if date_start >= date_end:
+        raise ModelResearchError("源模型训练范围没有共同区间")
+    data_cutoff = max(
+        _iso_datetime(item.get("data_cutoff"), "data_cutoff") for item in datasets
+    )
+    factors: list[dict[str, Any]] = []
+    seen_factors: set[tuple[str, int, str]] = set()
+    for dataset in datasets:
+        for factor in dataset.get("factors") or []:
+            item = dict(factor or {})
+            key = (
+                str(item.get("factor_id") or ""),
+                int(item.get("factor_version") or 0),
+                str(item.get("params_hash") or ""),
+            )
+            if key not in seen_factors:
+                seen_factors.add(key)
+                factors.append(item)
+    first = next(
+        (
+            item for item in datasets
+            if int(dict(item.get("label") or {}).get(
+                "horizon_trading_days"
+            ) or 5) == int(evaluation_horizon)
+        ),
+        datasets[0],
+    )
+    return {
+        "name": f"模型融合预测数据集 · {fingerprint[:12]}",
+        "universe_id": str(first.get("universe_id") or "csi500"),
+        "index_code": str(first.get("index_code") or "000905.SH"),
+        "date_start": date_start,
+        "date_end": date_end,
+        "data_cutoff": data_cutoff,
+        "research_target": str(first.get("research_target") or "stock_selection"),
+        "prediction_scope": str(first.get("prediction_scope") or "stock"),
+        "factors": factors,
+        "feature_field": "source_model_score",
+        "label": dict(first.get("label") or {}),
+        "split": dict(first.get("split") or {}),
+        "minimum_factor_coverage": min(
+            float(item.get("minimum_factor_coverage") or 0.8) for item in datasets
+        ),
+        "materialization": {
+            "mode": (
+                "multi_horizon_model_prediction_fusion"
+                if ensemble_mode == "multi_horizon"
+                else "model_prediction_fusion"
+            ),
+            "format": "clickhouse",
+            "persist_factor_values": False,
+        },
+        "availability": {
+            "source_predictions_required_for_every_entity": True,
+            "feature_cutoff_at_lte_signal_close": True,
+            "evaluation_horizon_frozen": True,
+        },
+        "ensemble_mode": ensemble_mode,
+        "evaluation_horizon_trading_days": int(evaluation_horizon),
+        "ensemble_sources": [
+            {
+                "model_id": item["model_id"],
+                "model_version": item["model_version"],
+                "dataset_hash": item["dataset_hash"],
+                "weight": item["weight"],
+            }
+            for item in sources
+        ],
+    }
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _json_ready_mapping(source: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in source.items():
+        if isinstance(value, datetime):
+            result[str(key)] = value.isoformat()
+        elif hasattr(value, "isoformat"):
+            result[str(key)] = value.isoformat()
+        else:
+            result[str(key)] = value
+    return result
+
+
+def _research_origin_spec(
+    source: Mapping[str, Any],
+    *,
+    source_type: str,
+    source_id: str,
+    source_job: Mapping[str, Any],
+    source_model_id: str,
+    source_model_version: int,
+    dataset: Mapping[str, Any],
+    model: Mapping[str, Any],
+    walk_forward: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_config = dict(source_job.get("config_json") or {})
+    source_dataset = _dataset_spec(source_job.get("dataset_spec") or {})
+    source_model = _model_spec(source_config.get("model") or {})
+    source_walk_forward = _walk_forward_spec(
+        source_config.get("walk_forward") or {}
+    )
+    comparisons = {
+        "dataset": (dataset, source_dataset),
+        "model": (model, source_model),
+        "walk_forward": (walk_forward, source_walk_forward),
+    }
+    changed_sections = [
+        name for name, (current, historical) in comparisons.items()
+        if _canonical_json(current) != _canonical_json(historical)
+    ]
+    declared = source.get("declared_changes") or []
+    if declared and not isinstance(declared, list):
+        raise ModelResearchError("research_origin.declared_changes必须是数组")
+    for value in declared:
+        label = str(value or "").strip()[:80]
+        if label and label not in changed_sections:
+            changed_sections.append(label)
+    requested_mode = str(
+        source.get("requested_mode") or "derived"
+    ).strip().lower()
+    if requested_mode not in {"exact_replay", "derived"}:
+        raise ModelResearchError(
+            "research_origin.requested_mode只支持exact_replay或derived"
+        )
+    if requested_mode == "exact_replay" and changed_sections:
+        raise ModelResearchConflict(
+            "精确复现配置已发生变化：" + "、".join(changed_sections)
+        )
+    source_snapshot = {
+        "dataset": source_dataset,
+        "model": source_model,
+        "walk_forward": source_walk_forward,
+    }
+    return {
+        "schema_version": "alphablocks.research-origin.v1",
+        "source_type": source_type,
+        "source_id": source_id,
+        "source_job_id": str(source_job.get("job_id") or ""),
+        "source_model_id": source_model_id,
+        "source_model_version": int(source_model_version),
+        "requested_mode": requested_mode,
+        "mode": "exact_replay" if requested_mode == "exact_replay" else "derived",
+        "changed_sections": changed_sections,
+        "source_dataset_hash": str(source_job.get("dataset_hash") or ""),
+        "source_config_hash": sha256(
+            _canonical_json(source_snapshot).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     factors = source.get("factors")
     if not isinstance(factors, list) or not factors:
@@ -985,6 +3535,67 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     if date_start >= date_end:
         raise ModelResearchError("训练开始日期必须早于结束日期")
     data_cutoff = _iso_datetime(source.get("data_cutoff"), "data_cutoff")
+    research_target = str(
+        source.get("research_target") or "stock_selection"
+    ).strip().lower()
+    if research_target not in {
+        "stock_selection", "market_style", "industry_rotation",
+    }:
+        raise ModelResearchError(
+            "训练目标只支持stock_selection、market_style或industry_rotation"
+        )
+    if (
+        research_target == "industry_rotation"
+        and date_start < SW2021_INDUSTRY_SAFE_START
+    ):
+        raise ModelResearchError(
+            "申万一级行业轮动仅支持2021-12-13及以后；"
+            "更早历史包含申万2021版回溯重分类"
+        )
+    raw_horizon = source.get("label_horizon_trading_days")
+    if raw_horizon is None:
+        raw_horizon = dict(source.get("label") or {}).get(
+            "horizon_trading_days", 5,
+        )
+    try:
+        horizon = int(raw_horizon)
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError(
+            "标签周期只支持T+1、T+3、T+5或T+10交易日"
+        ) from exc
+    if horizon not in {1, 3, 5, 10}:
+        raise ModelResearchError("标签周期只支持T+1、T+3、T+5或T+10交易日")
+    label = (
+        {
+            "kind": f"future_{horizon}d_market_style_rank",
+            "horizon_trading_days": horizon,
+            "range": [-1.0, 1.0],
+            "entities": ["STYLE_SMALL", "STYLE_LARGE"],
+        }
+        if research_target == "market_style"
+        else {
+            "kind": f"future_{horizon}d_industry_rank",
+            "horizon_trading_days": horizon,
+            "range": [-1.0, 1.0],
+            "classification": "sw2021_l1",
+            "safe_start": SW2021_INDUSTRY_SAFE_START,
+        }
+        if research_target == "industry_rotation"
+        else {
+            "kind": f"future_{horizon}d_cross_sectional_rank",
+            "horizon_trading_days": horizon,
+            "range": [-1.0, 1.0],
+        }
+    )
+    availability = {
+        "event_available_at_lte_signal_close": True,
+        "source_available_at_lte_data_cutoff": True,
+    }
+    if research_target == "industry_rotation":
+        availability.update({
+            "industry_snapshot_date_eq_signal_date": True,
+            "industry_classification_safe_start": SW2021_INDUSTRY_SAFE_START,
+        })
     return {
         "name": str(source.get("name") or "中证500因子数据集")[:160],
         "universe_id": "csi500",
@@ -992,24 +3603,28 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,
+        "research_target": research_target,
+        "prediction_scope": (
+            "market_style" if research_target == "market_style"
+            else "industry" if research_target == "industry_rotation"
+            else "stock"
+        ),
         "factors": normalized_factors,
         "feature_field": "score",
-        "label": {
-            "kind": "future_5d_cross_sectional_rank",
-            "horizon_trading_days": 5,
-            "range": [-1.0, 1.0],
+        "label": label,
+        "split": {
+            "train": 0.6,
+            "valid": 0.2,
+            "test": 0.2,
+            "embargo_days": horizon,
         },
-        "split": {"train": 0.6, "valid": 0.2, "test": 0.2, "embargo_days": 5},
         "minimum_factor_coverage": 0.8,
         "materialization": {
             "mode": "on_demand",
             "format": "parquet",
             "persist_factor_values": False,
         },
-        "availability": {
-            "event_available_at_lte_signal_close": True,
-            "source_available_at_lte_data_cutoff": True,
-        },
+        "availability": availability,
     }
 
 

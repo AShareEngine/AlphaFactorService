@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 from typing import Any
@@ -21,6 +21,8 @@ FACTOR_COMPUTED_CUTOFF = "computed_at <= {cutoff:DateTime}"
 FACTOR_EVENT_CUTOFF = (
     "event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR"
 )
+SW2021_INDUSTRY_SAFE_START = "2021-12-13"
+FACTOR_QUERY_CHUNK_DAYS = 366
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,83 @@ class DatasetBuilder:
             "clickhouse_version": version,
             "enabled_factor_count": int(factors),
             "future_function_sentinel": sentinel,
+            "training_targets": self.target_capabilities(),
         }
+
+    def target_capabilities(self) -> list[dict[str, Any]]:
+        rows = self.client.query(
+            """
+            SELECT table, groupArray(name)
+            FROM system.columns
+            WHERE database = {database:String}
+              AND table IN (
+                  'ad_equity_structure', 'ad_industry_weight',
+                  'ad_industry_base_info'
+              )
+            GROUP BY table
+            """,
+            parameters={"database": self.settings.source_database},
+        ).result_rows
+        columns = {str(table): {str(name) for name in names} for table, names in rows}
+        equity_required = {
+            "market_code", "ann_date", "change_date", "tot_share", "is_valid",
+        }
+        industry_weight_required = {
+            "index_code", "con_code", "trade_date", "weight",
+        }
+        industry_base_required = {
+            "index_code", "level_type", "level1_name",
+        }
+        equity_missing = sorted(
+            equity_required - columns.get("ad_equity_structure", set())
+        )
+        industry_missing = sorted(
+            {
+                *(f"ad_industry_weight.{name}" for name in (
+                    industry_weight_required
+                    - columns.get("ad_industry_weight", set())
+                )),
+                *(f"ad_industry_base_info.{name}" for name in (
+                    industry_base_required
+                    - columns.get("ad_industry_base_info", set())
+                )),
+            }
+        )
+        return [
+            {
+                "target": "stock_selection",
+                "label": "个股选股",
+                "ready": True,
+                "prediction_scope": "stock",
+                "reason": "支持冻结T+1、T+3、T+5或T+10个股收益截面排名标签。",
+                "missing_fields": [],
+            },
+            {
+                "target": "market_style",
+                "label": "大小盘市场风格",
+                "ready": not equity_missing,
+                "prediction_scope": "market_style",
+                "reason": (
+                    "按公告日与变更日可用的总股本重建每日市值，形成大小盘两组。"
+                    if not equity_missing else "缺少PIT市值重建字段。"
+                ),
+                "missing_fields": equity_missing,
+            },
+            {
+                "target": "industry_rotation",
+                "label": "申万一级行业轮动",
+                "ready": not industry_missing,
+                "prediction_scope": "industry",
+                "reason": (
+                    "使用申万2021版日频行业权重；仅允许从2021-12-13起训练，禁止使用更早的回溯重分类。"
+                    if not industry_missing
+                    else "缺少申万2021版日频行业权重或分类字段。"
+                ),
+                "missing_fields": industry_missing,
+                "minimum_date": SW2021_INDUSTRY_SAFE_START,
+                "source_contract": "sw2021_daily_weight_snapshot",
+            },
+        ]
 
     def audit_future_function_sentinel(self) -> dict[str, Any]:
         """Execute the production PIT predicates against safe and future rows."""
@@ -126,7 +204,10 @@ class DatasetBuilder:
             _progress(progress, "loading_factors", 8 + int(26 * (index - 1) / len(factors)), {
                 "factor_id": name, "factor_index": index, "factor_count": len(factors),
             })
-            frame = self._factor_values(item, cutoff_for_clickhouse, date_start, date_end)
+            frame = self._factor_values(
+                item, cutoff_for_clickhouse, date_start, date_end,
+                cancellation=cancellation,
+            )
             frame = frame.merge(expected, on=["trade_date", "instrument"], how="inner")
             actual_coverage = frame[["trade_date", "instrument"]].drop_duplicates().shape[0] / expected_count
             coverage[name] = actual_coverage
@@ -143,8 +224,64 @@ class DatasetBuilder:
         prices = self._adjusted_close(sorted(features["instrument"].unique()), date_start, date_end)
         _checkpoint(cancellation)
         _progress(progress, "building_labels", 46, {})
-        labels = _future_rank_label(prices, horizon=5)
-        panel = features.merge(labels, on=["trade_date", "instrument"], how="inner")
+        research_target = str(spec.get("research_target") or "stock_selection")
+        horizon = int((spec.get("label") or {}).get("horizon_trading_days") or 5)
+        target_contract: dict[str, Any]
+        if research_target == "market_style":
+            market_caps = self._historical_market_cap(
+                sorted(features["instrument"].unique()), date_start, date_end,
+            )
+            features, style_membership = _market_style_features(
+                features, market_caps, feature_names,
+            )
+            labels = _market_style_rank_label(
+                prices, style_membership, horizon=horizon,
+            )
+            panel = features.merge(
+                labels, on=["trade_date", "instrument"], how="inner",
+            )
+            target_contract = {
+                "research_target": "market_style",
+                "prediction_scope": "market_style",
+                "entities": ["STYLE_SMALL", "STYLE_LARGE"],
+                "feature_aggregation": "daily_group_mean",
+                "membership": "daily_pit_market_cap_halves",
+                "label": "future_group_return_cross_sectional_rank",
+            }
+        elif research_target == "industry_rotation":
+            industry_membership = self._industry_membership(
+                expected, date_start, date_end,
+            )
+            features, industry_membership = _industry_features(
+                features, industry_membership, feature_names,
+            )
+            labels = _industry_rank_label(
+                prices, industry_membership, horizon=horizon,
+            )
+            panel = features.merge(
+                labels, on=["trade_date", "instrument"], how="inner",
+            )
+            target_contract = {
+                "research_target": "industry_rotation",
+                "prediction_scope": "industry",
+                "feature_aggregation": "daily_industry_weighted_mean",
+                "membership": "sw2021_daily_weight_snapshot",
+                "safe_start": SW2021_INDUSTRY_SAFE_START,
+                "label": "future_industry_return_cross_sectional_rank",
+            }
+        elif research_target == "stock_selection":
+            labels = _future_rank_label(prices, horizon=horizon)
+            panel = features.merge(
+                labels, on=["trade_date", "instrument"], how="inner",
+            )
+            target_contract = {
+                "research_target": "stock_selection",
+                "prediction_scope": "stock",
+                "feature_aggregation": "none",
+                "label": "future_stock_return_cross_sectional_rank",
+            }
+        else:
+            raise ValueError(f"训练目标{research_target}尚不可用")
         panel.sort_values(["trade_date", "instrument"], inplace=True)
         trading_dates = pd.Index(sorted(panel["trade_date"].unique()))
         segments = split_trading_dates(trading_dates, embargo_days=5)
@@ -169,6 +306,22 @@ class DatasetBuilder:
         indexed.loc[:, pd.IndexSlice["feature", :]] = (
             indexed.loc[:, pd.IndexSlice["feature", :]].fillna(medians)
         )
+        future_function_guards = [
+            "factor definitions and parameters frozen before materialization",
+            "source rows limited to signal date and available by market close",
+            "data_cutoff >= final signal date close",
+            "historical index membership",
+            "five session split embargo",
+            "preprocessors fitted on train only",
+        ]
+        if research_target == "market_style":
+            future_function_guards.append(
+                "market-style membership uses close-date market cap and shares available by signal date"
+            )
+        elif research_target == "industry_rotation":
+            future_function_guards.append(
+                "industry membership uses exact-date SW2021 weight snapshots no earlier than 2021-12-13"
+            )
         manifest = {
             "schema_version": "alphablocks.qlib-dataset.v1",
             "dataset_hash": str(job.get("dataset_hash") or ""),
@@ -179,14 +332,8 @@ class DatasetBuilder:
             "medians": medians,
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
-            "future_function_guards": [
-                "factor definitions and parameters frozen before materialization",
-                "source rows limited to signal date and available by market close",
-                "data_cutoff >= final signal date close",
-                "historical index membership",
-                "five session split embargo",
-                "preprocessors fitted on train only",
-            ],
+            "target_contract": target_contract,
+            "future_function_guards": future_function_guards,
             "materialization": {
                 "mode": "on_demand",
                 "format": "parquet",
@@ -257,7 +404,13 @@ class DatasetBuilder:
         return dates
 
     def _factor_values(
-        self, item: dict[str, Any], cutoff: datetime, date_start: str, date_end: str,
+        self,
+        item: dict[str, Any],
+        cutoff: datetime,
+        date_start: str,
+        date_end: str,
+        *,
+        cancellation: CancellationToken | None = None,
     ) -> pd.DataFrame:
         signal_close = datetime.combine(
             pd.Timestamp(date_end).date(), datetime.min.time(),
@@ -274,29 +427,44 @@ class DatasetBuilder:
         params = item.get("params")
         if not isinstance(params, dict):
             raise ValueError(f"冻结因子{item['factor_id']}缺少params")
-        plan = build_factor_query_plan(
-            factor,
-            overrides=params,
-            entity_type="stock",
-            date_start=pd.Timestamp(date_start).date(),
-            date_end=pd.Timestamp(date_end).date(),
-            job_id="model-dataset",
-        )
         expected_hash = str(item.get("params_hash") or "").strip().lower()
-        if plan.params_hash != expected_hash:
-            raise ValueError(
-                f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+        chunk_start = pd.Timestamp(date_start).date()
+        final_end = pd.Timestamp(date_end).date()
+        rows: list[tuple[Any, ...]] = []
+        while chunk_start <= final_end:
+            _checkpoint(cancellation)
+            chunk_end = min(
+                chunk_start + timedelta(days=FACTOR_QUERY_CHUNK_DAYS - 1),
+                final_end,
             )
-        # The canonical factor query exposes raw/rank/percentile/score. Model
-        # features deliberately consume only the model-ready score, so project
-        # the six-column query back to the stable three-column dataset contract.
-        feature_sql = f"""
-        SELECT trade_date, entity_code, score AS value
-        FROM (
-            {plan.sql}
-        )
-        """
-        rows = self.client.query(feature_sql, parameters=plan.params).result_rows
+            plan = build_factor_query_plan(
+                factor,
+                overrides=params,
+                entity_type="stock",
+                date_start=chunk_start,
+                date_end=chunk_end,
+                job_id="model-dataset",
+            )
+            if plan.params_hash != expected_hash:
+                raise ValueError(
+                    f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+                )
+            # The canonical query retains its own factor-specific lookback for
+            # every chunk. Only the requested output dates are concatenated, so
+            # rolling windows stay identical at chunk boundaries while the
+            # ClickHouse working set remains bounded on long research ranges.
+            feature_sql = f"""
+            SELECT trade_date, entity_code, score AS value
+            FROM (
+                {plan.sql}
+            )
+            """
+            rows.extend(
+                self.client.query(
+                    feature_sql, parameters=plan.params,
+                ).result_rows
+            )
+            chunk_start = chunk_end + timedelta(days=1)
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument", "value"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
@@ -332,6 +500,177 @@ class DatasetBuilder:
             frame["adjusted_close"] = pd.to_numeric(frame["adjusted_close"], errors="coerce")
         return frame
 
+    def _historical_market_cap(
+        self, instruments: list[str], date_start: str, date_end: str,
+    ) -> pd.DataFrame:
+        price_rows = self.client.query(
+            f"""
+            SELECT toDate(trade_time), code, toFloat64(close)
+            FROM {self.settings.source_database}.ad_market_kline_daily
+            WHERE code IN {{codes:Array(String)}}
+              AND toDate(trade_time) >= {{date_start:Date}}
+              AND toDate(trade_time) <= {{date_end:Date}}
+              AND close IS NOT NULL AND close > 0
+            ORDER BY code, trade_time
+            """,
+            parameters={
+                "codes": instruments, "date_start": date_start,
+                "date_end": date_end,
+            },
+        ).result_rows
+        share_rows = self.client.query(
+            f"""
+            SELECT market_code, ann_date, change_date, toFloat64(tot_share)
+            FROM {self.settings.source_database}.ad_equity_structure
+            WHERE market_code IN {{codes:Array(String)}}
+              AND is_valid = 1 AND tot_share IS NOT NULL AND tot_share > 0
+              AND ann_date <= {{date_end:Date}}
+              AND change_date <= {{date_end:Date}}
+            ORDER BY market_code, ann_date, change_date
+            """,
+            parameters={"codes": instruments, "date_end": date_end},
+        ).result_rows
+        prices = pd.DataFrame(
+            price_rows, columns=["trade_date", "instrument", "close"],
+        )
+        shares = pd.DataFrame(
+            share_rows,
+            columns=["instrument", "ann_date", "change_date", "total_share_10k"],
+        )
+        if prices.empty or shares.empty:
+            return pd.DataFrame(columns=["trade_date", "instrument", "market_cap"])
+        prices["trade_date"] = pd.to_datetime(prices["trade_date"], errors="coerce")
+        prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+        shares["ann_date"] = pd.to_datetime(shares["ann_date"], errors="coerce")
+        shares["change_date"] = pd.to_datetime(shares["change_date"], errors="coerce")
+        shares["total_share_10k"] = pd.to_numeric(
+            shares["total_share_10k"], errors="coerce",
+        )
+        shares["available_date"] = shares[["ann_date", "change_date"]].max(axis=1)
+        shares = shares.dropna(subset=["available_date", "total_share_10k"])
+        parts: list[pd.DataFrame] = []
+        share_groups = {
+            str(code): group.sort_values("available_date")
+            for code, group in shares.groupby("instrument", sort=False)
+        }
+        for code, price_group in prices.groupby("instrument", sort=False):
+            available = share_groups.get(str(code))
+            if available is None or available.empty:
+                continue
+            parts.append(pd.merge_asof(
+                price_group.sort_values("trade_date"),
+                available[["available_date", "total_share_10k"]],
+                left_on="trade_date", right_on="available_date", direction="backward",
+            ))
+        if not parts:
+            return pd.DataFrame(columns=["trade_date", "instrument", "market_cap"])
+        result = pd.concat(parts, ignore_index=True).dropna(subset=["total_share_10k"])
+        result["market_cap"] = result["close"] * result["total_share_10k"] * 10_000.0
+        result = result.loc[
+            np.isfinite(result["market_cap"]) & (result["market_cap"] > 0)
+        ]
+        return result[["trade_date", "instrument", "market_cap"]]
+
+    def _industry_membership(
+        self, observations: pd.DataFrame, date_start: str, date_end: str,
+    ) -> pd.DataFrame:
+        """Return exact-date Shenwan 2021 L1 membership for observed stocks.
+
+        The source contains a retroactively restated history before the SW2021
+        cutover.  Those older rows overlap legacy classifications, so accepting
+        them would leak a future taxonomy into historical samples.  Starting at
+        the cutover, the daily snapshot has one L1 industry per stock and can be
+        joined using only the signal date.
+        """
+        empty = pd.DataFrame(columns=[
+            "trade_date", "instrument", "industry_entity",
+            "industry_name", "industry_weight",
+        ])
+        if observations.empty:
+            return empty
+        if pd.Timestamp(date_start) < pd.Timestamp(SW2021_INDUSTRY_SAFE_START):
+            raise ValueError(
+                "申万一级行业轮动仅支持2021-12-13及以后；"
+                "更早历史包含申万2021版回溯重分类"
+            )
+        expected = observations[["trade_date", "instrument"]].drop_duplicates().copy()
+        expected["trade_date"] = pd.to_datetime(expected["trade_date"], errors="coerce")
+        instruments = sorted(expected["instrument"].dropna().astype(str).unique())
+        if not instruments:
+            return empty
+        rows = self.client.query(
+            f"""
+            SELECT w.trade_date, w.con_code, w.index_code, b.level1_name,
+                   toFloat64(w.weight)
+            FROM {self.settings.source_database}.ad_industry_weight w
+            INNER JOIN {self.settings.source_database}.ad_industry_base_info b
+              ON w.index_code = b.index_code
+            WHERE b.level_type = 1
+              AND w.con_code IN {{codes:Array(String)}}
+              AND w.trade_date >= {{date_start:Date}}
+              AND w.trade_date <= {{date_end:Date}}
+              AND w.weight IS NOT NULL AND w.weight > 0
+            ORDER BY w.trade_date, w.con_code, w.index_code
+            """,
+            parameters={
+                "codes": instruments, "date_start": date_start,
+                "date_end": date_end,
+            },
+        ).result_rows
+        frame = pd.DataFrame(rows, columns=[
+            "trade_date", "instrument", "industry_entity",
+            "industry_name", "industry_weight",
+        ])
+        if frame.empty:
+            raise ValueError("申万2021版一级行业日频权重为空")
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        frame["industry_weight"] = pd.to_numeric(
+            frame["industry_weight"], errors="coerce",
+        )
+        frame = frame.dropna(subset=[
+            "trade_date", "instrument", "industry_entity", "industry_weight",
+        ])
+        duplicate = frame.duplicated(
+            ["trade_date", "instrument"], keep=False,
+        )
+        if duplicate.any():
+            sample = frame.loc[duplicate, [
+                "trade_date", "instrument", "industry_entity",
+            ]].head(5).to_dict("records")
+            raise ValueError(f"申万一级行业日频映射存在重复归属: {sample}")
+        mapped = expected.merge(
+            frame, on=["trade_date", "instrument"], how="inner",
+        )
+        coverage = len(mapped) / max(1, len(expected))
+        if not np.isfinite(coverage) or coverage < 0.8:
+            raise ValueError(f"申万一级行业日频映射覆盖率{coverage:.2%}低于80%")
+        return mapped
+
+    def market_style_features(
+        self, features: pd.DataFrame, feature_names: list[str],
+        date_start: str, date_end: str,
+    ) -> pd.DataFrame:
+        market_caps = self._historical_market_cap(
+            sorted(features["instrument"].astype(str).unique()),
+            date_start, date_end,
+        )
+        result, _membership = _market_style_features(
+            features, market_caps, feature_names,
+        )
+        return result
+
+    def industry_features(
+        self, features: pd.DataFrame, feature_names: list[str],
+        date_start: str, date_end: str,
+    ) -> pd.DataFrame:
+        membership = self._industry_membership(
+            features[["trade_date", "instrument"]], date_start, date_end,
+        )
+        result, _membership = _industry_features(
+            features, membership, feature_names,
+        )
+        return result
+
 
 def _future_rank_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
     if prices.empty:
@@ -343,6 +682,174 @@ def _future_rank_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
     percentile = future_return.rank(axis=1, pct=True, method="average")
     labels = (2.0 * percentile - 1.0).stack(future_stack=True).dropna().rename("LABEL0").reset_index()
     return labels
+
+
+def _market_style_features(
+    features: pd.DataFrame,
+    market_caps: pd.DataFrame,
+    feature_names: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if features.empty or market_caps.empty:
+        raise ValueError("大小盘风格训练缺少PIT市值数据")
+    source = features.merge(
+        market_caps, on=["trade_date", "instrument"], how="left",
+    )
+    coverage = source["market_cap"].notna().mean()
+    if not np.isfinite(coverage) or coverage < 0.8:
+        raise ValueError(f"大小盘风格PIT市值覆盖率{coverage:.2%}低于80%")
+    source = source.dropna(subset=["market_cap"]).sort_values(
+        ["trade_date", "market_cap", "instrument"],
+    )
+    source["_position"] = source.groupby("trade_date").cumcount()
+    source["_count"] = source.groupby("trade_date")["instrument"].transform("size")
+    source["style_entity"] = np.where(
+        source["_position"] < (source["_count"] / 2.0),
+        "STYLE_SMALL", "STYLE_LARGE",
+    )
+    group_counts = source.groupby("trade_date")["style_entity"].nunique()
+    complete_dates = set(group_counts[group_counts == 2].index)
+    source = source[source["trade_date"].isin(complete_dates)]
+    if source.empty:
+        raise ValueError("大小盘风格无法形成每日两个市值组")
+    membership = source[[
+        "trade_date", "instrument", "style_entity", "market_cap",
+    ]].copy()
+    aggregated = source.groupby(
+        ["trade_date", "style_entity"], as_index=False,
+    )[feature_names].mean()
+    aggregated.rename(columns={"style_entity": "instrument"}, inplace=True)
+    return aggregated, membership
+
+
+def _market_style_rank_label(
+    prices: pd.DataFrame,
+    membership: pd.DataFrame,
+    *,
+    horizon: int,
+) -> pd.DataFrame:
+    if prices.empty or membership.empty:
+        raise ValueError("大小盘风格标签缺少价格或市值分组")
+    pivot = prices.drop_duplicates(
+        ["trade_date", "instrument"], keep="last",
+    ).pivot(
+        index="trade_date", columns="instrument", values="adjusted_close",
+    ).sort_index()
+    returns = pivot.shift(-int(horizon)).div(pivot).sub(1.0)
+    future = returns.stack(future_stack=True).dropna().rename(
+        "future_return",
+    ).reset_index()
+    grouped = membership.merge(
+        future, on=["trade_date", "instrument"], how="inner",
+    ).groupby(
+        ["trade_date", "style_entity"], as_index=False,
+    )["future_return"].mean()
+    grouped["_rank"] = grouped.groupby("trade_date")["future_return"].rank(
+        method="average", ascending=True,
+    )
+    grouped["_count"] = grouped.groupby("trade_date")["style_entity"].transform(
+        "size",
+    )
+    grouped = grouped[grouped["_count"] == 2].copy()
+    grouped["LABEL0"] = 2.0 * (grouped["_rank"] - 1.0) / (
+        grouped["_count"] - 1.0
+    ) - 1.0
+    grouped.rename(columns={"style_entity": "instrument"}, inplace=True)
+    return grouped[["trade_date", "instrument", "LABEL0"]]
+
+
+def _industry_features(
+    features: pd.DataFrame,
+    membership: pd.DataFrame,
+    feature_names: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if features.empty or membership.empty:
+        raise ValueError("行业轮动训练缺少申万一级行业日频映射")
+    source = features.merge(
+        membership,
+        on=["trade_date", "instrument"],
+        how="inner",
+        validate="one_to_one",
+    )
+    if source.empty:
+        raise ValueError("所选股票与申万一级行业日频映射无交集")
+    group_counts = source.groupby("trade_date")["industry_entity"].nunique()
+    complete_dates = set(group_counts[group_counts >= 2].index)
+    source = source[source["trade_date"].isin(complete_dates)].copy()
+    if source.empty:
+        raise ValueError("行业轮动无法形成每日行业截面")
+    aggregated = _weighted_group_means(
+        source,
+        group_columns=["trade_date", "industry_entity"],
+        value_columns=feature_names,
+        weight_column="industry_weight",
+    )
+    aggregated.rename(columns={"industry_entity": "instrument"}, inplace=True)
+    return aggregated, source[[
+        "trade_date", "instrument", "industry_entity",
+        "industry_name", "industry_weight",
+    ]].copy()
+
+
+def _industry_rank_label(
+    prices: pd.DataFrame,
+    membership: pd.DataFrame,
+    *,
+    horizon: int,
+) -> pd.DataFrame:
+    if prices.empty or membership.empty:
+        raise ValueError("行业轮动标签缺少价格或行业映射")
+    pivot = prices.drop_duplicates(
+        ["trade_date", "instrument"], keep="last",
+    ).pivot(
+        index="trade_date", columns="instrument", values="adjusted_close",
+    ).sort_index()
+    returns = pivot.shift(-int(horizon)).div(pivot).sub(1.0)
+    future = returns.stack(future_stack=True).dropna().rename(
+        "future_return",
+    ).reset_index()
+    source = membership.merge(
+        future, on=["trade_date", "instrument"], how="inner",
+    )
+    grouped = _weighted_group_means(
+        source,
+        group_columns=["trade_date", "industry_entity"],
+        value_columns=["future_return"],
+        weight_column="industry_weight",
+    )
+    grouped["_rank"] = grouped.groupby("trade_date")["future_return"].rank(
+        method="average", ascending=True,
+    )
+    grouped["_count"] = grouped.groupby("trade_date")[
+        "industry_entity"
+    ].transform("size")
+    grouped = grouped[grouped["_count"] >= 2].copy()
+    grouped["LABEL0"] = 2.0 * (grouped["_rank"] - 1.0) / (
+        grouped["_count"] - 1.0
+    ) - 1.0
+    grouped.rename(columns={"industry_entity": "instrument"}, inplace=True)
+    return grouped[["trade_date", "instrument", "LABEL0"]]
+
+
+def _weighted_group_means(
+    frame: pd.DataFrame,
+    *,
+    group_columns: list[str],
+    value_columns: list[str],
+    weight_column: str,
+) -> pd.DataFrame:
+    """Compute per-column weighted means while ignoring only that column's NaNs."""
+    result = frame[group_columns].drop_duplicates().copy()
+    keys = [frame[column] for column in group_columns]
+    weights = pd.to_numeric(frame[weight_column], errors="coerce")
+    weights = weights.where(np.isfinite(weights) & (weights > 0))
+    for column in value_columns:
+        values = pd.to_numeric(frame[column], errors="coerce")
+        valid = values.notna() & weights.notna() & np.isfinite(values)
+        numerator = (values * weights).where(valid).groupby(keys).sum(min_count=1)
+        denominator = weights.where(valid).groupby(keys).sum(min_count=1)
+        grouped = numerator.div(denominator).rename(column).reset_index()
+        result = result.merge(grouped, on=group_columns, how="left")
+    return result.sort_values(group_columns).reset_index(drop=True)
 
 
 def split_trading_dates(dates: pd.Index, *, embargo_days: int = 5) -> dict[str, tuple[str, str]]:
@@ -379,8 +886,10 @@ def walk_forward_segments(
     """Build recent, non-overlapping walk-forward windows from trading sessions.
 
     One year is defined as 252 observed trading sessions and one month as 21.
-    All embargoes are counted using the supplied trading calendar.  When more
-    windows are available than requested, the most recent windows are retained.
+    All embargoes are counted using the supplied trading calendar. Windows are
+    planned backwards from the latest observed session so the final independent
+    test window always reaches the frozen dataset boundary. This avoids silently
+    leaving a recent partial step outside the stability assessment.
     """
     unique = pd.Index(sorted(pd.to_datetime(dates).unique()))
     if strategy not in {"rolling", "expanding"}:
@@ -405,23 +914,24 @@ def walk_forward_segments(
         )
 
     windows: list[dict[str, tuple[str, str]]] = []
-    offset = 0
-    while True:
-        train_start_index = 0 if strategy == "expanding" else offset
-        train_end_index = offset + train_sessions - 1
-        valid_start_index = train_end_index + embargo + 1
-        valid_end_index = valid_start_index + valid_sessions - 1
-        test_start_index = valid_end_index + embargo + 1
-        test_end_index = test_start_index + test_sessions - 1
-        if test_end_index >= len(unique):
+    for reverse_index in range(limit):
+        test_end_index = len(unique) - 1 - reverse_index * step_sessions
+        test_start_index = test_end_index - test_sessions + 1
+        valid_end_index = test_start_index - embargo - 1
+        valid_start_index = valid_end_index - valid_sessions + 1
+        train_end_index = valid_start_index - embargo - 1
+        train_start_index = (
+            0 if strategy == "expanding"
+            else train_end_index - train_sessions + 1
+        )
+        if train_start_index < 0:
             break
         windows.append({
             "train": _date_range(unique, train_start_index, train_end_index),
             "valid": _date_range(unique, valid_start_index, valid_end_index),
             "test": _date_range(unique, test_start_index, test_end_index),
         })
-        offset += step_sessions
-    return windows[-limit:]
+    return list(reversed(windows))
 
 
 def _date_range(dates: pd.Index, start: int, end: int) -> tuple[str, str]:

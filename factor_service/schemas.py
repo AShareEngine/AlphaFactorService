@@ -400,6 +400,7 @@ class ModelBacktestJobCreate(BaseModel):
     date_end: Optional[date] = None
     top_n: int = Field(default=20, ge=1, le=500)
     rebalance_every: int = Field(default=5, ge=1, le=60)
+    research_only: bool = False
 
 
 class ModelBacktestJobOut(BaseModel):

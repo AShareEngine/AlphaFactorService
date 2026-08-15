@@ -52,6 +52,20 @@ class DailyInferenceRunner:
         _checkpoint(cancellation)
         model, training_manifest = _load_bundle(bundle_path)
         model_kind = str(training_manifest.get("model_kind") or "lightgbm")
+        dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
+        research_target = str(
+            dataset_spec.get("research_target") or "stock_selection"
+        ).strip().lower()
+        prediction_scope = str(
+            dataset_spec.get("prediction_scope")
+            or ("market_style" if research_target == "market_style"
+                else "industry" if research_target == "industry_rotation"
+                else "stock")
+        ).strip().lower()
+        if research_target not in {
+            "stock_selection", "market_style", "industry_rotation",
+        }:
+            raise PermanentJobError(f"训练目标{research_target}尚不支持每日推理")
         expected_names = list(training_manifest.get("feature_names") or [])
         medians = dict(training_manifest.get("medians") or {})
         factors = list(job["dataset_spec"]["factors"])
@@ -106,6 +120,20 @@ class DailyInferenceRunner:
         low = [name for name, coverage in coverages.items() if coverage < minimum]
         if low:
             raise PermanentJobError("每日推理因子覆盖率低于阈值: " + ", ".join(low))
+        if research_target == "market_style":
+            try:
+                features = self.dataset_builder.market_style_features(
+                    features, expected_names, feature_date_start, trade_date,
+                )
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
+        elif research_target == "industry_rotation":
+            try:
+                features = self.dataset_builder.industry_features(
+                    features, expected_names, feature_date_start, trade_date,
+                )
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
         features[expected_names] = features[expected_names].fillna({
             name: float(medians[name]) for name in expected_names
         })
@@ -135,7 +163,14 @@ class DailyInferenceRunner:
                     columns={"datetime": "trade_date", "instrument": "entity_code"},
                     inplace=True,
                 )
-                target_count = max(1, target_membership["instrument"].nunique())
+                target_count = (
+                    2 if research_target == "market_style"
+                    else int(features.loc[
+                        features["trade_date"] == pd.Timestamp(trade_date),
+                        "instrument",
+                    ].nunique()) if research_target == "industry_rotation"
+                    else max(1, target_membership["instrument"].nunique())
+                )
                 sequence_coverage = len(predictions) / target_count
                 if sequence_coverage < minimum:
                     raise ValueError(f"时序模型完整历史窗口覆盖率{sequence_coverage:.2%}低于阈值")
@@ -155,19 +190,43 @@ class DailyInferenceRunner:
         grouped = predictions.groupby("trade_date")["raw_prediction"]
         predictions["rank_value"] = grouped.rank(method="first", ascending=False).astype(int)
         predictions["percentile"] = grouped.rank(method="average", pct=True)
-        predictions["score"] = (2.0 * predictions["percentile"] - 1.0).clip(-1.0, 1.0)
+        if prediction_scope in {"market_style", "industry"}:
+            counts = grouped.transform("size")
+            predictions["score"] = np.where(
+                counts > 1,
+                1.0 - 2.0 * (predictions["rank_value"] - 1.0) / (counts - 1.0),
+                0.0,
+            )
+        else:
+            predictions["score"] = (
+                2.0 * predictions["percentile"] - 1.0
+            ).clip(-1.0, 1.0)
         predictions["feature_cutoff_at"] = pd.Timestamp(inference["feature_cutoff_at"])
         computed_at = pd.Timestamp.now(tz="Asia/Shanghai")
         predictions["computed_at"] = computed_at
         predictions["source_vintage"] = f"qlib-daily#{job['job_id']}@{computed_at.isoformat()}"
         predictions_path = work_dir / "predictions.parquet"
         predictions.to_parquet(predictions_path, index=False)
+        future_function_guards = [
+            "frozen factor definitions computed on demand from source data",
+            "source rows limited to signal date and available by market close",
+            "inference data_cutoff >= signal date close",
+            "historical index membership",
+            "causal per-instrument history ending at signal date",
+            "training-fitted medians only",
+        ]
+        if research_target == "industry_rotation":
+            future_function_guards.append(
+                "exact-date SW2021 industry snapshots no earlier than 2021-12-13"
+            )
         manifest = {
             "schema_version": "alphablocks.qlib-inference.v1",
             "job_id": job["job_id"],
             "model_id": job["model_id"],
             "model_version": int(config["planned_model_version"]),
             "model_kind": model_kind,
+            "research_target": research_target,
+            "prediction_scope": prediction_scope,
             "dataset_hash": job["dataset_hash"],
             "training_job_id": source["training_job_id"],
             "trade_date": trade_date,
@@ -180,14 +239,7 @@ class DailyInferenceRunner:
             "sequence_coverage": sequence_coverage,
             "medians_source": "training_manifest",
             "row_count": len(predictions),
-            "future_function_guards": [
-                "frozen factor definitions computed on demand from source data",
-                "source rows limited to signal date and available by market close",
-                "inference data_cutoff >= signal date close",
-                "historical index membership",
-                "causal per-instrument history ending at signal date",
-                "training-fitted medians only",
-            ],
+            "future_function_guards": future_function_guards,
             "created_at": computed_at.isoformat(),
         }
         manifest_path = work_dir / "inference_manifest.json"

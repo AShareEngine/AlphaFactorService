@@ -8,12 +8,59 @@ import pandas as pd
 
 from factor_service.research.trainer import (
     _create_model,
+    _feature_importance,
+    _fit_model,
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
     _walk_forward_frame,
     predict_feature_frame,
 )
+
+
+def test_qlib_column_feature_importance_maps_back_to_frozen_factor_names() -> None:
+    class _Model:
+        @staticmethod
+        def get_feature_importance():
+            return pd.Series({"Column_0": 12, "Column_1": 7, "Column_2": 3})
+
+    rows = _feature_importance(_Model(), ["amount", "turnover", "momentum"])
+
+    assert rows == [
+        {"factor": "amount", "importance": 12.0, "rank": 1},
+        {"factor": "turnover", "importance": 7.0, "rank": 2},
+        {"factor": "momentum", "importance": 3.0, "rank": 3},
+    ]
+
+
+def test_catboost_fit_copies_framework_history_into_shared_evaluations() -> None:
+    class _RawModel:
+        @staticmethod
+        def get_evals_result():
+            return {
+                "learn": {"RMSE": [0.5, 0.4]},
+                "validation": {"RMSE": [0.52, 0.43]},
+            }
+
+    class _Model:
+        _alphablocks_num_boost_round = 10
+        _alphablocks_early_stopping_rounds = 2
+        model = _RawModel()
+
+        @staticmethod
+        def fit(*_args, **_kwargs):
+            return None
+
+    evaluations = {}
+    _fit_model(
+        "catboost", _Model(), object(), evaluations,
+        cancellation=None, progress=None,
+    )
+
+    assert evaluations == {
+        "train": [0.5, 0.4],
+        "valid": [0.52, 0.43],
+    }
 
 
 def test_recorder_experiment_uses_job_local_artifact_root(tmp_path: Path) -> None:
@@ -232,6 +279,53 @@ def test_prediction_rank_one_is_the_highest_score() -> None:
     assert str(ranked.loc["HIGH", "computed_at"].tz) == "Asia/Shanghai"
 
 
+def test_market_style_prediction_uses_full_minus_one_to_one_range() -> None:
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2024-01-02"), "STYLE_SMALL"),
+            (pd.Timestamp("2024-01-02"), "STYLE_LARGE"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    prediction = pd.Series([0.9, 0.1], index=index)
+    job = {
+        "job_id": "style-job",
+        "dataset_spec": {"prediction_scope": "market_style"},
+    }
+
+    ranked = _prediction_frame(
+        prediction, SimpleNamespace(), job,
+    ).set_index("entity_code")
+
+    assert ranked.loc["STYLE_SMALL", "rank_value"] == 1
+    assert ranked.loc["STYLE_SMALL", "score"] == 1.0
+    assert ranked.loc["STYLE_LARGE", "score"] == -1.0
+
+
+def test_industry_prediction_uses_full_minus_one_to_one_range() -> None:
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2024-01-02"), "801010.SI"),
+            (pd.Timestamp("2024-01-02"), "801020.SI"),
+            (pd.Timestamp("2024-01-02"), "801030.SI"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    prediction = pd.Series([0.9, 0.5, 0.1], index=index)
+    job = {
+        "job_id": "industry-job",
+        "dataset_spec": {"prediction_scope": "industry"},
+    }
+
+    ranked = _prediction_frame(
+        prediction, SimpleNamespace(), job,
+    ).set_index("entity_code")
+
+    assert ranked.loc["801010.SI", "score"] == 1.0
+    assert ranked.loc["801020.SI", "score"] == 0.0
+    assert ranked.loc["801030.SI", "score"] == -1.0
+
+
 def test_walk_forward_imputation_is_fitted_on_window_train_only() -> None:
     dates = pd.date_range("2024-01-02", periods=12, freq="B")
     index = pd.MultiIndex.from_product(
@@ -308,6 +402,8 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
         assert not prediction.index.duplicated().any()
         assert report["window_count"] == 1
         assert report["aggregate"]["test_days"] == 21
+        assert report["stability"]["status"] == "insufficient_windows"
+        assert report["stability"]["passed"] is False
     """
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

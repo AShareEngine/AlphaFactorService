@@ -79,7 +79,7 @@ class QlibTorchMLPModel:
         best_loss = float("inf")
         best_state = deepcopy(self.network.state_dict())
         stale = 0
-        evaluations.update({"train": [], "valid": []})
+        evaluations.update({"train": [], "valid": [], "steps": []})
         self.network.train()
         for step in range(1, self.max_steps + 1):
             if cancellation is not None:
@@ -98,6 +98,7 @@ class QlibTorchMLPModel:
                 valid_loss = loss_fn(self.network(x_valid).reshape(-1), y_valid).item()
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
+            evaluations["steps"].append(step)
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
@@ -216,7 +217,7 @@ class QlibTorchLSTMModel:
         best_head = deepcopy(self.head.state_dict())
         stale = 0
         successful_steps = 0
-        evaluations.update({"train": [], "valid": []})
+        evaluations.update({"train": [], "valid": [], "steps": []})
         self.encoder.train()
         self.head.train()
         for step in range(1, self.max_steps + 1):
@@ -240,6 +241,7 @@ class QlibTorchLSTMModel:
             valid_loss = self._validation_loss(valid, loss_fn, cancellation)
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
+            evaluations["steps"].append(step)
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
@@ -260,6 +262,7 @@ class QlibTorchLSTMModel:
             valid_loss = self._validation_loss(valid, loss_fn, cancellation)
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
+            evaluations["steps"].append(self.max_steps)
             best_loss = valid_loss
             best_encoder = deepcopy(self.encoder.state_dict())
             best_head = deepcopy(self.head.state_dict())

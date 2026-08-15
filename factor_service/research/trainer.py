@@ -13,6 +13,7 @@ import clickhouse_connect
 import numpy as np
 import pandas as pd
 
+from factor_service.model_validation import assess_walk_forward_stability
 from factor_service.research.config import Settings
 from factor_service.research.dataset import (
     DatasetBuilder,
@@ -21,6 +22,7 @@ from factor_service.research.dataset import (
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.research.snapshot import DatasetSnapshotStore
+from factor_service.research.training_diagnostics import build_training_diagnostics
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,7 @@ class QlibTrainer:
             )
             _checkpoint(cancellation)
             _progress(progress, "predicting", 82, {})
+            valid_prediction = model.predict(dataset, segment="valid")
             test_prediction = model.predict(dataset, segment="test")
             R.save_objects(trained_model=model)
             recorder_id = R.get_recorder().id
@@ -131,26 +134,56 @@ class QlibTrainer:
         prediction_frame.to_parquet(predictions_path, index=False)
         prediction_rows = len(prediction_frame)
         standard_metrics = _metrics(test_prediction, prepared.frame, prepared.segments["test"])
+        raw_validation_metrics = _metrics(
+            valid_prediction, prepared.frame, prepared.segments["valid"],
+        )
+        validation_metrics = {
+            "rows": raw_validation_metrics["test_rows"],
+            "days": raw_validation_metrics["test_days"],
+            "rmse": raw_validation_metrics["rmse"],
+            "ic": raw_validation_metrics["ic"],
+            "rank_ic": raw_validation_metrics["rank_ic"],
+            "ic_ir": raw_validation_metrics["ic_ir"],
+        }
         if walk_forward_report is not None:
             metrics: dict[str, Any] = {
                 **walk_forward_report["aggregate"],
                 "evaluation_mode": "walk_forward",
                 "walk_forward_windows": walk_forward_report["window_count"],
                 "standard_test": standard_metrics,
+                "validation": validation_metrics,
             }
         else:
-            metrics = {**standard_metrics, "evaluation_mode": "single_split"}
+            metrics = {
+                **standard_metrics,
+                "evaluation_mode": "single_split",
+                "validation": validation_metrics,
+            }
         feature_importance = _feature_importance(model, prepared.feature_names)
+        training_diagnostics = build_training_diagnostics(
+            model_kind, evals_result, model_params,
+        )
+        dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
+        research_target = str(
+            dataset_spec.get("research_target") or "stock_selection"
+        )
+        prediction_scope = str(
+            dataset_spec.get("prediction_scope") or "stock"
+        )
         manifest = {
             **prepared.manifest,
             "schema_version": "alphablocks.qlib-training.v1",
             "job_id": job["job_id"],
             "model_id": job["model_id"],
             "model_kind": model_kind,
+            "research_target": research_target,
+            "prediction_scope": prediction_scope,
             "model_version": int((job.get("config_json") or {}).get("planned_model_version") or 1),
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
             "model_params": model_params,
+            "validation_metrics": validation_metrics,
+            "training_diagnostics": training_diagnostics,
             "walk_forward": walk_forward_report,
             "environment": {
                 "python": platform.python_version(),
@@ -165,17 +198,21 @@ class QlibTrainer:
         manifest_path = work_dir / "manifest.json"
         metrics_path = work_dir / "metrics.json"
         importance_path = work_dir / "feature_importance.json"
+        training_diagnostics_path = work_dir / "training_diagnostics.json"
         config_path = work_dir / "task_config.json"
         model_path = work_dir / "model.pkl"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         importance_path.write_text(json.dumps(feature_importance, ensure_ascii=False, indent=2), encoding="utf-8")
+        training_diagnostics_path.write_text(
+            json.dumps(training_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
         config_path.write_text(json.dumps(job.get("config_json") or {}, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         with model_path.open("wb") as target:
             pickle.dump(model, target)
         bundle_path = work_dir / "qlib_experiment.tar.gz"
         with tarfile.open(bundle_path, "w:gz") as archive:
-            for path in [manifest_path, metrics_path, importance_path, config_path, model_path, predictions_path, dataset_manifest_path]:
+            for path in [manifest_path, metrics_path, importance_path, training_diagnostics_path, config_path, model_path, predictions_path, dataset_manifest_path]:
                 archive.add(path, arcname=path.name)
             if recorder_db.exists():
                 archive.add(recorder_db, arcname=recorder_db.name)
@@ -200,6 +237,7 @@ class QlibTrainer:
             ("dataset_manifest", dataset_manifest_path),
             ("predictions", predictions_path),
             ("manifest", manifest_path),
+            ("training_diagnostics", training_diagnostics_path),
         ]
         _checkpoint(cancellation)
         _progress(progress, "packaged", 88, {
@@ -232,7 +270,17 @@ class QlibTrainer:
         if frame.empty:
             raise ValueError("测试段预测结果为空")
         if frame.duplicated(["trade_date", "entity_code"]).any():
-            raise ValueError("预测文件包含重复的日期与股票")
+            raise ValueError("预测文件包含重复的日期与预测实体")
+        dataset_spec = dict(
+            job.get("dataset_spec")
+            or (job.get("config_json") or {}).get("dataset")
+            or {}
+        )
+        prediction_scope = str(
+            dataset_spec.get("prediction_scope") or "stock"
+        ).strip().lower()
+        if prediction_scope not in {"stock", "market_style", "industry"}:
+            raise ValueError(f"不支持的预测实体类型: {prediction_scope}")
         client = clickhouse_connect.get_client(
             host=self.settings.clickhouse_host,
             port=self.settings.clickhouse_port,
@@ -263,7 +311,7 @@ class QlibTrainer:
         now = datetime.now()
         rows = [
             [
-                row.trade_date, "stock", row.entity_code, job["model_id"],
+                row.trade_date, prediction_scope, row.entity_code, job["model_id"],
                 model_version,
                 row.raw_prediction, row.rank_value, row.percentile, row.score,
                 row.feature_cutoff_at, row.computed_at, row.source_vintage,
@@ -411,6 +459,9 @@ def _run_walk_forward(
         "aggregate": aggregate,
         "prediction_date_start": windows[0]["test"][0],
         "prediction_date_end": windows[-1]["test"][1],
+        "stability": assess_walk_forward_stability(
+            aggregate, window_count=total,
+        ),
     }
     return stitched, report
 
@@ -466,6 +517,17 @@ def _fit_model(
                 verbose_eval=20,
                 evals_result=evals_result,
             )
+            if model_kind == "catboost" and not evals_result:
+                raw_evaluations = model.model.get_evals_result()
+                train_metrics = dict(raw_evaluations.get("learn") or {})
+                valid_metrics = dict(raw_evaluations.get("validation") or {})
+                shared_metrics = [name for name in train_metrics if name in valid_metrics]
+                if shared_metrics:
+                    metric = shared_metrics[0]
+                    evals_result.update({
+                        "train": list(train_metrics[metric]),
+                        "valid": list(valid_metrics[metric]),
+                    })
         else:
             def mapped_progress(
                 _stage: str, percent: int, details: dict[str, Any],
@@ -752,10 +814,28 @@ def _prediction_frame(prediction: pd.Series, prepared: PreparedDataset, job: dic
     frame.rename(columns={"datetime": "trade_date", "instrument": "entity_code"}, inplace=True)
     frame["trade_date"] = pd.to_datetime(frame["trade_date"])
     grouped = frame.groupby("trade_date")["raw_prediction"]
-    # rank_value=1始终代表当日预测最高的股票，便于页面和TopN语义一致。
+    # rank_value=1始终代表当日预测最高的实体，便于页面和TopN语义一致。
     frame["rank_value"] = grouped.rank(method="first", ascending=False).astype(int)
     frame["percentile"] = grouped.rank(method="average", pct=True)
-    frame["score"] = (2.0 * frame["percentile"] - 1.0).clip(-1.0, 1.0)
+    dataset_spec = dict(
+        job.get("dataset_spec")
+        or (job.get("config_json") or {}).get("dataset")
+        or {}
+    )
+    prediction_scope = str(
+        dataset_spec.get("prediction_scope") or "stock"
+    ).strip().lower()
+    if prediction_scope in {"market_style", "industry"}:
+        # 风格与行业截面实体较少，使用完整区间映射，保证首尾为+1/-1，
+        # 而不是普通pct rank在N个样本时只能覆盖(-1, 1]。
+        counts = grouped.transform("size")
+        frame["score"] = np.where(
+            counts > 1,
+            1.0 - 2.0 * (frame["rank_value"] - 1.0) / (counts - 1.0),
+            0.0,
+        )
+    else:
+        frame["score"] = (2.0 * frame["percentile"] - 1.0).clip(-1.0, 1.0)
     trade_dates = pd.to_datetime(frame["trade_date"])
     if trade_dates.dt.tz is None:
         signal_dates = trade_dates.dt.tz_localize("Asia/Shanghai")
@@ -800,7 +880,13 @@ def _feature_importance(model: Any, feature_names: list[str]) -> list[dict[str, 
         if isinstance(raw_importance, pd.Series):
             mapped = {str(key): float(value) for key, value in raw_importance.items()}
             values = [
-                mapped.get(name, mapped.get(f"f{index}", 0.0))
+                mapped.get(
+                    name,
+                    mapped.get(
+                        f"Column_{index}",
+                        mapped.get(f"f{index}", 0.0),
+                    ),
+                )
                 for index, name in enumerate(feature_names)
             ]
         else:

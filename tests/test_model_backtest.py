@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from factor_service.model_backtest import _build_top_n_targets
+from factor_service.model_backtest import (
+    _architecture_walk_forward_backtest,
+    _build_top_n_targets,
+    _compose_architecture_signals,
+    _expand_architecture_prediction_scopes,
+)
 
 
 def _market(calendar: pd.DatetimeIndex, codes: list[str]) -> pd.DataFrame:
@@ -57,3 +63,349 @@ def test_top_n_rebalances_every_five_signal_sessions() -> None:
     )
 
     assert list(targets) == [calendar[1], calendar[6]]
+
+
+def _architecture_predictions() -> pd.DataFrame:
+    scores = {
+        ("model-a", "A"): 0.9,
+        ("model-a", "B"): 0.8,
+        ("model-a", "C"): 0.1,
+        ("model-b", "A"): 0.2,
+        ("model-b", "B"): 0.7,
+        ("model-b", "C"): 0.95,
+    }
+    return pd.DataFrame([
+        {
+            "signal_date": pd.Timestamp("2024-01-02"),
+            "code": code,
+            "model_id": model_id,
+            "model_version": 1,
+            "score": score,
+        }
+        for (model_id, code), score in scores.items()
+    ])
+
+
+def _architecture_engines() -> list[dict]:
+    return [
+        {
+            "engine_key": "first", "model_id": "model-a",
+            "model_version": 1, "priority": 1, "enabled": True,
+            "weight": 1.0, "score_threshold": 0.0, "top_n": 2,
+        },
+        {
+            "engine_key": "second", "model_id": "model-b",
+            "model_version": 1, "priority": 2, "enabled": True,
+            "weight": 1.0, "score_threshold": 0.0, "top_n": 2,
+        },
+    ]
+
+
+def test_architecture_priority_fills_candidates_in_engine_order() -> None:
+    result = _compose_architecture_signals(
+        _architecture_predictions(), _architecture_engines(),
+        merge_method="priority",
+    )
+
+    assert result["code"].tolist() == ["A", "B", "C"]
+    assert result["score"].tolist() == [1.0, 0.0, -1.0]
+
+
+def test_architecture_weighted_score_requires_common_engine_coverage() -> None:
+    predictions = _architecture_predictions()
+    predictions = predictions[
+        ~((predictions["model_id"] == "model-b") & (predictions["code"] == "A"))
+    ]
+    result = _compose_architecture_signals(
+        predictions, _architecture_engines(), merge_method="weighted_score",
+    )
+
+    assert result["code"].tolist() == ["B", "C"]
+    assert result.set_index("code").loc["B", "score"] == pytest.approx(0.75)
+
+
+def test_architecture_union_uses_each_engine_top_n_and_deduplicates() -> None:
+    result = _compose_architecture_signals(
+        _architecture_predictions(), _architecture_engines(),
+        merge_method="union",
+    )
+
+    assert result["code"].tolist() == ["C", "A", "B"]
+    assert result["code"].is_unique
+    assert result["score"].between(-1.0, 1.0).all()
+
+
+def test_hierarchical_architecture_gates_before_stock_ranking() -> None:
+    scores = {
+        ("style", "A"): 0.8, ("style", "B"): -0.2, ("style", "C"): 0.9,
+        ("industry", "A"): 0.6, ("industry", "B"): 0.7,
+        ("industry", "C"): -0.1,
+        ("stock", "A"): 0.7, ("stock", "B"): 0.9, ("stock", "C"): 0.8,
+    }
+    predictions = pd.DataFrame([
+        {
+            "signal_date": pd.Timestamp("2024-01-02"), "code": code,
+            "model_id": model_id, "model_version": 1, "score": score,
+        }
+        for (model_id, code), score in scores.items()
+    ])
+    engines = [
+        {
+            "engine_key": "style", "role": "market_style",
+            "model_id": "style", "model_version": 1, "priority": 1,
+            "enabled": True, "weight": 1.0, "score_threshold": 0.0,
+            "top_n": 20,
+        },
+        {
+            "engine_key": "industry", "role": "industry_rotation",
+            "model_id": "industry", "model_version": 1, "priority": 2,
+            "enabled": True, "weight": 1.0, "score_threshold": 0.0,
+            "top_n": 20,
+        },
+        {
+            "engine_key": "stock", "role": "stock_selection",
+            "model_id": "stock", "model_version": 1, "priority": 3,
+            "enabled": True, "weight": 1.0, "score_threshold": 0.0,
+            "top_n": 1,
+        },
+    ]
+
+    result = _compose_architecture_signals(
+        predictions, engines, merge_method="weighted_score",
+        pipeline_mode="hierarchical",
+    )
+
+    assert result[["code", "score"]].to_dict("records") == [{
+        "code": "A", "score": pytest.approx(0.7),
+    }]
+    audit = result.attrs["architecture_gate_audit"]
+    assert audit["pipeline_mode"] == "hierarchical"
+    assert [item["average_count"] for item in audit["stages"]] == [
+        3.0, 2.0, 1.0, 1.0,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("gate_role", "gate_scores", "expected_codes", "expected_stage"),
+    [
+        ("market_style", {"A": 0.8, "B": -0.2, "C": 0.9}, ["C", "A"], "style_gate"),
+        ("industry_rotation", {"A": 0.6, "B": 0.7, "C": -0.1}, ["B", "A"], "industry_gate"),
+    ],
+)
+def test_hierarchical_ablation_allows_one_optional_gate(
+    gate_role, gate_scores, expected_codes, expected_stage,
+) -> None:
+    predictions = pd.DataFrame([
+        {
+            "signal_date": pd.Timestamp("2024-01-02"), "code": code,
+            "model_id": "gate", "model_version": 1, "score": score,
+        }
+        for code, score in gate_scores.items()
+    ] + [
+        {
+            "signal_date": pd.Timestamp("2024-01-02"), "code": code,
+            "model_id": "stock", "model_version": 1, "score": score,
+        }
+        for code, score in {"A": 0.7, "B": 0.9, "C": 0.8}.items()
+    ])
+    engines = [
+        {
+            "engine_key": "gate", "role": gate_role,
+            "model_id": "gate", "model_version": 1, "priority": 1,
+            "enabled": True, "weight": 1.0, "score_threshold": 0.0,
+            "top_n": 20,
+        },
+        {
+            "engine_key": "stock", "role": "stock_selection",
+            "model_id": "stock", "model_version": 1, "priority": 2,
+            "enabled": True, "weight": 1.0, "score_threshold": -1.0,
+            "top_n": 20,
+        },
+    ]
+
+    result = _compose_architecture_signals(
+        predictions, engines, merge_method="weighted_score",
+        pipeline_mode="hierarchical",
+    )
+
+    assert result["code"].tolist() == expected_codes
+    stages = result.attrs["architecture_gate_audit"]["stages"]
+    assert [item["key"] for item in stages] == [
+        "input", expected_stage, "stock_rank",
+    ]
+
+
+def test_market_style_prediction_is_broadcast_to_signal_day_members(monkeypatch) -> None:
+    predictions = pd.DataFrame([
+        {
+            "signal_date": pd.Timestamp("2024-01-02"),
+            "entity_type": "market_style", "code": "STYLE_SMALL",
+            "model_id": "style", "model_version": 1, "score": 0.8,
+        },
+        {
+            "signal_date": pd.Timestamp("2024-01-02"),
+            "entity_type": "market_style", "code": "STYLE_LARGE",
+            "model_id": "style", "model_version": 1, "score": -0.8,
+        },
+        {
+            "signal_date": pd.Timestamp("2024-01-02"),
+            "entity_type": "stock", "code": "A",
+            "model_id": "stock", "model_version": 1, "score": 0.3,
+        },
+    ])
+    monkeypatch.setattr(
+        "factor_service.model_backtest._market_style_membership_for_backtest",
+        lambda *_args: pd.DataFrame([
+            {
+                "signal_date": pd.Timestamp("2024-01-02"),
+                "style_entity": "STYLE_SMALL", "code": "A",
+            },
+            {
+                "signal_date": pd.Timestamp("2024-01-02"),
+                "style_entity": "STYLE_LARGE", "code": "B",
+            },
+        ]),
+    )
+    engines = [
+        {
+            "engine_key": "style", "role": "market_style",
+            "prediction_scope": "market_style", "model_id": "style",
+            "model_version": 1, "enabled": True,
+        },
+        {
+            "engine_key": "stock", "role": "stock_selection",
+            "prediction_scope": "stock", "model_id": "stock",
+            "model_version": 1, "enabled": True,
+        },
+    ]
+
+    expanded = _expand_architecture_prediction_scopes(
+        predictions, engines,
+        date_start=pd.Timestamp("2024-01-02").date(),
+        date_end=pd.Timestamp("2024-01-02").date(),
+    )
+
+    style_rows = expanded[expanded["model_id"] == "style"].sort_values("code")
+    assert style_rows[["code", "score"]].to_dict("records") == [
+        {"code": "A", "score": 0.8},
+        {"code": "B", "score": -0.8},
+    ]
+
+
+def test_industry_prediction_is_broadcast_to_exact_date_members(monkeypatch) -> None:
+    predictions = pd.DataFrame([{
+        "signal_date": pd.Timestamp("2024-01-02").date(),
+        "entity_type": "industry", "code": "801010.SI",
+        "model_id": "industry", "model_version": 1, "score": 0.8,
+    }])
+    engines = [{
+        "engine_key": "industry", "role": "industry_rotation",
+        "prediction_scope": "industry", "model_id": "industry",
+        "model_version": 1, "enabled": True,
+    }]
+
+    monkeypatch.setattr(
+        "factor_service.model_backtest._industry_membership_for_backtest",
+        lambda *_args: pd.DataFrame([
+            {
+                "signal_date": pd.Timestamp("2024-01-02"),
+                "industry_entity": "801010.SI", "code": "A",
+            },
+            {
+                "signal_date": pd.Timestamp("2024-01-02"),
+                "industry_entity": "801010.SI", "code": "B",
+            },
+        ]),
+    )
+
+    expanded = _expand_architecture_prediction_scopes(
+        predictions, engines,
+        date_start=pd.Timestamp("2024-01-02").date(),
+        date_end=pd.Timestamp("2024-01-02").date(),
+    )
+
+    assert expanded[["code", "score"]].to_dict("records") == [
+        {"code": "A", "score": 0.8},
+        {"code": "B", "score": 0.8},
+    ]
+
+
+def test_architecture_walk_forward_backtest_reports_complete_oos_windows() -> None:
+    windows = [
+        ("2024-01-02", "2024-01-08", 0.001),
+        ("2024-02-01", "2024-02-07", 0.001),
+        ("2024-03-01", "2024-03-07", 0.001),
+    ]
+    daily = pd.concat([
+        pd.DataFrame({
+            "trade_date": pd.date_range(start, end, freq="B"),
+            "portfolio_return": value,
+            "benchmark_return": 0.0,
+            "excess_return": value,
+            "turnover": 0.1,
+        })
+        for start, end, value in windows
+    ], ignore_index=True)
+    contract = {
+        "eligible": True,
+        "window_count": 3,
+        "windows": [
+            {"window": index, "test_start": start, "test_end": end}
+            for index, (start, end, _value) in enumerate(windows, start=1)
+        ],
+    }
+
+    report = _architecture_walk_forward_backtest(daily, contract)
+
+    assert report["complete_window_count"] == 3
+    assert report["status"] == "stable"
+    assert report["aggregate"]["positive_excess_window_ratio"] == pytest.approx(1.0)
+    assert report["failed_checks"] == []
+
+
+def test_architecture_walk_forward_backtest_marks_volatile_windows_mixed() -> None:
+    windows = [
+        ("2024-01-02", "2024-01-08", -0.001),
+        ("2024-02-01", "2024-02-07", 0.001),
+        ("2024-03-01", "2024-03-07", 0.001),
+    ]
+    daily = pd.concat([
+        pd.DataFrame({
+            "trade_date": pd.date_range(start, end, freq="B"),
+            "portfolio_return": value,
+            "benchmark_return": 0.0,
+            "excess_return": value,
+            "turnover": 0.1,
+        })
+        for start, end, value in windows
+    ], ignore_index=True)
+    report = _architecture_walk_forward_backtest(daily, {
+        "eligible": True, "window_count": 3,
+        "windows": [
+            {"window": index, "test_start": start, "test_end": end}
+            for index, (start, end, _value) in enumerate(windows, start=1)
+        ],
+    })
+
+    assert report["status"] == "mixed"
+    assert "worst_window" in report["failed_checks"]
+
+
+def test_architecture_walk_forward_backtest_does_not_count_partial_window() -> None:
+    daily = pd.DataFrame({
+        "trade_date": pd.date_range("2024-01-03", "2024-01-08", freq="B"),
+        "portfolio_return": 0.01,
+        "benchmark_return": 0.0,
+        "excess_return": 0.01,
+        "turnover": 0.1,
+    })
+    report = _architecture_walk_forward_backtest(daily, {
+        "eligible": True, "window_count": 1,
+        "windows": [{
+            "window": 1, "test_start": "2024-01-02", "test_end": "2024-01-08",
+        }],
+    })
+
+    assert report["evaluated_window_count"] == 1
+    assert report["complete_window_count"] == 0
+    assert report["status"] == "insufficient"
