@@ -67,6 +67,33 @@ def test_prediction_query_without_date_returns_only_latest_cross_section(monkeyp
     assert captured["parameters"]["limit"] == 1000
 
 
+def test_prediction_query_for_entity_returns_cross_date_history(monkeypatch) -> None:
+    captured = {}
+
+    class _Client:
+        def query(self, query, parameters):
+            captured["query"] = query
+            captured["parameters"] = parameters
+            return SimpleNamespace(result_rows=[])
+
+    monkeypatch.setattr(model_repository, "client", lambda: _Client())
+    monkeypatch.setattr(
+        model_repository, "settings",
+        lambda: SimpleNamespace(model_database="ab_model"),
+    )
+
+    rows = model_repository.list_model_predictions(
+        model_id="model-a", model_version=1,
+        entity_code="000001.SZ", limit=120,
+    )
+
+    assert rows == []
+    assert "entity_code = {entity_code:String}" in captured["query"]
+    assert "SELECT max(trade_date)" not in captured["query"]
+    assert captured["parameters"]["entity_code"] == "000001.SZ"
+    assert captured["parameters"]["limit"] == 120
+
+
 def test_prediction_overview_reports_distribution_and_cross_day_stability(
     monkeypatch,
 ) -> None:

@@ -122,23 +122,33 @@ def insert_model_predictions(payload: ModelPredictionBatchIn) -> int:
 
 def list_model_predictions(
     *, model_id: str, model_version: int, trade_date: Optional[date] = None,
-    limit: int = 500,
+    entity_code: str = "", limit: int = 500,
 ) -> list[ModelPredictionOut]:
     database = settings().model_database
-    condition = "AND trade_date = {trade_date:Date}" if trade_date else f"""
+    clean_entity_code = str(entity_code or "").strip()
+    if trade_date:
+        date_condition = "AND trade_date = {trade_date:Date}"
+    elif clean_entity_code:
+        # 单标的研究需要返回跨日期历史；普通截面查询仍只取最新交易日。
+        date_condition = ""
+    else:
+        date_condition = f"""
           AND trade_date = (
               SELECT max(trade_date)
               FROM {database}.model_predictions_daily FINAL
               WHERE model_id = {{model_id:String}}
                 AND model_version = {{model_version:UInt32}}
           )
-    """
+        """
+    entity_condition = "AND entity_code = {entity_code:String}" if clean_entity_code else ""
     params = {
         "model_id": model_id, "model_version": model_version,
         "limit": max(1, min(limit, 5000)),
     }
     if trade_date:
         params["trade_date"] = trade_date
+    if clean_entity_code:
+        params["entity_code"] = clean_entity_code
     rows = client().query(
         f"""
         SELECT trade_date, entity_code, raw_prediction, rank_value, percentile,
@@ -147,7 +157,8 @@ def list_model_predictions(
         FROM {database}.model_predictions_daily FINAL
         WHERE model_id = {{model_id:String}}
           AND model_version = {{model_version:UInt32}}
-          {condition}
+          {date_condition}
+          {entity_condition}
         ORDER BY trade_date DESC, score DESC, entity_code
         LIMIT {{limit:UInt32}}
         """,

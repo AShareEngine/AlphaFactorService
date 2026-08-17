@@ -2119,6 +2119,7 @@ def list_predictions(
     model_id: str,
     model_version: int,
     trade_date: str = "",
+    entity_code: str = "",
     limit: int = Query(default=500, ge=1, le=5000),
 ) -> dict[str, Any]:
     try:
@@ -2127,6 +2128,7 @@ def list_predictions(
             model_id=model_id,
             model_version=model_version,
             trade_date=parsed_date,
+            entity_code=entity_code,
             limit=limit,
         )
         return {"ok": True, "predictions": rows}
