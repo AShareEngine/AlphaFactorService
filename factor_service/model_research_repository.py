@@ -3989,11 +3989,9 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     try:
         horizon = int(raw_horizon)
     except (TypeError, ValueError) as exc:
-        raise ModelResearchError(
-            "标签周期只支持T+1、T+3、T+5或T+10交易日"
-        ) from exc
-    if horizon not in {1, 3, 5, 10}:
-        raise ModelResearchError("标签周期只支持T+1、T+3、T+5或T+10交易日")
+        raise ModelResearchError("单周期标签必须是T+1至T+30交易日") from exc
+    if horizon < 1 or horizon > 30:
+        raise ModelResearchError("单周期标签必须是T+1至T+30交易日")
     label = (
         {
             "kind": f"future_{horizon}d_market_style_rank",
@@ -4217,7 +4215,7 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     test_months = integer("test_months", 12, 1, 36)
     step_months = integer("step_months", 12, 1, 36)
     max_windows = integer("max_windows", 4, 1, 12)
-    embargo_days = integer("embargo_days", 5, 1, 20)
+    embargo_days = integer("embargo_days", 5, 1, 30)
     if step_months < test_months:
         raise ModelResearchError("Walk-Forward步长不得小于测试窗口，避免样本外预测重叠")
     return {

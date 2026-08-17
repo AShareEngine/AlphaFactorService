@@ -248,7 +248,7 @@ def _validate_walk_forward(source: Any) -> None:
         source.get("step_months", 12), "walk_forward.step_months", 1, 36,
     )
     _integer(source.get("max_windows", 4), "walk_forward.max_windows", 1, 12)
-    _integer(source.get("embargo_days", 5), "walk_forward.embargo_days", 1, 20)
+    _integer(source.get("embargo_days", 5), "walk_forward.embargo_days", 1, 30)
     if step_months < test_months:
         raise PermanentJobError("Walk-Forward步长不得小于测试窗口")
 

@@ -105,7 +105,7 @@ class DatasetBuilder:
                 "label": "个股选股",
                 "ready": True,
                 "prediction_scope": "stock",
-                "reason": "支持冻结T+1、T+3、T+5或T+10个股收益截面排名标签。",
+                "reason": "支持冻结T+1至T+30个股收益截面排名标签。",
                 "missing_fields": [],
             },
             {

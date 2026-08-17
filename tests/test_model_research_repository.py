@@ -207,13 +207,23 @@ def test_dataset_contract_freezes_label_horizon_and_matching_embargo() -> None:
     assert spec["split"]["embargo_days"] == 10
 
 
-@pytest.mark.parametrize("horizon", [0, 2, 20, "invalid"])
+@pytest.mark.parametrize("horizon", [0, 31, "invalid"])
 def test_dataset_contract_rejects_unsupported_label_horizon(horizon) -> None:
-    with pytest.raises(ModelResearchError, match="标签周期只支持"):
+    with pytest.raises(ModelResearchError, match=r"T\+1至T\+30"):
         _dataset_spec({
             **_source(),
             "label_horizon_trading_days": horizon,
         })
+
+
+@pytest.mark.parametrize("horizon", [1, 2, 5, 20, 30])
+def test_dataset_contract_accepts_single_horizon_range(horizon) -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "label_horizon_trading_days": horizon,
+    })
+    assert spec["label"]["horizon_trading_days"] == horizon
+    assert spec["split"]["embargo_days"] == horizon
 
 
 def test_market_style_dataset_contract_freezes_target_and_style_label() -> None:
