@@ -1,0 +1,286 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: AlphaBlocksStudio
+        - menubar [ref=e8]:
+          - menuitem "模式运行" [ref=e9]
+          - menuitem "数据资产" [ref=e14]
+          - menuitem "数据同步" [ref=e19]
+          - menuitem "因子库" [ref=e24]
+          - menuitem "模型中心" [ref=e29]
+          - menuitem "其他" [ref=e34]
+        - generic [ref=e39]:
+          - button "实体资产 已同步 9/55" [ref=e190] [cursor=pointer]:
+            - generic [ref=e44]: 实体资产
+            - strong [ref=e45]: 已同步 9/55
+          - button "切换主题" [ref=e46] [cursor=pointer]
+    - main [ref=e51]:
+      - generic [ref=e54]:
+        - complementary [ref=e55]:
+          - generic [ref=e56]:
+            - generic [ref=e57]: TRAINING WORKFLOW
+            - strong [ref=e58]: 训练流程
+            - generic [ref=e59]: 按步骤完成配置，最后统一提交。
+          - navigation "训练步骤" [ref=e60]:
+            - button "1 特征选择 0 个特征" [ref=e406] [cursor=pointer]:
+              - generic [ref=e62]: "1"
+              - generic [ref=e63]:
+                - strong [ref=e64]: 特征选择
+                - generic [ref=e65]: 0 个特征
+            - button "2 训练目标 确定样本、标签与切分" [active] [ref=e407] [cursor=pointer]:
+              - generic [ref=e67]: "2"
+              - generic [ref=e68]:
+                - strong [ref=e69]: 训练目标
+                - generic [ref=e70]: 确定样本、标签与切分
+            - button "✓ 参数配置 LightGBM · 单模型训练" [ref=e71] [cursor=pointer]:
+              - generic [ref=e72]: ✓
+              - generic [ref=e73]:
+                - strong [ref=e74]: 参数配置
+                - generic [ref=e75]: LightGBM · 单模型训练
+            - button "4 执行训练 创建任务并进入队列" [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: "4"
+              - generic [ref=e78]:
+                - strong [ref=e79]: 执行训练
+                - generic [ref=e80]: 创建任务并进入队列
+            - button "5 结果入库 等待训练提交" [ref=e81] [cursor=pointer]:
+              - generic [ref=e82]: "5"
+              - generic [ref=e83]:
+                - strong [ref=e84]: 结果入库
+                - generic [ref=e85]: 等待训练提交
+          - generic [ref=e86]:
+            - text: 当前配置
+            - generic [ref=e87]:
+              - generic [ref=e88]:
+                - term [ref=e89]: 目标
+                - definition [ref=e90]: 个股选股
+              - generic [ref=e91]:
+                - term [ref=e92]: 算法
+                - definition [ref=e93]: LightGBM
+              - generic [ref=e94]:
+                - term [ref=e95]: 特征
+                - definition [ref=e96]: 0 个
+              - generic [ref=e97]:
+                - term [ref=e98]: 标签
+                - definition [ref=e99]: T+5
+          - generic [ref=e100]:
+            - generic [ref=e101]:
+              - generic [ref=e102]: 训练节点
+              - button "检查" [ref=e103] [cursor=pointer]
+            - button "本机训练 LOCAL" [ref=e195] [cursor=pointer]:
+              - generic [ref=e197]:
+                - strong [ref=e198]: 本机训练
+                - generic [ref=e199]: LOCAL
+          - generic [ref=e104]:
+            - button "参数实验" [ref=e105] [cursor=pointer]
+            - button "训练任务" [ref=e106] [cursor=pointer]
+        - generic [ref=e107]:
+          - generic [ref=e108]:
+            - generic [ref=e109]:
+              - generic [ref=e110]: MODEL TRAINING
+              - strong [ref=e111]: 模型训练
+              - generic [ref=e112]: 选择因子并形成可复现的 Qlib 训练任务
+            - generic [ref=e113]:
+              - generic [ref=e114]:
+                - generic [ref=e115]: 草稿
+                - strong [ref=e116]: 等待修改
+              - button "研究模板（0）" [ref=e201] [cursor=pointer]
+              - button "保存为模板" [ref=e119] [cursor=pointer]
+          - generic [ref=e121]:
+            - generic [ref=e122]:
+              - generic [ref=e123]: 研究目标
+              - strong [ref=e124]: 个股选股
+            - generic [ref=e125]:
+              - generic [ref=e126]: 股票池
+              - generic [ref=e204] [cursor=pointer]:
+                - generic:
+                  - combobox [ref=e206]
+                  - generic [ref=e207]: 中证500
+            - generic [ref=e127]:
+              - generic [ref=e128]: 特征数
+              - strong [ref=e129]: "0"
+            - generic [ref=e130]:
+              - generic [ref=e131]: 预测周期
+              - strong [ref=e132]: T+5
+            - generic [ref=e133]:
+              - generic [ref=e134]: 数据集天数
+              - strong [ref=e135]: "--"
+            - generic [ref=e136]:
+              - generic [ref=e137]: 状态
+              - strong [ref=e138]: 待配置
+          - generic [ref=e409]:
+            - generic [ref=e410]:
+              - generic [ref=e411]: 步骤 2
+              - heading "训练目标与时间切分" [level=2] [ref=e412]
+            - generic [ref=e413]:
+              - generic [ref=e414]:
+                - generic [ref=e420]:
+                  - heading "第二步：训练目标 T+N" [level=3] [ref=e421]
+                  - paragraph [ref=e422]: 训练目标与标签 Horizon 独立配置，不与回测调仓周期混用。
+                - generic [ref=e423]:
+                  - generic [ref=e424]:
+                    - generic [ref=e425]: 目标类型
+                    - generic [ref=e427] [cursor=pointer]:
+                      - generic:
+                        - combobox "目标类型 回归目标（未来截面排名） AlphaBlocks当前以连续截面Score训练，适合未来收益排序与TopN选股。" [ref=e429]
+                        - generic [ref=e430]: 回归目标（未来截面排名）
+                    - generic [ref=e435]: AlphaBlocks当前以连续截面Score训练，适合未来收益排序与TopN选股。
+                  - generic [ref=e436]:
+                    - generic [ref=e437]:
+                      - generic [ref=e438]: T+N 参数
+                      - generic [ref=e439]: 允许 1～30 个交易日
+                    - radiogroup "radio-group" [ref=e440]:
+                      - generic [ref=e441]:
+                        - radio "T+1" [ref=e442]
+                        - generic [ref=e443] [cursor=pointer]: T+1
+                      - generic [ref=e444]:
+                        - radio "T+3" [ref=e445]
+                        - generic [ref=e446] [cursor=pointer]: T+3
+                      - generic [ref=e447]:
+                        - radio "T+5" [checked] [ref=e448]
+                        - generic [ref=e449] [cursor=pointer]: T+5
+                      - generic [ref=e450]:
+                        - radio "T+10" [ref=e451]
+                        - generic [ref=e452] [cursor=pointer]: T+10
+                    - generic [ref=e453]:
+                      - generic [ref=e454]:
+                        - button "减少数值" [ref=e455] [cursor=pointer]
+                        - button "增加数值" [ref=e459] [cursor=pointer]
+                        - spinbutton [ref=e465]: "5"
+                      - generic [ref=e466]: 交易日
+                  - generic [ref=e468]:
+                    - generic [ref=e473]:
+                      - strong [ref=e474]: 多周期训练
+                      - generic [ref=e475]: 一次创建多个独立标签模型，并在完成后支持ICIR融合。
+                    - generic [ref=e476]:
+                      - switch
+                      - generic [ref=e477] [cursor=pointer]
+                  - generic [ref=e479]:
+                    - generic [ref=e480]: 标签预览
+                    - strong [ref=e481]: 未来5交易日后复权收益截面排名 [-1, 1]
+                    - code [ref=e482]: 2 × RankPct(ADJ_CLOSE[T+5] / ADJ_CLOSE[T] - 1) - 1
+                  - generic [ref=e483]:
+                    - generic [ref=e484]:
+                      - generic [ref=e485]: 生效日期预览
+                      - strong [ref=e486]: "--"
+                    - generic [ref=e487]: 仅作自然日预览，服务端会按真实交易日历校正。
+                  - alert [ref=e488]:
+                    - generic [ref=e492]: T+N是训练标签周期，不是成交日或回测调仓周期。
+              - generic [ref=e494]:
+                - generic [ref=e499]:
+                  - heading "时空切分预览 (Time Split)" [level=3] [ref=e500]
+                  - paragraph [ref=e501]: 冻结总样本区间，服务端按交易日顺序按设置比例切分。
+                - generic [ref=e502]:
+                  - generic [ref=e503]:
+                    - generic [ref=e504]: 冻结总日期范围
+                    - generic [ref=e505]:
+                      - combobox "冻结总日期范围 -" [ref=e509]
+                      - generic [ref=e510]: "-"
+                      - combobox "结束日期" [ref=e511]
+                  - generic [ref=e512]:
+                    - generic [ref=e513]: 数据截止时间
+                    - combobox "数据截止时间 源数据可用时间不得晚于该截止点，且截止点不能早于最后信号日收盘。" [ref=e522]: 2026-08-18 21:08:05
+                    - generic [ref=e523]: 源数据可用时间不得晚于该截止点，且截止点不能早于最后信号日收盘。
+                  - generic [ref=e524]:
+                    - generic [ref=e525]:
+                      - generic [ref=e526]: 验证集比例 (%)
+                      - generic [ref=e527]:
+                        - button "减少数值" [ref=e528] [cursor=pointer]
+                        - button "增加数值" [ref=e532] [cursor=pointer]
+                        - spinbutton "验证集比例 (%) 减少数值 增加数值 用于早停和参数选择" [ref=e538]: "20"
+                      - generic [ref=e539]: 用于早停和参数选择
+                    - generic [ref=e540]:
+                      - generic [ref=e541]: 测试集比例 (%)
+                      - generic [ref=e542]:
+                        - button "减少数值" [ref=e543] [cursor=pointer]
+                        - button "增加数值" [ref=e547] [cursor=pointer]
+                        - spinbutton "测试集比例 (%) 减少数值 增加数值 用于样本外最终审计" [ref=e553]: "20"
+                      - generic [ref=e554]: 用于样本外最终审计
+                    - generic [ref=e555]:
+                      - generic [ref=e556]: 训练集比例 (%)
+                      - generic [ref=e557]:
+                        - button "减少数值" [ref=e558] [cursor=pointer]
+                        - button "增加数值" [ref=e562] [cursor=pointer]
+                        - spinbutton "训练集比例 (%) 减少数值 增加数值 由 100% − 验证集 − 测试集 自动得出" [disabled] [ref=e568]: "60"
+                      - generic [ref=e569]: 由 100% − 验证集 − 测试集 自动得出
+                  - generic [ref=e570]:
+                    - article [ref=e571]:
+                      - generic [ref=e572]:
+                        - generic [ref=e573]:
+                          - strong [ref=e574]: 训练集 (Training)
+                          - generic [ref=e575]: 用于拟合模型参数
+                        - generic [ref=e576]: "--d"
+                      - generic [ref=e580]:
+                        - generic [ref=e581]: 等待选择总日期范围
+                        - generic [ref=e582]: 60%
+                    - article [ref=e583]:
+                      - generic [ref=e584]:
+                        - generic [ref=e585]:
+                          - strong [ref=e586]: 验证集 (Validation)
+                          - generic [ref=e587]: 用于早停和参数选择
+                        - generic [ref=e588]: "--d"
+                      - generic [ref=e592]:
+                        - generic [ref=e593]: 等待选择总日期范围
+                        - generic [ref=e594]: 20%
+                    - article [ref=e595]:
+                      - generic [ref=e596]:
+                        - generic [ref=e597]:
+                          - strong [ref=e598]: 测试集 (Testing)
+                          - generic [ref=e599]: 用于样本外最终审计
+                        - generic [ref=e600]: "--d"
+                      - generic [ref=e604]:
+                        - generic [ref=e605]: 等待选择总日期范围
+                        - generic [ref=e606]: 20%
+                  - alert [ref=e607]:
+                    - generic [ref=e611]: 两处分界会分别清除T+5个交易日，测试段不会参与模型和参数选择。
+              - generic [ref=e614]:
+                - generic [ref=e619]:
+                  - strong [ref=e620]: Walk-Forward 稳定性诊断
+                  - generic [ref=e621]: 滚动窗口独立训练并拼接样本外预测，检查不同历史阶段的稳定性。
+                - generic [ref=e622]:
+                  - switch
+                  - generic [ref=e623] [cursor=pointer]
+          - generic [ref=e626]:
+            - generic [ref=e627]:
+              - generic [ref=e628]: 训练目标校验
+              - heading "训练前检查" [level=2] [ref=e629]
+            - alert [ref=e630]:
+              - generic [ref=e634]:
+                - generic [ref=e635]: 未来函数检查尚未通过
+                - paragraph [ref=e636]: 构建数据集时，调度服务还会重新执行全部服务端约束。
+            - generic [ref=e637]:
+              - generic [ref=e638]:
+                - generic [ref=e639]: 通过
+                - generic [ref=e641]: 个股选股的数据与PIT时间字段已就绪
+              - generic [ref=e642]:
+                - generic [ref=e643]: 通过
+                - generic [ref=e645]: 单周期标签范围为T+1至T+30；多周期研究固定使用T+1/T+3/T+5/T+10
+              - generic [ref=e646]:
+                - generic [ref=e647]: 通过
+                - generic [ref=e649]: 训练执行节点“本机训练”配置可用
+              - generic [ref=e650]:
+                - generic [ref=e651]: 待处理
+                - generic [ref=e653]: 因子版本、公式参数和参数哈希可冻结
+              - generic [ref=e654]:
+                - generic [ref=e655]: 通过
+                - generic [ref=e657]: 训练数据在任务内构建并冻结Parquet，不写入因子值明细表
+              - generic [ref=e658]:
+                - generic [ref=e659]: 通过
+                - generic [ref=e661]: 源数据截止时间不得早于最后一个信号日收盘
+              - generic [ref=e662]:
+                - generic [ref=e663]: 通过
+                - generic [ref=e665]: 训练/验证边界按T+5标签清除5个交易日
+          - generic [ref=e180]:
+            - generic [ref=e181]:
+              - generic [ref=e182]: 步骤 2 / 5
+              - strong [ref=e183]: 训练目标
+              - generic [ref=e184]: 确定样本、标签与切分
+            - generic [ref=e185]:
+              - button "上一步" [ref=e186] [cursor=pointer]
+              - button "下一步" [ref=e188] [cursor=pointer]
+  - generic [ref=e387]:
+    - button "Toggle Nuxt DevTools" [ref=e388] [cursor=pointer]
+    - generic "Page load time" [ref=e392]:
+      - generic [ref=e393]: "228"
+      - generic [ref=e394]: ms
+    - button "Toggle Component Inspector" [ref=e396] [cursor=pointer]

@@ -322,6 +322,9 @@ class _Scheduler:
         self.submitted.append(dict(job))
         return {"accepted": True, "job_id": job["job_id"]}
 
+    def status(self):
+        return {"ready": True, "busy": False, "active_job_id": "", "progress": {}}
+
 
 def _client(monkeypatch, repository, scheduler) -> TestClient:
     app = FastAPI()
@@ -379,6 +382,75 @@ def test_training_targets_expose_real_availability(monkeypatch) -> None:
         "target": "market_style", "ready": True,
     }
     assert response.json()["targets"][2]["minimum_date"] == "2021-12-13"
+
+
+def test_execution_nodes_and_local_status_are_exposed_without_secrets(monkeypatch) -> None:
+    from factor_service.research import remote
+
+    monkeypatch.setattr(remote, "execution_nodes", lambda: [
+        {"id": "local", "type": "local", "available": True},
+        {
+            "id": "autodl-gpu-01", "type": "remote", "available": True,
+            "credential_type": "password_env",
+        },
+    ])
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+
+    nodes = client.get("/model-research/execution-nodes")
+    status = client.get("/model-research/execution-nodes/local/status")
+
+    assert nodes.status_code == 200
+    assert nodes.json()["nodes"][1]["id"] == "autodl-gpu-01"
+    assert "private-value" not in nodes.text
+    assert "ssh_password" not in nodes.text
+    assert status.status_code == 200
+    assert status.json()["status"]["online"] is True
+
+
+def test_execution_node_settings_crud_api_never_returns_password_values(monkeypatch) -> None:
+    from factor_service.research import remote_settings
+
+    node = {
+        "id": "autodl-gpu-01",
+        "type": "remote",
+        "name": "AutoDL GPU",
+        "host": "gpu.example.test",
+        "password_env": "TEST_AUTODL_PASSWORD",
+    }
+    monkeypatch.setattr(remote_settings, "list_remote_node_settings", lambda: [node])
+    monkeypatch.setattr(
+        remote_settings, "create_remote_node_setting", lambda payload: {**node, **payload},
+    )
+    monkeypatch.setattr(
+        remote_settings, "update_remote_node_setting",
+        lambda node_id, payload: {**node, **payload, "id": node_id},
+    )
+    monkeypatch.setattr(
+        remote_settings, "delete_remote_node_setting",
+        lambda node_id: {"id": node_id, "deleted": True},
+    )
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+
+    listed = client.get("/model-research/execution-node-settings")
+    created = client.post(
+        "/model-research/execution-node-settings", json={"id": "autodl-gpu-01"},
+    )
+    updated = client.put(
+        "/model-research/execution-node-settings/autodl-gpu-01",
+        json={"name": "AutoDL A100"},
+    )
+    deleted = client.delete(
+        "/model-research/execution-node-settings/autodl-gpu-01",
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["security"]["password_values_returned"] is False
+    assert created.status_code == 201
+    assert updated.json()["node"]["name"] == "AutoDL A100"
+    assert deleted.json()["deleted"] is True
+    assert "private-password" not in "".join(
+        response.text for response in (listed, created, updated, deleted)
+    )
 
 
 def test_market_style_model_can_be_viewed_but_not_top20_backtested(monkeypatch) -> None:
@@ -2046,3 +2118,33 @@ def test_exact_replay_exposes_reproducibility_audit(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["audit"]["status"] == "exact"
     assert response.json()["audit"]["source"]["model_id"] == "source-model"
+
+
+def test_return_calibration_uses_the_model_frozen_horizon(monkeypatch) -> None:
+    captured = {}
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    def _calibration(**kwargs):
+        captured.update(kwargs)
+        return {
+            "status": "insufficient_history",
+            "available": False,
+            "message": "有效样本不足",
+        }
+
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "model_stock_return_calibration",
+        _calibration,
+    )
+
+    response = client.get(
+        "/model-research/models/model-1/versions/1/return-calibration",
+        params={"entity_code": "600036.SH", "trade_date": "2025-12-31"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["forecast"]["available"] is False
+    assert captured["horizon"] == 5
+    assert captured["entity_code"] == "600036.SH"

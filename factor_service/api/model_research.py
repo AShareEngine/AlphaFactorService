@@ -263,6 +263,20 @@ def _assert_model_active(model: dict[str, Any], action: str) -> None:
         raise ModelResearchConflict(f"已归档模型不能{action}；请先从模型池恢复")
 
 
+def _validate_execution_node(payload: dict[str, Any]) -> None:
+    execution = payload.get("execution") or {}
+    node_id = str(
+        (execution.get("node_id") if isinstance(execution, dict) else "")
+        or payload.get("execution_node_id")
+        or "local"
+    ).strip()
+    if node_id == "local":
+        return
+    from factor_service.research.remote import get_remote_node
+
+    get_remote_node(node_id)
+
+
 @router.get("/jobs")
 def list_jobs(
     status: str = Query(default=""),
@@ -297,9 +311,136 @@ def get_training_targets() -> dict[str, Any]:
         _raise(exc)
 
 
+@router.get("/market-history")
+def get_market_history(
+    entity_code: str = Query(..., min_length=2, max_length=32),
+    through_date: str = Query(default=""),
+    limit: int = Query(default=60, ge=10, le=240),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "market": model_repository.stock_market_history(
+                entity_code, through_date=through_date, limit=limit,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/execution-nodes")
+def get_execution_nodes() -> dict[str, Any]:
+    try:
+        from factor_service.research.remote import execution_nodes
+
+        return {"ok": True, "nodes": execution_nodes()}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/execution-node-settings")
+def get_execution_node_settings() -> dict[str, Any]:
+    try:
+        from factor_service.research.remote_settings import list_remote_node_settings
+
+        return {
+            "ok": True,
+            "nodes": list_remote_node_settings(),
+            "security": {
+                "password_storage": "environment_variable",
+                "password_values_returned": False,
+                "ssh_key_recommended": True,
+            },
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/execution-node-settings", status_code=HTTPStatus.CREATED)
+def create_execution_node_setting(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        from factor_service.research.remote_settings import create_remote_node_setting
+
+        return {"ok": True, "node": create_remote_node_setting(payload)}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.put("/execution-node-settings/{node_id}")
+def update_execution_node_setting(
+    node_id: str, payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        from factor_service.research.remote_settings import update_remote_node_setting
+
+        return {
+            "ok": True,
+            "node": update_remote_node_setting(node_id, payload),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.delete("/execution-node-settings/{node_id}")
+def delete_execution_node_setting(node_id: str) -> dict[str, Any]:
+    try:
+        from factor_service.research.remote_settings import delete_remote_node_setting
+
+        return {"ok": True, **delete_remote_node_setting(node_id)}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/execution-nodes/{node_id}/status")
+def get_execution_node_status(node_id: str, request: Request) -> dict[str, Any]:
+    try:
+        if node_id == "local":
+            status = _worker(request).status()
+            return {
+                "ok": True,
+                "status": {
+                    "id": "local", "name": "本机训练", "type": "local",
+                    "online": bool(status.get("ready")),
+                    "training_active": bool(status.get("busy")),
+                    "active_job_id": status.get("active_job_id") or "",
+                    "progress": status.get("progress") or {},
+                },
+            }
+        from factor_service.research.remote import RemoteTransport, get_remote_node
+
+        return {
+            "ok": True,
+            "status": RemoteTransport(get_remote_node(node_id)).collect_status(),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/execution-nodes/{node_id}/test")
+def test_execution_node(node_id: str, request: Request) -> dict[str, Any]:
+    try:
+        if node_id == "local":
+            status = _worker(request).status()
+            return {
+                "ok": True, "success": bool(status.get("ready")),
+                "node_id": "local", "detail": "AlphaFactorService研究调度器可用",
+            }
+        from factor_service.research.remote import RemoteTransport, get_remote_node
+
+        return {
+            "ok": True,
+            **RemoteTransport(get_remote_node(node_id)).test_connection(),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.post("/jobs", status_code=HTTPStatus.CREATED)
 def create_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
+        _validate_execution_node(payload)
         return {"ok": True, "job": repository.create_training_job(payload)}
     except Exception as exc:
         _raise(exc)
@@ -308,6 +449,7 @@ def create_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 @router.post("/experiments", status_code=HTTPStatus.CREATED)
 def create_experiment(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
+        _validate_execution_node(payload)
         return {
             "ok": True,
             "experiment": repository.create_training_experiment(payload),
@@ -1799,6 +1941,7 @@ def _inference_availability(
         factors=list((model.get("dataset_spec") or {}).get("factors") or []),
         requested_trade_date=requested_date,
         data_cutoff=cutoff,
+        universe_id=str((model.get("dataset_spec") or {}).get("universe_id") or "csi500"),
     )
 
 
@@ -1972,9 +2115,13 @@ def inference_precheck(
             )
             target_date = trade_date or str(availability.get("trade_date") or "")[:10]
             if target_date and not trade_date:
-                availability = _inference_availability(
-                    model, trade_date=target_date, data_cutoff=cutoff,
+                # The discovered target is by definition the latest fully
+                # available date, so no second availability pass is needed.
+                availability = dict(availability)
+                availability["requested_trade_date"] = (
+                    datetime.fromisoformat(target_date).date()
                 )
+                availability["requested_trade_date_available"] = True
         except Exception as exc:
             availability = {}
             target_date = trade_date
@@ -2161,6 +2308,40 @@ def get_prediction_overview(
         _raise(exc)
 
 
+@router.get("/models/{model_id}/versions/{version}/return-calibration")
+def get_model_return_calibration(
+    model_id: str,
+    version: int,
+    entity_code: str,
+    trade_date: str,
+    lookback_days: int = Query(default=252, ge=20, le=504),
+    buckets: int = Query(default=10, ge=2, le=20),
+) -> dict[str, Any]:
+    try:
+        model = repository.get_model(model_id, version)
+        dataset = dict(model.get("dataset_spec") or {})
+        if str(dataset.get("prediction_scope") or "stock") != "stock":
+            raise ModelResearchConflict("只有个股选股模型支持单股收益率校准")
+        horizon = int(
+            (dataset.get("label") or {}).get("horizon_trading_days") or 5
+        )
+        parsed_date = datetime.fromisoformat(trade_date).date()
+        return {
+            "ok": True,
+            "forecast": model_repository.model_stock_return_calibration(
+                model_id=model_id,
+                model_version=version,
+                entity_code=entity_code,
+                as_of_date=parsed_date,
+                horizon=horizon,
+                lookback_days=lookback_days,
+                buckets=buckets,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.get("/models/{model_id}/versions/{version}/signals")
 def list_signals(
     model_id: str,
@@ -2201,10 +2382,13 @@ def create_backtest(
         _assert_stock_prediction_scope(model, "运行个股Top20回测")
         _assert_experiment_backtest_allowed(model)
         _assert_validation_backtest_allowed(model)
+        trained_universe = str(
+            (model.get("dataset_spec") or {}).get("universe_id") or "csi500"
+        )
         created = model_repository.create_model_backtest_job(ModelBacktestJobCreate(
             model_id=model_id,
             model_version=version,
-            universe_id="csi500",
+            universe_id=str(payload.get("universe_id") or trained_universe),
             top_n=20,
             rebalance_every=5,
             date_preset=str(payload.get("date_preset") or "3y"),
@@ -2240,13 +2424,16 @@ def create_portfolio_sensitivity(
         date_preset = str(payload.get("date_preset") or "3y")
         if date_preset not in {"3m", "1y", "3y", "10y"}:
             raise ModelResearchConflict("敏感性研究日期范围无效")
+        trained_universe = str(
+            (model.get("dataset_spec") or {}).get("universe_id") or "csi500"
+        )
         jobs = []
         for top_n in top_ns:
             created = model_repository.create_model_backtest_job(
                 ModelBacktestJobCreate(
                     model_id=model_id,
                     model_version=version,
-                    universe_id="csi500",
+                    universe_id=str(payload.get("universe_id") or trained_universe),
                     top_n=top_n,
                     rebalance_every=rebalance_every,
                     date_preset=date_preset,

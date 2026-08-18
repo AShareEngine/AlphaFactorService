@@ -48,6 +48,71 @@ ARCHITECTURE_ABLATION_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
+def stock_market_history(
+    entity_code: str,
+    *,
+    through_date: str = "",
+    limit: int = 60,
+) -> dict[str, Any]:
+    code = str(entity_code or "").strip().upper()
+    if not re.fullmatch(r"[0-9A-Z][0-9A-Z._-]{1,31}", code):
+        raise ValueError("股票代码无效")
+    bounded_limit = max(10, min(int(limit), 240))
+    date_filter = ""
+    parameters: dict[str, Any] = {"code": code, "limit": bounded_limit}
+    if through_date:
+        parsed = date.fromisoformat(str(through_date)[:10])
+        date_filter = "AND toDate(trade_time) <= {through_date:Date}"
+        parameters["through_date"] = parsed
+    rows = client().query(
+        f"""
+        SELECT trade_date, open, high, low, close, volume, amount
+        FROM (
+            SELECT toDate(trade_time) AS trade_date,
+                   toFloat64(open) AS open, toFloat64(high) AS high,
+                   toFloat64(low) AS low, toFloat64(close) AS close,
+                   toFloat64(ifNull(volume, 0)) AS volume,
+                   toFloat64(ifNull(amount, 0)) AS amount
+            FROM starlight.ad_market_kline_daily
+            WHERE code = {{code:String}}
+              {date_filter}
+              AND open IS NOT NULL AND high IS NOT NULL
+              AND low IS NOT NULL AND close IS NOT NULL
+              AND open > 0 AND high > 0 AND low > 0 AND close > 0
+            ORDER BY trade_time DESC
+            LIMIT {{limit:UInt32}}
+        )
+        ORDER BY trade_date ASC
+        """,
+        parameters=parameters,
+    ).result_rows
+    name_rows = client().query(
+        """
+        SELECT coalesce(security_name, comp_name, ''), snapshot_date
+        FROM starlight.ad_stock_basic
+        WHERE market_code = {code:String}
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        """,
+        parameters={"code": code},
+    ).result_rows
+    return {
+        "entity_code": code,
+        "entity_name": str(name_rows[0][0] or "") if name_rows else "",
+        "name_snapshot_date": str(name_rows[0][1]) if name_rows else "",
+        "through_date": str(rows[-1][0]) if rows else str(through_date or "")[:10],
+        "rows": [
+            {
+                "trade_date": str(item[0]),
+                "open": float(item[1]), "high": float(item[2]),
+                "low": float(item[3]), "close": float(item[4]),
+                "volume": float(item[5]), "amount": float(item[6]),
+            }
+            for item in rows
+        ],
+    }
+
+
 def architecture_ablation_profiles() -> list[dict[str, Any]]:
     return [
         {"key": key, "label": str(value["label"])}
@@ -314,6 +379,413 @@ def model_prediction_overview(
             selected, previous, selected_date=selected_date,
             previous_date=previous_date, top_n=safe_top_n,
         ),
+    }
+
+
+def model_stock_return_calibration(
+    *,
+    model_id: str,
+    model_version: int,
+    entity_code: str,
+    as_of_date: date,
+    horizon: int,
+    lookback_days: int = 252,
+    buckets: int = 10,
+    minimum_samples: int = 80,
+    minimum_signal_days: int = 10,
+) -> dict[str, Any]:
+    """Calibrate a stock's ranked prediction to realized, PIT-safe returns.
+
+    This keeps the model's cross-sectional ranking target intact.  The returned
+    distribution is empirical: it uses only earlier signals in the same
+    prediction-percentile bucket whose full holding period had completed by
+    ``as_of_date``.  It must therefore never be presented as a native
+    quantile-regression output.
+    """
+    code = str(entity_code or "").strip().upper()
+    if not re.fullmatch(r"[0-9A-Z][0-9A-Z._-]{1,31}", code):
+        raise ValueError("股票代码无效")
+    clean_horizon = max(1, min(int(horizon), 60))
+    clean_lookback = max(20, min(int(lookback_days), 504))
+    clean_buckets = max(2, min(int(buckets), 20))
+    clean_minimum_samples = max(20, min(int(minimum_samples), 5000))
+    clean_minimum_signal_days = max(3, min(int(minimum_signal_days), 120))
+    database = settings().model_database
+
+    # Calendar days are only an SQL prefilter.  The exact trailing window is
+    # selected by observed prediction trade dates below.
+    date_floor = as_of_date - timedelta(days=clean_lookback * 3)
+    rows = client().query(
+        f"""
+        WITH latest AS (
+            SELECT trade_date, entity_code,
+                   argMax(percentile,
+                          tuple(updated_at, computed_at, inference_run_id)) AS percentile,
+                   argMax(score,
+                          tuple(updated_at, computed_at, inference_run_id)) AS score,
+                   argMax(rank_value,
+                          tuple(updated_at, computed_at, inference_run_id)) AS rank_value,
+                   argMax(feature_cutoff_at,
+                          tuple(updated_at, computed_at, inference_run_id)) AS feature_cutoff_at
+            FROM {database}.model_predictions_daily FINAL
+            WHERE model_id = {{model_id:String}}
+              AND model_version = {{model_version:UInt32}}
+              AND entity_type = 'stock'
+              AND trade_date >= {{date_floor:Date}}
+              AND trade_date <= {{as_of_date:Date}}
+            GROUP BY trade_date, entity_code
+        )
+        SELECT trade_date, entity_code, percentile, score, rank_value
+        FROM latest
+        WHERE feature_cutoff_at <=
+              toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR
+        ORDER BY trade_date, entity_code
+        """,
+        parameters={
+            "model_id": str(model_id),
+            "model_version": int(model_version),
+            "date_floor": date_floor,
+            "as_of_date": as_of_date,
+        },
+    ).result_rows
+    predictions = pd.DataFrame(
+        rows,
+        columns=["trade_date", "instrument", "percentile", "score", "rank_value"],
+    )
+    if predictions.empty:
+        raise ValueError("模型没有PIT安全的股票预测，无法校准收益率")
+    predictions["trade_date"] = pd.to_datetime(predictions["trade_date"])
+    for column in ("percentile", "score", "rank_value"):
+        predictions[column] = pd.to_numeric(predictions[column], errors="coerce")
+    predictions = predictions.dropna(subset=["percentile"])
+    available_dates = sorted(predictions["trade_date"].drop_duplicates())
+    retained_dates = available_dates[-clean_lookback:]
+    predictions = predictions.loc[
+        predictions["trade_date"].isin(retained_dates)
+    ].copy()
+
+    current = predictions.loc[
+        (predictions["trade_date"] == pd.Timestamp(as_of_date))
+        & (predictions["instrument"] == code)
+    ].copy()
+    if current.empty:
+        raise ValueError("所选股票在该日期没有PIT安全的模型预测")
+    current_row = current.sort_values("rank_value", na_position="last").iloc[0]
+    target_percentile = float(current_row["percentile"])
+    target_bucket = _prediction_percentile_bucket(
+        pd.Series([target_percentile]), clean_buckets,
+    ).iloc[0]
+
+    historical = predictions.loc[
+        predictions["trade_date"] < pd.Timestamp(as_of_date)
+    ].copy()
+    if historical.empty:
+        return _empty_stock_return_calibration(
+            model_id=model_id,
+            model_version=model_version,
+            entity_code=code,
+            as_of_date=as_of_date,
+            horizon=clean_horizon,
+            buckets=clean_buckets,
+            target_percentile=target_percentile,
+            target_bucket=int(target_bucket),
+            minimum_samples=clean_minimum_samples,
+            minimum_signal_days=clean_minimum_signal_days,
+            message="没有早于所选日期的模型预测，无法建立收益率校准样本",
+        )
+
+    paths = _realized_return_paths_frame(
+        instruments=sorted(historical["instrument"].astype(str).unique()),
+        date_start=historical["trade_date"].min().date(),
+        realized_through=as_of_date,
+        horizon=clean_horizon,
+    )
+    aligned = historical.merge(
+        paths, on=["trade_date", "instrument"], how="inner",
+    )
+    return _stock_return_calibration_from_frames(
+        aligned=aligned,
+        model_id=model_id,
+        model_version=model_version,
+        entity_code=code,
+        as_of_date=as_of_date,
+        horizon=clean_horizon,
+        buckets=clean_buckets,
+        target_percentile=target_percentile,
+        target_bucket=int(target_bucket),
+        current_score=(
+            float(current_row["score"])
+            if pd.notna(current_row["score"]) else None
+        ),
+        current_rank=(
+            int(current_row["rank_value"])
+            if pd.notna(current_row["rank_value"]) else None
+        ),
+        minimum_samples=clean_minimum_samples,
+        minimum_signal_days=clean_minimum_signal_days,
+    )
+
+
+def _prediction_percentile_bucket(
+    values: pd.Series, buckets: int,
+) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce").clip(0.0, 1.0)
+    bucket = np.ceil(numeric * int(buckets)).clip(1, int(buckets))
+    return pd.Series(bucket, index=values.index, dtype="Int64")
+
+
+def _realized_return_paths_frame(
+    *,
+    instruments: list[str],
+    date_start: date,
+    realized_through: date,
+    horizon: int,
+) -> pd.DataFrame:
+    """Return realized T+1..T+N paths, hard-capped at an as-of date."""
+    clean_horizon = max(1, int(horizon))
+    price_rows = client().query(
+        """
+        SELECT toDate(k.trade_time) AS trade_date, k.code,
+               k.close * ifNull(a.backward_adj_factor, 1.0) AS adjusted_close
+        FROM starlight.ad_market_kline_daily k
+        ASOF LEFT JOIN (
+            SELECT code AS adjustment_code, toDate(divid_operate_date) AS factor_date,
+                   toFloat64OrNull(nullIf(back_adjust_factor, '')) AS backward_adj_factor
+            FROM baostock.bs_adjust_factor
+            WHERE code IN {codes:Array(String)}
+            ORDER BY code, factor_date
+        ) a ON k.code = a.adjustment_code
+           AND toDate(k.trade_time) >= a.factor_date
+        WHERE k.code IN {codes:Array(String)}
+          AND toDate(k.trade_time) >= {date_start:Date}
+          AND toDate(k.trade_time) <= {realized_through:Date}
+          AND k.close IS NOT NULL AND k.close > 0
+        ORDER BY trade_date, code
+        """,
+        parameters={
+            "codes": instruments,
+            "date_start": date_start,
+            "realized_through": realized_through,
+        },
+    ).result_rows
+    prices = pd.DataFrame(
+        price_rows, columns=["trade_date", "instrument", "adjusted_close"],
+    )
+    if prices.empty:
+        return pd.DataFrame(columns=["trade_date", "instrument"])
+    prices["trade_date"] = pd.to_datetime(prices["trade_date"])
+    prices["adjusted_close"] = pd.to_numeric(
+        prices["adjusted_close"], errors="coerce",
+    )
+    pivot = prices.drop_duplicates(
+        ["trade_date", "instrument"], keep="last",
+    ).pivot(
+        index="trade_date", columns="instrument", values="adjusted_close",
+    ).sort_index()
+
+    result: pd.DataFrame | None = None
+    for step in range(1, clean_horizon + 1):
+        values = pivot.shift(-step).div(pivot).sub(1.0)
+        frame = values.stack(future_stack=True).dropna().rename(
+            f"return_t_plus_{step}",
+        ).reset_index()
+        result = frame if result is None else result.merge(
+            frame, on=["trade_date", "instrument"], how="outer",
+        )
+    return result if result is not None else pd.DataFrame(
+        columns=["trade_date", "instrument"],
+    )
+
+
+def _return_distribution(values: pd.Series) -> dict[str, Any]:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return {
+            "sample_count": 0,
+            "mean": None,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "positive_probability": None,
+        }
+    array = numeric.to_numpy(dtype=float)
+    return {
+        "sample_count": int(array.size),
+        "mean": float(np.mean(array)),
+        "p10": float(np.quantile(array, 0.10)),
+        "p50": float(np.quantile(array, 0.50)),
+        "p90": float(np.quantile(array, 0.90)),
+        "positive_probability": float(np.mean(array > 0.0)),
+    }
+
+
+def _empty_stock_return_calibration(
+    *,
+    model_id: str,
+    model_version: int,
+    entity_code: str,
+    as_of_date: date,
+    horizon: int,
+    buckets: int,
+    target_percentile: float,
+    target_bucket: int,
+    minimum_samples: int,
+    minimum_signal_days: int,
+    message: str,
+    current_score: float | None = None,
+    current_rank: int | None = None,
+    sample_count: int = 0,
+    signal_days: int = 0,
+    date_start: date | None = None,
+    date_end: date | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "insufficient_history",
+        "available": False,
+        "message": message,
+        "model_id": str(model_id),
+        "model_version": int(model_version),
+        "entity_code": entity_code,
+        "as_of_date": as_of_date,
+        "horizon_trading_days": int(horizon),
+        "prediction": {
+            "score": current_score,
+            "rank_value": current_rank,
+            "percentile": float(target_percentile),
+        },
+        "calibration": {
+            "bucket_count": int(buckets),
+            "bucket": int(target_bucket),
+            "percentile_lower": float((target_bucket - 1) / buckets),
+            "percentile_upper": float(target_bucket / buckets),
+            "sample_count": int(sample_count),
+            "signal_days": int(signal_days),
+            "minimum_samples": int(minimum_samples),
+            "minimum_signal_days": int(minimum_signal_days),
+            "date_start": date_start,
+            "date_end": date_end,
+        },
+        "returns": _return_distribution(pd.Series(dtype=float)),
+        "curve": [],
+        "method": {
+            "kind": "historical_oos_percentile_bucket_calibration",
+            "price": "后复权收盘价",
+            "look_ahead_guard": (
+                "只使用早于基准日、且完整T+N收益已在基准日前实现的PIT安全预测"
+            ),
+            "native_quantile_model": False,
+        },
+    }
+
+
+def _stock_return_calibration_from_frames(
+    *,
+    aligned: pd.DataFrame,
+    model_id: str,
+    model_version: int,
+    entity_code: str,
+    as_of_date: date,
+    horizon: int,
+    buckets: int,
+    target_percentile: float,
+    target_bucket: int,
+    current_score: float | None,
+    current_rank: int | None,
+    minimum_samples: int,
+    minimum_signal_days: int,
+) -> dict[str, Any]:
+    frame = aligned.copy()
+    frame["calibration_bucket"] = _prediction_percentile_bucket(
+        frame["percentile"], buckets,
+    )
+    selected = frame.loc[
+        frame["calibration_bucket"] == int(target_bucket)
+    ].copy()
+    final_column = f"return_t_plus_{int(horizon)}"
+    if final_column not in selected:
+        selected[final_column] = np.nan
+    final_returns = pd.to_numeric(selected[final_column], errors="coerce")
+    valid = selected.loc[final_returns.notna()].copy()
+    sample_count = int(len(valid))
+    signal_days = int(valid["trade_date"].nunique()) if sample_count else 0
+    date_start = valid["trade_date"].min().date() if sample_count else None
+    date_end = valid["trade_date"].max().date() if sample_count else None
+    if sample_count < minimum_samples or signal_days < minimum_signal_days:
+        reasons = []
+        if sample_count < minimum_samples:
+            reasons.append(f"有效样本{sample_count}条，至少需要{minimum_samples}条")
+        if signal_days < minimum_signal_days:
+            reasons.append(f"有效信号日{signal_days}天，至少需要{minimum_signal_days}天")
+        return _empty_stock_return_calibration(
+            model_id=model_id,
+            model_version=model_version,
+            entity_code=entity_code,
+            as_of_date=as_of_date,
+            horizon=horizon,
+            buckets=buckets,
+            target_percentile=target_percentile,
+            target_bucket=target_bucket,
+            minimum_samples=minimum_samples,
+            minimum_signal_days=minimum_signal_days,
+            message="；".join(reasons),
+            current_score=current_score,
+            current_rank=current_rank,
+            sample_count=sample_count,
+            signal_days=signal_days,
+            date_start=date_start,
+            date_end=date_end,
+        )
+
+    distribution = _return_distribution(valid[final_column])
+    curve = []
+    for step in range(1, int(horizon) + 1):
+        column = f"return_t_plus_{step}"
+        step_distribution = _return_distribution(
+            valid[column] if column in valid else pd.Series(dtype=float),
+        )
+        curve.append({
+            "step": step,
+            "p10_return": step_distribution["p10"],
+            "p50_return": step_distribution["p50"],
+            "p90_return": step_distribution["p90"],
+            "sample_count": step_distribution["sample_count"],
+        })
+    return {
+        "status": "ready",
+        "available": True,
+        "message": "收益率区间来自同模型历史样本外预测的真实后复权收益",
+        "model_id": str(model_id),
+        "model_version": int(model_version),
+        "entity_code": entity_code,
+        "as_of_date": as_of_date,
+        "horizon_trading_days": int(horizon),
+        "prediction": {
+            "score": current_score,
+            "rank_value": current_rank,
+            "percentile": float(target_percentile),
+        },
+        "calibration": {
+            "bucket_count": int(buckets),
+            "bucket": int(target_bucket),
+            "percentile_lower": float((target_bucket - 1) / buckets),
+            "percentile_upper": float(target_bucket / buckets),
+            "sample_count": sample_count,
+            "signal_days": signal_days,
+            "minimum_samples": int(minimum_samples),
+            "minimum_signal_days": int(minimum_signal_days),
+            "date_start": date_start,
+            "date_end": date_end,
+        },
+        "returns": distribution,
+        "curve": curve,
+        "method": {
+            "kind": "historical_oos_percentile_bucket_calibration",
+            "price": "后复权收盘价",
+            "look_ahead_guard": (
+                "只使用早于基准日、且完整T+N收益已在基准日前实现的PIT安全预测"
+            ),
+            "native_quantile_model": False,
+        },
     }
 
 
@@ -2761,15 +3233,21 @@ def model_paper_snapshot(
 
 def model_inference_availability(
     *, factors: list[dict], requested_trade_date: Optional[date] = None,
-    data_cutoff: Optional[datetime] = None,
+    data_cutoff: Optional[datetime] = None, universe_id: str = "csi500",
 ) -> dict:
     if not factors:
         raise ValueError("模型没有冻结因子")
+    if universe_id not in UNIVERSES:
+        raise ValueError(f"不支持的股票池: {universe_id}")
     effective_cutoff = data_cutoff or datetime.now()
     _validate_frozen_factors(factors)
     available_through = _available_market_date(effective_cutoff)
+    benchmark_code = _calendar_code(universe_id)
     market_columns = "max(toDate(trade_time))"
-    market_params: dict[str, object] = {"available_through": available_through}
+    market_params: dict[str, object] = {
+        "available_through": available_through,
+        "benchmark_code": benchmark_code,
+    }
     if requested_trade_date:
         market_columns += ", toUInt8(countIf(toDate(trade_time) = {requested_trade_date:Date}) > 0)"
         market_params["requested_trade_date"] = requested_trade_date
@@ -2777,7 +3255,7 @@ def model_inference_availability(
         f"""
         SELECT {market_columns}
         FROM starlight.ad_market_kline_daily
-        WHERE code = '000905.SH'
+        WHERE code = {{benchmark_code:String}}
           AND toDate(trade_time) <= {{available_through:Date}}
         """,
         parameters=market_params,
@@ -2789,6 +3267,7 @@ def model_inference_availability(
         before_date=market_latest,
         limit=1,
         descending=True,
+        universe_id=universe_id,
     )
     factor_latest = ready_dates[0] if ready_dates else None
     common_latest = factor_latest
@@ -2800,6 +3279,7 @@ def model_inference_availability(
             before_date=requested_trade_date,
             limit=1,
             descending=False,
+            universe_id=universe_id,
         )
         requested_available = (
             requested_trade_date <= available_through
@@ -2820,10 +3300,13 @@ def model_inference_availability(
 def model_inference_dates(
     *, factors: list[dict], after_date: date, before_date: Optional[date] = None,
     data_cutoff: Optional[datetime] = None, limit: int = 20,
+    universe_id: str = "csi500",
 ) -> list[date]:
     """Return PIT-safe market dates for which every frozen factor is available."""
     if not factors:
         raise ValueError("模型没有冻结因子")
+    if universe_id not in UNIVERSES:
+        raise ValueError(f"不支持的股票池: {universe_id}")
     effective_cutoff = data_cutoff or datetime.now()
     _validate_frozen_factors(factors)
     available_through = _available_market_date(effective_cutoff)
@@ -2833,6 +3316,7 @@ def model_inference_dates(
         before_date=min(before_date or date.max, available_through),
         limit=max(1, min(int(limit), 250)),
         descending=False,
+        universe_id=universe_id,
     )
 
 
@@ -2844,6 +3328,7 @@ def _factor_source_ready_dates(
     limit: int,
     descending: bool,
     minimum_coverage: float = 0.8,
+    universe_id: str = "csi500",
 ) -> list[date]:
     """Return benchmark dates whose raw inputs cover every frozen factor.
 
@@ -2880,6 +3365,8 @@ def _factor_source_ready_dates(
             f">= {{minimum_coverage_{index}:Float64}}"
         )
     direction = "DESC" if descending else "ASC"
+    benchmark_code = _calendar_code(universe_id)
+    index_code = UNIVERSES[universe_id]["index_code"]
     candidate_limit = max(250, min(1000, int(limit) * 5))
     source_after = after_date or (
         before_date - timedelta(days=candidate_limit * 2 + 30)
@@ -2887,12 +3374,55 @@ def _factor_source_ready_dates(
     after_filter = (
         "AND toDate(trade_time) > {after_date:Date}" if after_date else ""
     )
+    if universe_id == "all_a":
+        membership_cte = f"""
+        membership AS (
+            SELECT DISTINCT toDate(trade_time) AS trade_date, code
+            FROM starlight.ad_market_kline_daily
+            WHERE toDate(trade_time) > {{source_after:Date}}
+              AND toDate(trade_time) <= {{before_date:Date}}
+              AND code IN (
+                  SELECT code
+                  FROM baostock.bs_stock_basic
+                  WHERE type = '1'
+              )
+        )
+        """
+        universe_filter = "1 = 1"
+        source_universe_subquery = f"""
+            SELECT code
+            FROM baostock.bs_stock_basic
+            WHERE type = '1'
+        """
+    else:
+        membership_cte = f"""
+        membership AS (
+            SELECT calendar.trade_date, members.con_code AS code
+            FROM calendar
+            CROSS JOIN (
+                SELECT con_code, in_date, out_date
+                FROM starlight.ad_index_constituent
+                WHERE index_code = '{index_code}'
+                  AND in_date <= {{before_date:Date}}
+            ) AS members
+            WHERE members.in_date <= calendar.trade_date
+              AND (members.out_date IS NULL OR members.out_date >= calendar.trade_date)
+        )
+        """
+        universe_filter = f"membership.code = source.{code_column}"
+        source_universe_subquery = f"""
+            SELECT con_code
+            FROM starlight.ad_index_constituent
+            WHERE index_code = '{index_code}'
+              AND in_date <= {{before_date:Date}}
+        """
     having = " AND ".join(coverage_checks) or "count() > 0"
     params: dict[str, object] = {
         "before_date": before_date,
         "source_after": source_after,
         "candidate_limit": candidate_limit,
         "limit": max(1, min(int(limit), 250)),
+        "benchmark_code": benchmark_code,
         **({"after_date": after_date} if after_date else {}),
         **{
             f"minimum_coverage_{index}": float(minimum_coverage)
@@ -2904,23 +3434,12 @@ def _factor_source_ready_dates(
         WITH calendar AS (
             SELECT DISTINCT toDate(trade_time) AS trade_date
             FROM starlight.ad_market_kline_daily
-            WHERE code = '000905.SH'
+            WHERE code = {{benchmark_code:String}}
               {after_filter}
               AND toDate(trade_time) <= {{before_date:Date}}
             ORDER BY trade_date {direction}
             LIMIT {{candidate_limit:UInt32}}
-        ), membership AS (
-            SELECT calendar.trade_date, members.con_code
-            FROM calendar
-            CROSS JOIN (
-                SELECT con_code, in_date, out_date
-                FROM starlight.ad_index_constituent
-                WHERE index_code = '000905.SH'
-                  AND in_date <= {{before_date:Date}}
-            ) AS members
-            WHERE members.in_date <= calendar.trade_date
-              AND (members.out_date IS NULL OR members.out_date >= calendar.trade_date)
-        )
+        ), {membership_cte}
         SELECT membership.trade_date
         FROM membership
         LEFT JOIN (
@@ -2928,9 +3447,13 @@ def _factor_source_ready_dates(
             FROM {source_database}.{source_table}
             WHERE toDate({date_column}) > {{source_after:Date}}
               AND toDate({date_column}) <= {{before_date:Date}}
+              AND {code_column} IN (
+                  {source_universe_subquery}
+              )
         ) AS source
-          ON source.{code_column} = membership.con_code
+          ON source.{code_column} = membership.code
          AND toDate(source.{date_column}) = membership.trade_date
+        WHERE {universe_filter}
         GROUP BY membership.trade_date
         HAVING {having}
         ORDER BY membership.trade_date {direction}
@@ -2969,6 +3492,17 @@ def _available_market_date(cutoff: datetime) -> date:
     if localized.hour < 15:
         available = date.fromordinal(available.toordinal() - 1)
     return available
+
+
+def _calendar_code(universe_id: str) -> str:
+    """Return the kline code used as the A-share trading calendar.
+
+    中证全指(000985.SH)行情只覆盖到2016年，全A股票池改用数据完整的
+    中证500指数日历；交易日对所有A股一致。
+    """
+    if universe_id == "all_a":
+        return "000905.SH"
+    return UNIVERSES[universe_id]["benchmark"]
 
 
 def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJobOut:

@@ -30,10 +30,12 @@ def list_factors(
 def parameter_identities(
     payload: FactorValueSyncStatesRequest,
 ) -> list[FactorParameterIdentityOut]:
+    requests = [(item.factor_id, item.factor_version) for item in payload.items]
+    factors_by_key = repository.get_factors_for_identity(requests)
     identities: list[FactorParameterIdentityOut] = []
     try:
         for item in payload.items:
-            factor = repository.get_factor(item.factor_id, version=item.factor_version)
+            factor = factors_by_key.get((item.factor_id, item.factor_version))
             if factor is None:
                 raise ValueError(f"因子不存在: {item.factor_id}")
             if item.entity_type != factor.asset_id:

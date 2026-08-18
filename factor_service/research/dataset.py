@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from factor_service import repository as factor_repository
+from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.worker import build_factor_query_plan
@@ -193,7 +195,11 @@ class DatasetBuilder:
         coverage: dict[str, float] = {}
         _checkpoint(cancellation)
         _progress(progress, "building_membership", 6, {})
-        membership = self._membership(date_start, date_end)
+        universe_id = str(spec.get("universe_id") or "csi500")
+        index_code = str(spec.get("index_code") or "000905.SH")
+        membership = self._membership(
+            date_start, date_end, universe_id=universe_id, index_code=index_code,
+        )
         if membership.empty:
             raise ValueError("中证500历史成分股为空")
         expected = membership[["trade_date", "instrument"]].drop_duplicates()
@@ -284,7 +290,13 @@ class DatasetBuilder:
             raise ValueError(f"训练目标{research_target}尚不可用")
         panel.sort_values(["trade_date", "instrument"], inplace=True)
         trading_dates = pd.Index(sorted(panel["trade_date"].unique()))
-        segments = split_trading_dates(trading_dates, embargo_days=5)
+        split_config = dict(spec.get("split") or {})
+        segments = split_trading_dates(
+            trading_dates,
+            embargo_days=max(1, int(split_config.get("embargo_days") or 5)),
+            train_ratio=float(split_config.get("train") or 0.6),
+            valid_ratio=float(split_config.get("valid") or 0.2),
+        )
         _progress(progress, "splitting_dataset", 52, {"segments": segments})
         train_start, train_end = segments["train"]
         train_mask = panel["trade_date"].between(pd.Timestamp(train_start), pd.Timestamp(train_end))
@@ -349,54 +361,96 @@ class DatasetBuilder:
             raw_frame=raw_indexed,
         )
 
-    def _membership(self, date_start: str, date_end: str) -> pd.DataFrame:
-        rows = self.client.query(
-            f"""
-            SELECT calendar.trade_date, members.con_code
-            FROM (
-                SELECT DISTINCT toDate(trade_time) AS trade_date
+    def _membership(
+        self,
+        date_start: str,
+        date_end: str,
+        *,
+        universe_id: str = "csi500",
+        index_code: str = "000905.SH",
+    ) -> pd.DataFrame:
+        if universe_id not in UNIVERSES:
+            raise ValueError(f"不支持的股票池: {universe_id}")
+        if index_code not in {config["index_code"] for config in UNIVERSES.values()}:
+            raise ValueError(f"不支持的基准指数: {index_code}")
+        calendar_code = "000905.SH" if universe_id == "all_a" else index_code
+        if universe_id == "all_a":
+            rows = self.client.query(
+                f"""
+                SELECT DISTINCT toDate(trade_time) AS trade_date, code AS instrument
                 FROM {self.settings.source_database}.ad_market_kline_daily
-                WHERE code = '000905.SH'
-                  AND toDate(trade_time) >= {{date_start:Date}}
+                WHERE toDate(trade_time) >= {{date_start:Date}}
                   AND toDate(trade_time) <= {{date_end:Date}}
-            ) AS calendar
-            CROSS JOIN (
-                SELECT con_code, in_date, out_date
-                FROM {self.settings.source_database}.ad_index_constituent
-                WHERE index_code = '000905.SH'
-                  AND in_date <= {{date_end:Date}}
-                  AND (out_date IS NULL OR out_date >= {{date_start:Date}})
-            ) AS members
-            WHERE members.in_date <= calendar.trade_date
-              AND (members.out_date IS NULL OR members.out_date >= calendar.trade_date)
-            ORDER BY calendar.trade_date, members.con_code
-            """,
-            parameters={"date_start": date_start, "date_end": date_end},
-        ).result_rows
+                  AND code IN (
+                      SELECT code
+                      FROM baostock.bs_stock_basic
+                      WHERE type = '1'
+                  )
+                ORDER BY trade_date, instrument
+                """,
+                parameters={
+                    "date_start": date_start, "date_end": date_end,
+                },
+            ).result_rows
+        else:
+            rows = self.client.query(
+                f"""
+                SELECT calendar.trade_date, members.con_code
+                FROM (
+                    SELECT DISTINCT toDate(trade_time) AS trade_date
+                    FROM {self.settings.source_database}.ad_market_kline_daily
+                    WHERE code = {{calendar_code:String}}
+                      AND toDate(trade_time) >= {{date_start:Date}}
+                      AND toDate(trade_time) <= {{date_end:Date}}
+                ) AS calendar
+                CROSS JOIN (
+                    SELECT con_code, in_date, out_date
+                    FROM {self.settings.source_database}.ad_index_constituent
+                    WHERE index_code = {{index_code:String}}
+                      AND in_date <= {{date_end:Date}}
+                      AND (out_date IS NULL OR out_date >= {{date_start:Date}})
+                ) AS members
+                WHERE members.in_date <= calendar.trade_date
+                  AND (members.out_date IS NULL OR members.out_date >= calendar.trade_date)
+                ORDER BY calendar.trade_date, members.con_code
+                """,
+                parameters={
+                    "date_start": date_start, "date_end": date_end,
+                    "calendar_code": calendar_code,
+                    "index_code": index_code,
+                },
+            ).result_rows
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
         return frame
 
-    def trading_dates_ending_at(self, trade_date: str, count: int) -> list[str]:
+    def trading_dates_ending_at(
+        self, trade_date: str, count: int, *,
+        index_code: str = "000905.SH", universe_id: str = "csi500",
+    ) -> list[str]:
         """Return the last ``count`` benchmark sessions without crossing signal time."""
         requested = int(count)
         if requested < 1:
             raise ValueError("交易日窗口必须大于0")
+        calendar_code = "000905.SH" if universe_id == "all_a" else index_code
         rows = self.client.query(
             f"""
             SELECT trade_date
             FROM (
                 SELECT DISTINCT toDate(trade_time) AS trade_date
                 FROM {self.settings.source_database}.ad_market_kline_daily
-                WHERE code = '000905.SH'
+                WHERE code = {{calendar_code:String}}
                   AND toDate(trade_time) <= {{trade_date:Date}}
                 ORDER BY trade_date DESC
                 LIMIT {{count:UInt32}}
             )
             ORDER BY trade_date
             """,
-            parameters={"trade_date": trade_date, "count": requested},
+            parameters={
+                "trade_date": trade_date, "count": requested,
+                "calendar_code": calendar_code,
+            },
         ).result_rows
         dates = [pd.Timestamp(row[0]).date().isoformat() for row in rows]
         if len(dates) < requested or dates[-1] != pd.Timestamp(trade_date).date().isoformat():
@@ -852,19 +906,36 @@ def _weighted_group_means(
     return result.sort_values(group_columns).reset_index(drop=True)
 
 
-def split_trading_dates(dates: pd.Index, *, embargo_days: int = 5) -> dict[str, tuple[str, str]]:
+def split_trading_dates(
+    dates: pd.Index,
+    *,
+    embargo_days: int = 5,
+    train_ratio: float = 0.6,
+    valid_ratio: float = 0.2,
+) -> dict[str, tuple[str, str]]:
     unique = pd.Index(sorted(pd.to_datetime(dates).unique()))
     if len(unique) < 60:
         raise ValueError("有效交易日不足60天，无法切分训练/验证/测试集")
-    train_boundary = int(len(unique) * 0.6)
-    valid_boundary = int(len(unique) * 0.8)
+    train_ratio = float(train_ratio)
+    valid_ratio = float(valid_ratio)
+    test_ratio = round(1.0 - train_ratio - valid_ratio, 6)
+    if not all(math.isfinite(ratio) for ratio in (train_ratio, valid_ratio, test_ratio)):
+        raise ValueError("切分比例必须是有效数字")
+    if train_ratio < 0.05 or valid_ratio < 0.05 or test_ratio < 0.05:
+        raise ValueError("训练/验证/测试比例不得低于5%")
+    if abs(train_ratio + valid_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError("训练/验证/测试比例之和必须为100%")
+    train_boundary = int(len(unique) * train_ratio)
+    valid_boundary = int(len(unique) * (train_ratio + valid_ratio))
     embargo = max(1, int(embargo_days))
+    if valid_boundary <= train_boundary:
+        raise ValueError("切分比例无效：验证集必须晚于训练集开始")
     train_end_index = train_boundary - embargo - 1
     valid_start_index = train_boundary
     valid_end_index = valid_boundary - embargo - 1
     test_start_index = valid_boundary
     if train_end_index < 0 or valid_end_index < valid_start_index:
-        raise ValueError("数据范围不足以应用5交易日隔离")
+        raise ValueError(f"数据范围不足以应用{embargo}交易日隔离")
     return {
         "train": (unique[0].date().isoformat(), unique[train_end_index].date().isoformat()),
         "valid": (unique[valid_start_index].date().isoformat(), unique[valid_end_index].date().isoformat()),

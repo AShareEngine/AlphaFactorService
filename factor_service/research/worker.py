@@ -68,6 +68,13 @@ class ResearchWorker:
                 versions[module_name] = importlib.metadata.version(package_name)
             except importlib.metadata.PackageNotFoundError:
                 versions[module_name] = "missing"
+        try:
+            from factor_service.research.remote import execution_nodes
+
+            nodes = execution_nodes()
+        except Exception as exc:
+            nodes = [{"id": "local", "type": "local", "available": True}]
+            self.last_error = f"远程训练节点配置无效: {exc}"
         return {
             "service_version": __version__,
             "python": platform.python_version(),
@@ -78,7 +85,8 @@ class ResearchWorker:
             ],
             "max_concurrency": 1,
             "packages": versions,
-            "dispatch_mode": "local",
+            "dispatch_mode": "local_and_remote_ssh",
+            "execution_nodes": nodes,
             "service_api_version": "v1",
             "cooperative_cancellation": True,
             "crash_recovery": True,
@@ -302,7 +310,26 @@ class ResearchWorker:
                 else:
                     trained = self._run_isolated_model(job, work_dir, cancellation)
             else:
-                if self.trainer is not None:
+                execution_node_id = str(
+                    ((job.get("config_json") or {}).get("execution") or {}).get(
+                        "node_id"
+                    )
+                    or "local"
+                )
+                if execution_node_id != "local":
+                    from factor_service.research.remote import (
+                        RemoteResearchExecutor,
+                        get_remote_node,
+                    )
+
+                    trained = RemoteResearchExecutor(
+                        self.settings, get_remote_node(execution_node_id),
+                    ).train(
+                        job, work_dir,
+                        cancellation=cancellation,
+                        progress=progress_callback,
+                    )
+                elif self.trainer is not None:
                     trained = self.trainer.train(
                         job, work_dir, cancellation=cancellation, progress=progress_callback,
                     )

@@ -1,0 +1,13 @@
+[    1250ms] [LOG] %cssr:success%c Vite server hmr 12 files 
+      background: #2ecc71;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      in 210.182ms 
+  at vite_node_entry_default (node_modules/@nuxt/vite-builder/dist/vite-node-entry.mjs)
+  at process.processTicksAndRejections (node:internal/process/task_queues)
+  at async Object.renderToString (node_modules/vue-bundle-renderer/dist/runtime.mjs)
+ @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[    1256ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[    1368ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51

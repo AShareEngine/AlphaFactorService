@@ -94,6 +94,7 @@ def inference_availability(payload: dict[str, Any]) -> dict:
             factors=list(payload.get("factors") or []),
             requested_trade_date=requested_trade_date,
             data_cutoff=data_cutoff,
+            universe_id=str(payload.get("universe_id") or "csi500"),
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -111,6 +112,7 @@ def inference_trading_dates(payload: dict[str, Any]) -> dict:
             before_date=date.fromisoformat(str(before_date)) if before_date else None,
             data_cutoff=datetime.fromisoformat(str(cutoff).replace("Z", "+00:00")) if cutoff else None,
             limit=int(payload.get("limit") or 20),
+            universe_id=str(payload.get("universe_id") or "csi500"),
         )
         return {"dates": dates, "count": len(dates)}
     except (TypeError, ValueError) as exc:

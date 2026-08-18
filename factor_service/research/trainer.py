@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import pickle
 import platform
@@ -38,7 +39,7 @@ class TrainingResult:
 class QlibTrainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.dataset_builder = DatasetBuilder(settings)
+        self.dataset_builder: DatasetBuilder | None = None
         self.snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
 
     def train(
@@ -57,8 +58,17 @@ class QlibTrainer:
             raise RuntimeError("Qlib模型环境尚未安装，请执行uv sync") from exc
         work_dir.mkdir(parents=True, exist_ok=True)
         _checkpoint(cancellation)
+        dataset_hash = str(job.get("dataset_hash") or "").strip().lower()
+        snapshot_manifest = (
+            self.snapshot_store.artifacts.root / "datasets" / dataset_hash
+            / "dataset_manifest.json"
+        )
+        builder = None
+        if not snapshot_manifest.is_file():
+            self.dataset_builder = self.dataset_builder or DatasetBuilder(self.settings)
+            builder = self.dataset_builder
         snapshot = self.snapshot_store.get_or_create(
-            job, work_dir, self.dataset_builder,
+            job, work_dir, builder,
             cancellation=cancellation, progress=progress,
         )
         prepared = snapshot.prepared
@@ -150,6 +160,9 @@ class QlibTrainer:
             _progress(progress, "predicting", 82, {})
             valid_prediction = model.predict(dataset, segment="valid")
             test_prediction = model.predict(dataset, segment="test")
+            if hasattr(model, "to_cpu"):
+                model.to_cpu()
+            _prepare_model_for_serialization(model_kind, model)
             R.save_objects(trained_model=model)
             recorder_id = R.get_recorder().id
         # 研究回测只允许使用完全样本外的test段；train/valid预测不得进入模型信号库。
@@ -210,6 +223,7 @@ class QlibTrainer:
             "model_kind": model_kind,
             "research_target": research_target,
             "prediction_scope": prediction_scope,
+            "execution": dict(config.get("execution") or {"node_id": "local", "mode": "local"}),
             "model_version": int((job.get("config_json") or {}).get("planned_model_version") or 1),
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
@@ -237,6 +251,7 @@ class QlibTrainer:
                 "python": platform.python_version(),
                 "platform": platform.platform(),
                 "machine": platform.machine(),
+                "accelerator": str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu"),
                 "qlib": getattr(qlib, "__version__", "unknown"),
                 **_model_package_version(model_kind),
             },
@@ -840,6 +855,8 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "seed": int(source.get("seed", 42)),
             "verbosity": 0,
         }
+        if str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu") == "cuda":
+            params.update({"device": "cuda", "tree_method": "hist"})
         model = XGBModel(**params)
         model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
@@ -859,6 +876,8 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "random_seed": int(source.get("seed", 42)),
             "allow_writing_files": False,
         }
+        if str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu") == "cuda":
+            params.update({"task_type": "GPU", "devices": "0"})
         model = CatBoostModel(loss="RMSE", **params)
         model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
@@ -942,6 +961,15 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         }
         return QlibTorchTransformerLSTMModel(**params), params
     raise ValueError(f"不支持的模型: {kind}")
+
+
+def _prepare_model_for_serialization(kind: str, model: Any) -> None:
+    """Make a remotely trained model loadable by the CPU inference service."""
+    if kind != "xgboost":
+        return
+    booster = getattr(model, "model", None)
+    if booster is not None and hasattr(booster, "set_param"):
+        booster.set_param({"device": "cpu"})
 
 
 def _dataset_for_model(

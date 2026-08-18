@@ -110,6 +110,9 @@ def run_inference_schedule_tick(
                 before_date=current.date(),
                 data_cutoff=current,
                 limit=int(schedule.get("max_catchup_days") or 20),
+                universe_id=str(
+                    (schedule.get("dataset_spec") or {}).get("universe_id") or "csi500"
+                ),
             )
         if not dates:
             repository.record_inference_schedule_tick(model_id, version)

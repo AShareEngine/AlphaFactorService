@@ -1,0 +1,314 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: AlphaBlocksStudio
+        - menubar [ref=e8]:
+          - menuitem "模式运行" [ref=e9]
+          - menuitem "数据资产" [ref=e14]
+          - menuitem "数据同步" [ref=e19]
+          - menuitem "因子库" [ref=e24]
+          - menuitem "模型中心" [ref=e29]
+          - menuitem "其他" [ref=e34]
+        - generic [ref=e39]:
+          - button "实体资产 已同步 9/55" [ref=e190] [cursor=pointer]:
+            - generic [ref=e44]: 实体资产
+            - strong [ref=e45]: 已同步 9/55
+          - button "切换主题" [ref=e46] [cursor=pointer]
+    - main [ref=e51]:
+      - generic [ref=e54]:
+        - complementary [ref=e55]:
+          - generic [ref=e56]:
+            - generic [ref=e57]: TRAINING WORKFLOW
+            - strong [ref=e58]: 训练流程
+            - generic [ref=e59]: 按步骤完成配置，最后统一提交。
+          - navigation "训练步骤" [ref=e60]:
+            - button "1 特征选择 0 个特征" [ref=e414] [cursor=pointer]:
+              - generic [ref=e62]: "1"
+              - generic [ref=e63]:
+                - strong [ref=e64]: 特征选择
+                - generic [ref=e65]: 0 个特征
+            - button "2 训练目标 2 项待处理" [ref=e193] [cursor=pointer]:
+              - generic [ref=e67]: "2"
+              - generic [ref=e68]:
+                - strong [ref=e69]: 训练目标
+                - generic [ref=e70]: 2 项待处理
+            - button "✓ 参数配置 选择算法与训练参数" [ref=e415] [cursor=pointer]:
+              - generic [ref=e72]: ✓
+              - generic [ref=e73]:
+                - strong [ref=e74]: 参数配置
+                - generic [ref=e75]: 选择算法与训练参数
+            - button "4 执行训练 创建任务并进入队列" [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: "4"
+              - generic [ref=e78]:
+                - strong [ref=e79]: 执行训练
+                - generic [ref=e80]: 创建任务并进入队列
+            - button "5 结果入库 等待训练提交" [ref=e81] [cursor=pointer]:
+              - generic [ref=e82]: "5"
+              - generic [ref=e83]:
+                - strong [ref=e84]: 结果入库
+                - generic [ref=e85]: 等待训练提交
+          - generic [ref=e86]:
+            - text: 当前配置
+            - generic [ref=e87]:
+              - generic [ref=e88]:
+                - term [ref=e89]: 目标
+                - definition [ref=e90]: 个股选股
+              - generic [ref=e91]:
+                - term [ref=e92]: 算法
+                - definition [ref=e93]: LightGBM
+              - generic [ref=e94]:
+                - term [ref=e95]: 特征
+                - definition [ref=e96]: 0 个
+              - generic [ref=e97]:
+                - term [ref=e98]: 标签
+                - definition [ref=e99]: T+5
+          - generic [ref=e100]:
+            - generic [ref=e101]:
+              - generic [ref=e102]: 训练节点
+              - button "检查" [ref=e103] [cursor=pointer]
+            - button "本机训练 LOCAL" [ref=e195] [cursor=pointer]:
+              - generic [ref=e197]:
+                - strong [ref=e198]: 本机训练
+                - generic [ref=e199]: LOCAL
+          - generic [ref=e104]:
+            - button "参数实验" [ref=e105] [cursor=pointer]
+            - button "训练任务" [ref=e106] [cursor=pointer]
+        - generic [ref=e107]:
+          - generic [ref=e108]:
+            - generic [ref=e109]:
+              - generic [ref=e110]: MODEL TRAINING
+              - strong [ref=e111]: 模型训练
+              - generic [ref=e112]: 选择因子并形成可复现的 Qlib 训练任务
+            - generic [ref=e113]:
+              - generic [ref=e114]:
+                - generic [ref=e115]: 草稿
+                - strong [ref=e116]: 21:06
+              - button "删除草稿" [ref=e412] [cursor=pointer]
+              - button "研究模板（0）" [ref=e201] [cursor=pointer]
+              - button "保存为模板" [ref=e119] [cursor=pointer]
+          - generic [ref=e121]:
+            - generic [ref=e122]:
+              - generic [ref=e123]: 研究目标
+              - strong [ref=e124]: 个股选股
+            - generic [ref=e125]:
+              - generic [ref=e126]: 股票池
+              - generic [ref=e204] [cursor=pointer]:
+                - generic:
+                  - combobox [active] [ref=e206]
+                  - generic [ref=e207]: 中证500
+            - generic [ref=e127]:
+              - generic [ref=e128]: 特征数
+              - strong [ref=e129]: "0"
+            - generic [ref=e130]:
+              - generic [ref=e131]: 预测周期
+              - strong [ref=e132]: T+5
+            - generic [ref=e133]:
+              - generic [ref=e134]: 数据集天数
+              - strong [ref=e135]: "--"
+            - generic [ref=e136]:
+              - generic [ref=e137]: 状态
+              - strong [ref=e138]: 待配置
+          - generic [ref=e417]:
+            - generic [ref=e418]:
+              - generic [ref=e419]: 步骤 3
+              - heading "参数配置" [level=2] [ref=e420]
+            - generic [ref=e421]:
+              - generic [ref=e422]:
+                - generic [ref=e427]:
+                  - heading "第三步：参数配置" [level=3] [ref=e428]
+                  - paragraph [ref=e429]: 把模型超参与训练上下文拆开，避免配置语义混在一起。
+                - generic [ref=e430]:
+                  - generic [ref=e431]:
+                    - generic [ref=e432]:
+                      - strong [ref=e433]: 模型类型
+                      - generic [ref=e434]: 树模型适合快速实验，深度学习模型适合时序建模；当前训练服务一次锁定一种真实可执行模型。
+                    - generic [ref=e435]:
+                      - generic [ref=e436]: 树模型
+                      - generic [ref=e441]:
+                        - radio "LightGBM 高效梯度提升树，适合多因子基线与参数实验" [checked] [ref=e442] [cursor=pointer]:
+                          - generic [ref=e444]:
+                            - checkbox [checked]
+                          - generic [ref=e446]:
+                            - strong [ref=e447]: LightGBM
+                            - generic [ref=e448]: 高效梯度提升树，适合多因子基线与参数实验
+                        - radio "XGBoost 正则化提升树，适合验证非线性因子组合" [ref=e449] [cursor=pointer]:
+                          - generic [ref=e451]:
+                            - checkbox
+                          - generic [ref=e453]:
+                            - strong [ref=e454]: XGBoost
+                            - generic [ref=e455]: 正则化提升树，适合验证非线性因子组合
+                        - radio "CatBoost 对称树结构，提供不同的归纳偏置" [ref=e456] [cursor=pointer]:
+                          - generic [ref=e458]:
+                            - checkbox
+                          - generic [ref=e460]:
+                            - strong [ref=e461]: CatBoost
+                            - generic [ref=e462]: 对称树结构，提供不同的归纳偏置
+                    - generic [ref=e463]:
+                      - generic [ref=e464]: 深度学习
+                      - generic [ref=e470]:
+                        - radio "PyTorch MLP 截面前馈网络，隐藏层结构可完全配置" [ref=e471] [cursor=pointer]:
+                          - generic [ref=e473]:
+                            - checkbox
+                          - generic [ref=e475]:
+                            - strong [ref=e476]: PyTorch MLP
+                            - generic [ref=e477]: 截面前馈网络，隐藏层结构可完全配置
+                        - radio "PyTorch LSTM 按股票构建因果历史窗口的循环网络" [ref=e478] [cursor=pointer]:
+                          - generic [ref=e480]:
+                            - checkbox
+                          - generic [ref=e482]:
+                            - strong [ref=e483]: PyTorch LSTM
+                            - generic [ref=e484]: 按股票构建因果历史窗口的循环网络
+                        - radio "Transformer + LSTM 因果注意力与LSTM组合的时序模型" [ref=e485] [cursor=pointer]:
+                          - generic [ref=e487]:
+                            - checkbox
+                          - generic [ref=e489]:
+                            - strong [ref=e490]: Transformer + LSTM
+                            - generic [ref=e491]: 因果注意力与LSTM组合的时序模型
+                  - generic [ref=e492]:
+                    - generic [ref=e493]:
+                      - strong [ref=e494]: 模型命名
+                      - generic [ref=e495]: 展示名称用于模型管理页和训练结果；模型标识留空时由服务端生成。
+                    - generic [ref=e496]:
+                      - textbox [ref=e499]: 中证500 多因子模型
+                      - button "恢复自动" [ref=e500] [cursor=pointer]
+                    - generic [ref=e502]:
+                      - generic [ref=e503]: 当前自动示例：中证500_T+5_LightGBM
+                      - generic [ref=e504]: 11/160
+                    - generic [ref=e505]:
+                      - generic [ref=e506]: 模型标识（可选）
+                      - textbox "模型标识（可选）" [ref=e509]:
+                        - /placeholder: 留空自动生成
+                  - generic [ref=e510]:
+                    - generic [ref=e511]:
+                      - strong [ref=e512]: 训练超参
+                      - generic [ref=e513]: Objective固定为MSE；最佳轮次只由验证集早停决定。
+                    - generic [ref=e514]:
+                      - generic [ref=e515]:
+                        - generic [ref=e516]: Objective
+                        - generic [ref=e518]:
+                          - generic:
+                            - combobox "Objective 回归 (regression)" [disabled] [ref=e520]
+                            - generic [ref=e521]: 回归 (regression)
+                      - generic [ref=e522]:
+                        - generic [ref=e523]: Metric
+                        - generic [ref=e525]:
+                          - generic:
+                            - combobox "Metric RMSE / RankIC" [disabled] [ref=e527]
+                            - generic [ref=e528]: RMSE / RankIC
+                    - generic [ref=e529]:
+                      - generic [ref=e530]: Seed 42
+                      - generic [ref=e531]: Deterministic true
+                      - generic [ref=e532]: Early Stop Validation
+                    - generic [ref=e533]:
+                      - generic [ref=e534]:
+                        - generic [ref=e535]: 学习率
+                        - generic [ref=e536]:
+                          - button "减少数值" [ref=e537] [cursor=pointer]
+                          - button "增加数值" [ref=e541] [cursor=pointer]
+                          - spinbutton "学习率 减少数值 增加数值" [ref=e547]: "0.05"
+                      - generic [ref=e548]:
+                        - generic [ref=e549]: 最大迭代轮数
+                        - generic [ref=e550]:
+                          - button "减少数值" [ref=e551] [cursor=pointer]
+                          - button "增加数值" [ref=e555] [cursor=pointer]
+                          - spinbutton "最大迭代轮数 减少数值 增加数值" [ref=e561]: "1000"
+                      - generic [ref=e562]:
+                        - generic [ref=e563]: 早停轮数
+                        - generic [ref=e564]:
+                          - button "减少数值" [ref=e565] [cursor=pointer]
+                          - button "增加数值" [ref=e569] [cursor=pointer]
+                          - spinbutton "早停轮数 减少数值 增加数值" [ref=e575]: "50"
+                      - generic [ref=e576]:
+                        - generic [ref=e577]: CPU线程
+                        - generic [ref=e578]:
+                          - button "减少数值" [ref=e579] [cursor=pointer]
+                          - button "增加数值" [ref=e583] [cursor=pointer]
+                          - spinbutton "CPU线程 减少数值 增加数值" [ref=e589]: "4"
+                    - generic [ref=e590]:
+                      - strong [ref=e591]: LightGBM 超参
+                      - generic [ref=e592]:
+                        - generic [ref=e593]:
+                          - generic [ref=e594]: 叶子数 (num_leaves)
+                          - generic [ref=e595]:
+                            - button "减少数值" [ref=e596] [cursor=pointer]
+                            - button "增加数值" [ref=e600] [cursor=pointer]
+                            - spinbutton "叶子数 (num_leaves) 减少数值 增加数值" [ref=e606]: "31"
+                        - generic [ref=e607]:
+                          - generic [ref=e608]: 最大深度
+                          - generic [ref=e609]:
+                            - button "减少数值" [ref=e610]
+                            - button "增加数值" [ref=e614] [cursor=pointer]
+                            - spinbutton "最大深度 减少数值 增加数值" [ref=e620]: "-1"
+                        - generic [ref=e621]:
+                          - generic [ref=e622]: 叶子最小样本
+                          - generic [ref=e623]:
+                            - button "减少数值" [ref=e624] [cursor=pointer]
+                            - button "增加数值" [ref=e628] [cursor=pointer]
+                            - spinbutton "叶子最小样本 减少数值 增加数值" [ref=e634]: "20"
+                        - generic [ref=e635]:
+                          - generic [ref=e636]: 行采样
+                          - generic [ref=e637]:
+                            - button "减少数值" [ref=e638] [cursor=pointer]
+                            - button "增加数值" [ref=e642] [cursor=pointer]
+                            - spinbutton "行采样 减少数值 增加数值" [ref=e648]: "0.9"
+                        - generic [ref=e649]:
+                          - generic [ref=e650]: 特征采样
+                          - generic [ref=e651]:
+                            - button "减少数值" [ref=e652] [cursor=pointer]
+                            - button "增加数值" [ref=e656] [cursor=pointer]
+                            - spinbutton "特征采样 减少数值 增加数值" [ref=e662]: "0.9"
+                        - generic [ref=e663]:
+                          - generic [ref=e664]: L1正则
+                          - generic [ref=e665]:
+                            - button "减少数值" [ref=e666]
+                            - button "增加数值" [ref=e670] [cursor=pointer]
+                            - spinbutton "L1正则 减少数值 增加数值" [ref=e676]: "0"
+                        - generic [ref=e677]:
+                          - generic [ref=e678]: L2正则
+                          - generic [ref=e679]:
+                            - button "减少数值" [ref=e680] [cursor=pointer]
+                            - button "增加数值" [ref=e684] [cursor=pointer]
+                            - spinbutton "L2正则 减少数值 增加数值" [ref=e690]: "1"
+              - generic [ref=e692]:
+                - generic [ref=e697]:
+                  - heading "训练上下文" [level=3] [ref=e698]
+                  - paragraph [ref=e699]: 记录训练时的数据、执行节点与回测口径，方便模型管理和结果复现。
+                - generic [ref=e700]:
+                  - generic [ref=e701]:
+                    - generic [ref=e702]:
+                      - generic [ref=e703]: 执行节点
+                      - strong [ref=e704]: 本机训练 · 本机隔离进程
+                    - generic [ref=e705]:
+                      - generic [ref=e706]: 股票池
+                      - strong [ref=e707]: 中证500历史时点成分
+                    - generic [ref=e708]:
+                      - generic [ref=e709]: 基准指数
+                      - strong [ref=e710]: 000905.SH
+                    - generic [ref=e711]:
+                      - generic [ref=e712]: 特征输入
+                      - strong [ref=e713]: 因子Score · 按需Parquet
+                    - generic [ref=e714]:
+                      - generic [ref=e715]: 缺失处理
+                      - strong [ref=e716]: 仅用训练段中位数
+                    - generic [ref=e717]:
+                      - generic [ref=e718]: 成交规则
+                      - strong [ref=e719]: 训练完成后由独立Top20回测验证
+                  - alert [ref=e720]:
+                    - generic [ref=e724]:
+                      - generic [ref=e725]: 口径提醒
+                      - paragraph [ref=e726]: 训练上下文写入不可变Dataset与模型Manifest；远程节点不会连接ClickHouse或控制库。
+          - generic [ref=e180]:
+            - generic [ref=e181]:
+              - generic [ref=e182]: 步骤 3 / 5
+              - strong [ref=e183]: 参数配置
+              - generic [ref=e184]: 选择算法与训练参数
+            - generic [ref=e185]:
+              - button "上一步" [ref=e186] [cursor=pointer]
+              - button "下一步" [ref=e188] [cursor=pointer]
+  - generic [ref=e387]:
+    - button "Toggle Nuxt DevTools" [ref=e388] [cursor=pointer]
+    - generic "Page load time" [ref=e392]:
+      - generic [ref=e393]: "282"
+      - generic [ref=e394]: ms
+    - button "Toggle Component Inspector" [ref=e396] [cursor=pointer]

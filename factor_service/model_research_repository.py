@@ -5,6 +5,7 @@ from hashlib import sha256
 from itertools import product
 import json
 import math
+import re
 import secrets
 from typing import Any, Mapping
 from uuid import uuid4
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 from psycopg.types.json import Jsonb
 
 from factor_service.control_database import ControlDatabase, get_control_database
+from factor_service.factor_backtest import UNIVERSES
 from factor_service.model_validation import select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
 
@@ -73,6 +75,11 @@ class ModelResearchRepository:
         spec = _dataset_spec(payload.get("dataset") or {})
         model = _model_spec(payload.get("model") or {})
         walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
+        execution = _execution_spec(
+            payload.get("execution") or {
+                "node_id": payload.get("execution_node_id") or "local",
+            }
+        )
         research_origin = self._resolve_research_origin(
             payload.get("research_origin") or {},
             dataset=spec,
@@ -111,11 +118,12 @@ class ModelResearchRepository:
             "dataset": spec,
             "model": model,
             "walk_forward": walk_forward,
+            "execution": execution,
             "backtest": {
-                "universe_id": "csi500",
+                "universe_id": spec["universe_id"],
                 "top_n": 20,
                 "rebalance_every": 5,
-                "benchmark_code": "000905.SH",
+                "benchmark_code": spec.get("benchmark_code") or spec["index_code"],
             },
         }
         experiment = _experiment_ref(payload.get("experiment") or {})
@@ -468,6 +476,9 @@ class ModelResearchRepository:
                 "walk_forward": {
                     **walk_forward,
                     "embargo_days": horizon,
+                },
+                "execution": payload.get("execution") or {
+                    "node_id": payload.get("execution_node_id") or "local",
                 },
                 "research_origin": payload.get("research_origin") or {},
                 "experiment": {
@@ -3860,6 +3871,7 @@ def _research_template_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     dataset = _dataset_spec(training_source.get("dataset") or {})
     model = _model_spec(training_source.get("model") or {})
     walk_forward = _walk_forward_spec(training_source.get("walk_forward") or {})
+    execution = _execution_spec(training_source.get("execution") or {})
     design_source = training_source.get("research_design") or {}
     if not isinstance(design_source, Mapping):
         raise ModelResearchError("research_design必须是对象")
@@ -3919,6 +3931,7 @@ def _research_template_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "dataset": dataset,
         "model": model,
         "walk_forward": walk_forward,
+        "execution": execution,
         "research_design": {"mode": mode, "search": search},
     }
     return {
@@ -4023,10 +4036,36 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "industry_snapshot_date_eq_signal_date": True,
             "industry_classification_safe_start": SW2021_INDUSTRY_SAFE_START,
         })
+    raw_split = source.get("split") or {}
+    try:
+        valid_raw = raw_split.get("valid")
+        test_raw = raw_split.get("test")
+        valid_ratio = 0.2 if valid_raw is None else float(valid_raw)
+        test_ratio = 0.2 if test_raw is None else float(test_raw)
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("验证集/测试集比例必须是数字") from exc
+    train_ratio = round(1.0 - valid_ratio - test_ratio, 6)
+    ratios = (train_ratio, valid_ratio, test_ratio)
+    if not all(math.isfinite(ratio) for ratio in ratios):
+        raise ModelResearchError("验证集/测试集比例必须是有效数字")
+    if valid_ratio < 0.05 or test_ratio < 0.05 or train_ratio < 0.3:
+        raise ModelResearchError(
+            "切分比例无效：验证集/测试集不低于5%，训练集不低于30%"
+        )
+    if abs(train_ratio + valid_ratio + test_ratio - 1.0) > 1e-6:
+        raise ModelResearchError("训练/验证/测试比例之和必须为100%")
+    universe_id = str(source.get("universe_id") or "csi500").strip()
+    if universe_id not in UNIVERSES:
+        raise ModelResearchError(
+            f"不支持的股票池: {universe_id}，可选{', '.join(sorted(UNIVERSES))}"
+        )
+    index_code = UNIVERSES[universe_id]["index_code"]
+    benchmark_code = UNIVERSES[universe_id]["benchmark"]
     return {
-        "name": str(source.get("name") or "中证500因子数据集")[:160],
-        "universe_id": "csi500",
-        "index_code": "000905.SH",
+        "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
+        "universe_id": universe_id,
+        "index_code": index_code,
+        "benchmark_code": benchmark_code,
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,
@@ -4040,9 +4079,9 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "feature_field": "score",
         "label": label,
         "split": {
-            "train": 0.6,
-            "valid": 0.2,
-            "test": 0.2,
+            "train": train_ratio,
+            "valid": valid_ratio,
+            "test": test_ratio,
             "embargo_days": horizon,
         },
         "minimum_factor_coverage": 0.8,
@@ -4191,6 +4230,18 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         defaults["d_model"] = d_model
         defaults["nhead"] = nhead
     return {"kind": kind, "qlib_model": definition["qlib_model"], "params": defaults}
+
+
+def _execution_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+    node_id = str(source.get("node_id") or "local").strip()
+    if node_id != "local" and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", node_id,
+    ):
+        raise ModelResearchError("execution.node_id无效")
+    return {
+        "node_id": node_id,
+        "mode": "local" if node_id == "local" else "remote_ssh_docker",
+    }
 
 
 def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:

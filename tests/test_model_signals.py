@@ -10,6 +10,31 @@ import pytest
 from factor_service import model_repository
 
 
+def test_stock_market_history_uses_real_ohlc_and_latest_display_name(monkeypatch) -> None:
+    calls = []
+
+    class _Client:
+        def query(self, query, parameters):
+            calls.append((query, parameters))
+            if "ad_market_kline_daily" in query:
+                return SimpleNamespace(result_rows=[
+                    (date(2025, 12, 30), 9.79, 9.80, 9.68, 9.74, 100.0, 974.0),
+                    (date(2025, 12, 31), 9.74, 9.81, 9.70, 9.70, 120.0, 1164.0),
+                ])
+            return SimpleNamespace(result_rows=[("长沙银行", date(2026, 7, 30))])
+
+    monkeypatch.setattr(model_repository, "client", lambda: _Client())
+
+    result = model_repository.stock_market_history(
+        "601577.SH", through_date="2025-12-31", limit=60,
+    )
+
+    assert result["entity_name"] == "长沙银行"
+    assert result["name_snapshot_date"] == "2026-07-30"
+    assert result["rows"][-1]["close"] == 9.70
+    assert calls[0][1]["through_date"] == date(2025, 12, 31)
+
+
 def test_formal_strategy_signal_query_is_pit_safe_and_top_n(monkeypatch) -> None:
     captured = {}
 
@@ -172,6 +197,82 @@ def test_prediction_stability_caps_top_n_to_available_cross_section() -> None:
     assert result["comparison_top_n"] == 3
     assert result["top_n_overlap_count"] == 2
     assert result["top_n_overlap_ratio"] == pytest.approx(2 / 3)
+
+
+def test_stock_return_calibration_uses_same_percentile_bucket_and_realized_paths() -> None:
+    rows = []
+    for day_index in range(12):
+        signal_date = pd.Timestamp("2025-01-02") + pd.Timedelta(day_index, unit="D")
+        for stock_index in range(10):
+            rows.append({
+                "trade_date": signal_date,
+                "instrument": f"S{stock_index:02d}",
+                "percentile": 0.91 + stock_index * 0.008,
+                "score": 0.8 + stock_index * 0.01,
+                "rank_value": stock_index + 1,
+                "return_t_plus_1": 0.01 + stock_index * 0.001,
+                "return_t_plus_2": 0.02 + stock_index * 0.001,
+                "return_t_plus_3": 0.03 + stock_index * 0.001,
+            })
+    aligned = pd.DataFrame(rows)
+
+    result = model_repository._stock_return_calibration_from_frames(
+        aligned=aligned,
+        model_id="model-a",
+        model_version=1,
+        entity_code="S00",
+        as_of_date=date(2025, 1, 20),
+        horizon=3,
+        buckets=10,
+        target_percentile=0.95,
+        target_bucket=10,
+        current_score=0.9,
+        current_rank=1,
+        minimum_samples=80,
+        minimum_signal_days=10,
+    )
+
+    assert result["status"] == "ready"
+    assert result["available"] is True
+    assert result["calibration"]["sample_count"] == 120
+    assert result["calibration"]["signal_days"] == 12
+    assert result["returns"]["p50"] == pytest.approx(0.0345)
+    assert result["curve"][-1]["p50_return"] == pytest.approx(0.0345)
+    assert result["method"]["native_quantile_model"] is False
+
+
+def test_stock_return_calibration_never_emits_numbers_for_insufficient_history() -> None:
+    aligned = pd.DataFrame([
+        {
+            "trade_date": pd.Timestamp("2025-01-02"),
+            "instrument": "S00",
+            "percentile": 0.95,
+            "score": 0.9,
+            "rank_value": 1,
+            "return_t_plus_5": 0.03,
+        },
+    ])
+
+    result = model_repository._stock_return_calibration_from_frames(
+        aligned=aligned,
+        model_id="model-a",
+        model_version=1,
+        entity_code="S00",
+        as_of_date=date(2025, 1, 20),
+        horizon=5,
+        buckets=10,
+        target_percentile=0.95,
+        target_bucket=10,
+        current_score=0.9,
+        current_rank=1,
+        minimum_samples=80,
+        minimum_signal_days=10,
+    )
+
+    assert result["status"] == "insufficient_history"
+    assert result["available"] is False
+    assert result["returns"]["p50"] is None
+    assert result["curve"] == []
 
 
 def test_inference_availability_uses_market_database_and_checks_requested_date(monkeypatch) -> None:

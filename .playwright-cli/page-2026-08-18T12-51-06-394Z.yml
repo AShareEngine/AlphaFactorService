@@ -1,0 +1,123 @@
+- generic [ref=e3]:
+  - banner [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]: AlphaBlocksStudio
+      - menubar [ref=e8]:
+        - menuitem "模式运行" [ref=e9]
+        - menuitem "数据资产" [ref=e14]
+        - menuitem "数据同步" [ref=e19]
+        - menuitem "因子库" [ref=e24]
+        - menuitem "模型中心" [ref=e29]
+        - menuitem "其他" [ref=e34]
+      - generic [ref=e39]:
+        - button "实体资产 未配置" [ref=e40] [cursor=pointer]:
+          - generic [ref=e44]: 实体资产
+          - strong [ref=e45]: 未配置
+        - button "切换主题" [ref=e46] [cursor=pointer]
+  - main [ref=e51]:
+    - generic [ref=e54]:
+      - complementary [ref=e55]:
+        - generic [ref=e56]:
+          - generic [ref=e57]: TRAINING WORKFLOW
+          - strong [ref=e58]: 训练流程
+          - generic [ref=e59]: 按步骤完成配置，最后统一提交。
+        - navigation "训练步骤" [ref=e60]:
+          - button "1 特征选择 选择并冻结训练因子" [ref=e61] [cursor=pointer]:
+            - generic [ref=e62]: "1"
+            - generic [ref=e63]:
+              - strong [ref=e64]: 特征选择
+              - generic [ref=e65]: 选择并冻结训练因子
+          - button "2 训练目标 4 项待处理" [ref=e66] [cursor=pointer]:
+            - generic [ref=e67]: "2"
+            - generic [ref=e68]:
+              - strong [ref=e69]: 训练目标
+              - generic [ref=e70]: 4 项待处理
+          - button "✓ 参数配置 LightGBM · 单模型训练" [ref=e71] [cursor=pointer]:
+            - generic [ref=e72]: ✓
+            - generic [ref=e73]:
+              - strong [ref=e74]: 参数配置
+              - generic [ref=e75]: LightGBM · 单模型训练
+          - button "4 执行训练 创建任务并进入队列" [ref=e76] [cursor=pointer]:
+            - generic [ref=e77]: "4"
+            - generic [ref=e78]:
+              - strong [ref=e79]: 执行训练
+              - generic [ref=e80]: 创建任务并进入队列
+          - button "5 结果入库 等待训练提交" [ref=e81] [cursor=pointer]:
+            - generic [ref=e82]: "5"
+            - generic [ref=e83]:
+              - strong [ref=e84]: 结果入库
+              - generic [ref=e85]: 等待训练提交
+        - generic [ref=e86]:
+          - text: 当前配置
+          - generic [ref=e87]:
+            - generic [ref=e88]:
+              - term [ref=e89]: 目标
+              - definition [ref=e90]: 训练目标
+            - generic [ref=e91]:
+              - term [ref=e92]: 算法
+              - definition [ref=e93]: LightGBM
+            - generic [ref=e94]:
+              - term [ref=e95]: 特征
+              - definition [ref=e96]: 0 个
+            - generic [ref=e97]:
+              - term [ref=e98]: 标签
+              - definition [ref=e99]: T+5
+        - generic [ref=e101]:
+          - generic [ref=e102]: 训练节点
+          - button "检查" [ref=e103] [cursor=pointer]
+        - generic [ref=e104]:
+          - button "参数实验" [ref=e105] [cursor=pointer]
+          - button "训练任务" [ref=e106] [cursor=pointer]
+      - generic [ref=e107]:
+        - generic [ref=e108]:
+          - generic [ref=e109]:
+            - generic [ref=e110]: MODEL TRAINING
+            - strong [ref=e111]: 模型训练
+            - generic [ref=e112]: 选择因子并形成可复现的 Qlib 训练任务
+          - generic [ref=e113]:
+            - generic [ref=e114]:
+              - generic [ref=e115]: 草稿
+              - strong [ref=e116]: 等待修改
+            - button "研究模板" [disabled] [ref=e117]
+            - button "保存为模板" [ref=e119] [cursor=pointer]
+        - generic [ref=e121]:
+          - generic [ref=e122]:
+            - generic [ref=e123]: 研究目标
+            - strong [ref=e124]: 训练目标
+          - generic [ref=e125]:
+            - generic [ref=e126]: 特征数
+            - strong [ref=e127]: "0"
+          - generic [ref=e128]:
+            - generic [ref=e129]: 预测周期
+            - strong [ref=e130]: T+5
+          - generic [ref=e131]:
+            - generic [ref=e132]: 数据集天数
+            - strong [ref=e133]: "--"
+          - generic [ref=e134]:
+            - generic [ref=e135]: 状态
+            - strong [ref=e136]: 待配置
+        - generic [ref=e138]:
+          - generic [ref=e139]:
+            - generic [ref=e140]: 步骤 1
+            - heading "选择训练特征" [level=2] [ref=e141]
+          - alert [ref=e142]:
+            - generic [ref=e146]: 基础行情与所有启用因子均可选择；提交时锁定版本、公式参数和params_hash，训练任务直接从源数据计算并冻结Parquet。
+          - generic [ref=e148]:
+            - group "checkbox-group"
+            - complementary [ref=e149]:
+              - generic [ref=e150]:
+                - generic [ref=e151]:
+                  - generic [ref=e152]: 特征预览
+                  - strong [ref=e153]: 0 个特征 · 0 个类别
+                - generic [ref=e154]: 待选择
+              - paragraph [ref=e175]: 请从左侧选择至少一个因子
+              - paragraph [ref=e176]: 尚未选择特征。请按分类展开选择，再根据研究假设增删。
+              - generic [ref=e177]: 覆盖率会在冻结的历史股票池上由服务端重新计算；测试段不参与因子删选和参数选择。
+        - generic [ref=e178]:
+          - generic [ref=e179]:
+            - generic [ref=e180]: 步骤 1 / 5
+            - strong [ref=e181]: 特征选择
+            - generic [ref=e182]: 选择并冻结训练因子
+          - generic [ref=e183]:
+            - button "上一步" [disabled] [ref=e184]
+            - button "下一步" [ref=e186] [cursor=pointer]

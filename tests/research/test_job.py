@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 from copy import deepcopy
 import os
@@ -9,7 +10,9 @@ import threading
 import pytest
 
 from factor_service.research.errors import JobCanceled, PermanentJobError, WorkerShutdown
-from factor_service.research.job import CancellationToken, safe_job_dir, validate_job
+from factor_service.research.job import (
+    CancellationToken, _canonical_json, safe_job_dir, validate_job,
+)
 from factor_service.research.state import JobStateStore
 from tests.research.utils import valid_inference_job, valid_job
 
@@ -19,6 +22,40 @@ def test_job_validation_accepts_frozen_contract() -> None:
 
     assert job["model_id"] == "test_model"
     assert job["dataset_spec"]["universe_id"] == "csi500"
+
+
+def test_job_validation_accepts_all_a_universe() -> None:
+    source = valid_job()
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["universe_id"] = "all_a"
+        target["index_code"] = "000985.SH"
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    job = validate_job(source)
+
+    assert job["dataset_spec"]["universe_id"] == "all_a"
+
+
+def test_job_validation_rejects_unknown_or_mismatched_universe() -> None:
+    source = valid_job()
+    source["dataset_spec"]["universe_id"] = "csi2000"
+    source["config_json"]["dataset"]["universe_id"] = "csi2000"
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="不支持的股票池"):
+        validate_job(source)
+
+    candidate = valid_job()
+    candidate["dataset_spec"]["universe_id"] = "all_a"
+    candidate["config_json"]["dataset"]["universe_id"] = "all_a"
+    candidate["dataset_hash"] = sha256(
+        _canonical_json(candidate["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="index_code"):
+        validate_job(candidate)
 
 
 def test_job_validation_accepts_all_phase2_model_kinds() -> None:

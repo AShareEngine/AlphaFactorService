@@ -32,7 +32,7 @@ class DatasetSnapshotStore:
         self,
         job: dict[str, Any],
         work_dir: Path,
-        builder: DatasetBuilder,
+        builder: DatasetBuilder | None,
         *,
         cancellation: CancellationToken | None = None,
         progress: ProgressCallback | None = None,
@@ -57,6 +57,9 @@ class DatasetSnapshotStore:
             return DatasetSnapshot(
                 prepared, dataset_path, raw_dataset_path, manifest_path, True,
             )
+
+        if builder is None:
+            raise ValueError("冻结数据集快照不存在，且当前执行器不能访问源数据")
 
         _progress(progress, "materializing_dataset", 5, {"dataset_hash": dataset_hash})
         prepared = builder.build(job, cancellation=cancellation, progress=progress)

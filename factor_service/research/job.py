@@ -8,6 +8,7 @@ import re
 import threading
 from typing import Any, Callable
 
+from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.errors import JobCanceled, PermanentJobError, WorkerShutdown
 
 
@@ -77,8 +78,12 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     configured_spec = config.get("dataset")
     if not isinstance(configured_spec, dict) or _canonical_json(configured_spec) != _canonical_json(spec):
         raise PermanentJobError("config_json.dataset与冻结dataset_spec不一致")
-    if str(spec.get("universe_id") or "") != "csi500" or str(spec.get("index_code") or "") != "000905.SH":
-        raise PermanentJobError("首版只允许中证500历史时点股票池")
+    universe_id = str(spec.get("universe_id") or "").strip()
+    index_code = str(spec.get("index_code") or "").strip()
+    if universe_id not in UNIVERSES:
+        raise PermanentJobError(f"不支持的股票池: {universe_id}")
+    if index_code != UNIVERSES[universe_id]["index_code"]:
+        raise PermanentJobError("dataset_spec的股票池与index_code不一致")
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")
@@ -134,6 +139,18 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(params, dict) or set(params) - MODEL_PARAM_FIELDS[model_kind]:
         raise PermanentJobError(f"{model_kind}参数包含未允许字段")
     _validate_model_params(model_kind, params)
+    execution = config.get("execution") or {"node_id": "local"}
+    if not isinstance(execution, dict):
+        raise PermanentJobError("execution必须是对象")
+    execution_node_id = _identifier(
+        execution.get("node_id") or "local", "execution.node_id",
+    )
+    execution_mode = str(execution.get("mode") or (
+        "local" if execution_node_id == "local" else "remote_ssh_docker"
+    ))
+    expected_mode = "local" if execution_node_id == "local" else "remote_ssh_docker"
+    if execution_mode != expected_mode:
+        raise PermanentJobError("execution.mode与node_id不一致")
     _integer(params.get("num_threads", 4), "num_threads", 1, 32)
     if str(params.get("loss", "mse")) != "mse":
         raise PermanentJobError("模型训练只允许MSE损失")

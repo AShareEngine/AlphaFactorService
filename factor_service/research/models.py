@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from typing import Any
 
 import numpy as np
@@ -39,18 +40,21 @@ class QlibTorchMLPModel:
         self.weight_decay = float(weight_decay)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
-        self.model_name = "LSTM"
+        self.model_name = "MLP"
         # The scheduler executes jobs in a background Python thread. Reconfiguring
         # PyTorch's global CPU pool from that thread can deadlock on Apple Silicon;
         # the service process owns the pool and its environment-level limits.
         torch.manual_seed(self.seed)
+        self.device = _torch_device(torch)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(self.seed)
         layers: list[Any] = []
         width = self.input_dim
         for hidden_width in self.hidden_layers:
             layers.extend((nn.Linear(width, hidden_width), nn.ReLU()))
             width = hidden_width
         layers.append(nn.Linear(width, 1))
-        self.network = nn.Sequential(*layers)
+        self.network = nn.Sequential(*layers).to(self.device)
         self.fitted = False
 
     def fit(
@@ -65,10 +69,10 @@ class QlibTorchMLPModel:
             ["train", "valid"], col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
         )
-        x_train = torch.as_tensor(train["feature"].values, dtype=torch.float32)
-        y_train = torch.as_tensor(train["label"].values.reshape(-1), dtype=torch.float32)
-        x_valid = torch.as_tensor(valid["feature"].values, dtype=torch.float32)
-        y_valid = torch.as_tensor(valid["label"].values.reshape(-1), dtype=torch.float32)
+        x_train = torch.as_tensor(train["feature"].values, dtype=torch.float32, device=self.device)
+        y_train = torch.as_tensor(train["label"].values.reshape(-1), dtype=torch.float32, device=self.device)
+        x_valid = torch.as_tensor(valid["feature"].values, dtype=torch.float32, device=self.device)
+        y_valid = torch.as_tensor(valid["label"].values.reshape(-1), dtype=torch.float32, device=self.device)
         if not len(x_train) or not len(x_valid):
             raise ValueError("MLP训练集或验证集为空")
         optimizer = torch.optim.AdamW(
@@ -86,7 +90,7 @@ class QlibTorchMLPModel:
                 cancellation.checkpoint()
             indices = torch.randint(
                 0, len(x_train), (min(self.batch_size, len(x_train)),), generator=generator,
-            )
+            ).to(self.device)
             optimizer.zero_grad(set_to_none=True)
             train_loss = loss_fn(self.network(x_train[indices]).reshape(-1), y_train[indices])
             train_loss.backward()
@@ -139,12 +143,18 @@ class QlibTorchMLPModel:
             raise ValueError("MLP模型尚未训练")
         self.network.eval()
         with torch.no_grad():
-            values = torch.as_tensor(features.values, dtype=torch.float32)
+            values = torch.as_tensor(features.values, dtype=torch.float32, device=self.device)
             return self.network(values).reshape(-1).cpu().numpy().astype(float)
 
     def get_feature_importance(self) -> list[float]:
         first = next(layer for layer in self.network if layer.__class__.__name__ == "Linear")
         return first.weight.detach().abs().mean(dim=0).cpu().numpy().tolist()
+
+    def to_cpu(self) -> None:
+        import torch
+
+        self.network = self.network.cpu()
+        self.device = torch.device("cpu")
 
 
 class QlibTorchLSTMModel:
@@ -177,14 +187,17 @@ class QlibTorchLSTMModel:
         if self.lookback_window < 2:
             raise ValueError("lookback_window必须至少为2")
         torch.manual_seed(self.seed)
+        self.device = _torch_device(torch)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(self.seed)
         self.encoder = nn.LSTM(
             input_size=self.input_dim,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
             dropout=self.dropout if self.num_layers > 1 else 0.0,
             batch_first=True,
-        )
-        self.head = nn.Linear(self.hidden_size, 1)
+        ).to(self.device)
+        self.head = nn.Linear(self.hidden_size, 1).to(self.device)
         self.fitted = False
 
     def _forward(self, features: Any) -> Any:
@@ -230,8 +243,8 @@ class QlibTorchLSTMModel:
             if not len(features):
                 continue
             successful_steps += 1
-            x_train = torch.as_tensor(features, dtype=torch.float32)
-            y_train = torch.as_tensor(labels, dtype=torch.float32)
+            x_train = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+            y_train = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
             optimizer.zero_grad(set_to_none=True)
             train_loss = loss_fn(self._forward(x_train), y_train)
             train_loss.backward()
@@ -300,8 +313,8 @@ class QlibTorchLSTMModel:
                 )
                 if not len(features):
                     continue
-                values = self._forward(torch.as_tensor(features, dtype=torch.float32))
-                target = torch.as_tensor(labels, dtype=torch.float32)
+                values = self._forward(torch.as_tensor(features, dtype=torch.float32, device=self.device))
+                target = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
                 loss = float(loss_fn(values, target).item())
                 total_loss += loss * len(features)
                 total_rows += len(features)
@@ -337,7 +350,7 @@ class QlibTorchLSTMModel:
                 if not len(features):
                     continue
                 output = self._forward(
-                    torch.as_tensor(features, dtype=torch.float32),
+                    torch.as_tensor(features, dtype=torch.float32, device=self.device),
                 ).cpu().numpy().astype(float)
                 predictions.append(output)
                 positions.extend(valid_positions)
@@ -348,6 +361,13 @@ class QlibTorchLSTMModel:
     def get_feature_importance(self) -> list[float]:
         weights = self.encoder.weight_ih_l0.detach().abs().mean(dim=0)
         return weights.cpu().numpy().tolist()
+
+    def to_cpu(self) -> None:
+        import torch
+
+        self.encoder = self.encoder.cpu()
+        self.head = self.head.cpu()
+        self.device = torch.device("cpu")
 
 
 class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
@@ -413,8 +433,8 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
                 dropout=self.dropout if self.lstm_layers > 1 else 0.0,
                 batch_first=True,
             ),
-        })
-        self.head = nn.Linear(self.lstm_hidden_size, 1)
+        }).to(self.device)
+        self.head = nn.Linear(self.lstm_hidden_size, 1).to(self.device)
         self.fitted = False
 
     def _forward(self, features: Any) -> Any:
@@ -464,6 +484,19 @@ def _sequence_batch(
         labels[valid_indices],
         [indices[int(position)] for position in valid_indices],
     )
+
+
+def _torch_device(torch: Any) -> Any:
+    requested = str(os.environ.get("ALPHA_TORCH_DEVICE") or "auto").strip().lower()
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("远程训练请求CUDA，但当前PyTorch无法访问GPU")
+        return torch.device("cuda")
+    if requested not in {"", "auto", "cpu"}:
+        raise ValueError("ALPHA_TORCH_DEVICE只允许auto、cpu或cuda")
+    if requested == "auto" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 __all__ = [

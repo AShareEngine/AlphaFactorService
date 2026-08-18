@@ -1,0 +1,138 @@
+- generic [ref=f1e3]:
+  - banner [ref=f1e5]:
+    - generic [ref=f1e6]:
+      - generic [ref=f1e7]: AlphaBlocksStudio
+      - menubar [ref=f1e8]:
+        - menuitem "模式运行" [ref=f1e9]
+        - menuitem "数据资产" [ref=f1e14]
+        - menuitem "数据同步" [ref=f1e19]
+        - menuitem "因子库" [ref=f1e24]
+        - menuitem "模型中心" [ref=f1e29]
+        - menuitem "其他" [ref=f1e34]
+      - generic [ref=f1e39]:
+        - button "实体资产 未配置" [ref=f1e40] [cursor=pointer]:
+          - generic [ref=f1e44]: 实体资产
+          - strong [ref=f1e45]: 未配置
+        - button "切换主题" [ref=f1e46] [cursor=pointer]
+  - main [ref=f1e51]:
+    - generic [ref=f1e54]:
+      - complementary [ref=f1e55]:
+        - generic [ref=f1e56]:
+          - generic [ref=f1e57]: TRAINING WORKFLOW
+          - strong [ref=f1e58]: 训练流程
+          - generic [ref=f1e59]: 按步骤完成配置，最后统一提交。
+        - navigation "训练步骤" [ref=f1e60]:
+          - button "1 特征选择 选择并冻结训练因子" [ref=f1e61] [cursor=pointer]:
+            - generic [ref=f1e62]: "1"
+            - generic [ref=f1e63]:
+              - strong [ref=f1e64]: 特征选择
+              - generic [ref=f1e65]: 选择并冻结训练因子
+          - button "2 训练目标 4 项待处理" [ref=f1e66] [cursor=pointer]:
+            - generic [ref=f1e67]: "2"
+            - generic [ref=f1e68]:
+              - strong [ref=f1e69]: 训练目标
+              - generic [ref=f1e70]: 4 项待处理
+          - button "✓ 参数配置 LightGBM · 单模型训练" [ref=f1e71] [cursor=pointer]:
+            - generic [ref=f1e72]: ✓
+            - generic [ref=f1e73]:
+              - strong [ref=f1e74]: 参数配置
+              - generic [ref=f1e75]: LightGBM · 单模型训练
+          - button "4 执行训练 创建任务并进入队列" [ref=f1e76] [cursor=pointer]:
+            - generic [ref=f1e77]: "4"
+            - generic [ref=f1e78]:
+              - strong [ref=f1e79]: 执行训练
+              - generic [ref=f1e80]: 创建任务并进入队列
+          - button "5 结果入库 等待训练提交" [ref=f1e81] [cursor=pointer]:
+            - generic [ref=f1e82]: "5"
+            - generic [ref=f1e83]:
+              - strong [ref=f1e84]: 结果入库
+              - generic [ref=f1e85]: 等待训练提交
+        - generic [ref=f1e86]:
+          - text: 当前配置
+          - generic [ref=f1e87]:
+            - generic [ref=f1e88]:
+              - term [ref=f1e89]: 目标
+              - definition [ref=f1e90]: 训练目标
+            - generic [ref=f1e91]:
+              - term [ref=f1e92]: 算法
+              - definition [ref=f1e93]: LightGBM
+            - generic [ref=f1e94]:
+              - term [ref=f1e95]: 特征
+              - definition [ref=f1e96]: 0 个
+            - generic [ref=f1e97]:
+              - term [ref=f1e98]: 标签
+              - definition [ref=f1e99]: T+5
+        - generic [ref=f1e101]:
+          - generic [ref=f1e102]: 训练节点
+          - button "检查" [ref=f1e103] [cursor=pointer]
+        - generic [ref=f1e104]:
+          - button "参数实验" [ref=f1e105] [cursor=pointer]
+          - button "训练任务" [ref=f1e106] [cursor=pointer]
+      - generic [ref=f1e107]:
+        - generic [ref=f1e108]:
+          - generic [ref=f1e109]:
+            - generic [ref=f1e110]: MODEL TRAINING
+            - strong [ref=f1e111]: 模型训练
+            - generic [ref=f1e112]: 选择因子并形成可复现的 Qlib 训练任务
+          - generic [ref=f1e113]:
+            - generic [ref=f1e114]:
+              - generic [ref=f1e115]: 草稿
+              - strong [ref=f1e116]: 等待修改
+            - button "研究模板" [disabled] [ref=f1e117]
+            - button "保存为模板" [ref=f1e119] [cursor=pointer]
+        - generic [ref=f1e122]:
+          - generic [ref=f1e123]:
+            - generic [ref=f1e124]: 研究目标
+            - strong [ref=f1e125]: 训练目标
+          - generic [ref=f1e126]:
+            - generic [ref=f1e127]: 股票池
+            - strong [ref=f1e128]: 中证500
+          - generic [ref=f1e129]:
+            - generic [ref=f1e130]: 特征数
+            - strong [ref=f1e131]: "0"
+          - generic [ref=f1e132]:
+            - generic [ref=f1e133]: 预测周期
+            - strong [ref=f1e134]: T+5
+          - generic [ref=f1e135]:
+            - generic [ref=f1e136]: 数据集天数
+            - strong [ref=f1e137]: "--"
+        - generic [ref=f1e139]:
+          - generic [ref=f1e140]:
+            - generic [ref=f1e141]: 步骤 1
+            - heading "选择训练特征" [level=2] [ref=f1e142]
+          - alert [ref=f1e143]:
+            - generic [ref=f1e147]: 基础行情与所有启用因子均可选择；提交时锁定版本、公式参数和params_hash，训练任务直接从源数据计算并冻结Parquet。
+          - generic [ref=f1e149]:
+            - generic [ref=f1e155]:
+              - strong [ref=f1e156]: 训练股票池
+              - generic [ref=f1e157]: 历史时点成分股，服务端按交易日快照冻结，不会使用未来成分。
+            - generic [ref=f1e158]: 股票池
+            - generic [ref=f1e161]:
+              - generic [ref=f1e162]:
+                - generic [ref=f1e163]: 当前股票池
+                - strong [ref=f1e164]: 中证500
+              - generic [ref=f1e165]:
+                - generic [ref=f1e166]: 基准指数
+                - strong [ref=f1e167]: 000905.SH
+              - generic [ref=f1e168]:
+                - generic [ref=f1e169]: 回测基准
+                - strong [ref=f1e170]: 000905.SH
+          - generic [ref=f1e171]:
+            - group "checkbox-group"
+            - complementary [ref=f1e172]:
+              - generic [ref=f1e173]:
+                - generic [ref=f1e174]:
+                  - generic [ref=f1e175]: 特征预览
+                  - strong [ref=f1e176]: 0 个特征 · 0 个类别
+                - generic [ref=f1e177]: 待选择
+              - paragraph [ref=f1e198]: 请从左侧选择至少一个因子
+              - paragraph [ref=f1e199]: 尚未选择特征。请按分类展开选择，再根据研究假设增删。
+              - generic [ref=f1e200]: 覆盖率会在冻结的历史股票池上由服务端重新计算；测试段不参与因子删选和参数选择。
+        - generic [ref=f1e201]:
+          - generic [ref=f1e202]:
+            - generic [ref=f1e203]: 步骤 1 / 5
+            - strong [ref=f1e204]: 特征选择
+            - generic [ref=f1e205]: 选择并冻结训练因子
+          - generic [ref=f1e206]:
+            - button "上一步" [disabled] [ref=f1e207]
+            - button "下一步" [ref=f1e209] [cursor=pointer]

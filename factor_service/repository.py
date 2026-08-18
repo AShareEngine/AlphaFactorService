@@ -104,6 +104,49 @@ def get_factor(
     return _factor_from_row(rows[0], available_versions=versions)
 
 
+def get_factors_for_identity(
+    requests: list[tuple[str, Optional[int]]],
+) -> dict[tuple[str, Optional[int]], FactorOut]:
+    """Resolve many (factor_id, version) pairs with two queries instead of one per factor.
+
+    A ``None`` version resolves to the latest version, matching ``get_factor``.
+    """
+    cleaned: list[tuple[str, Optional[int]]] = []
+    seen: set[tuple[str, Optional[int]]] = set()
+    for factor_id, version in requests:
+        key = (str(factor_id), version if version is None else int(version))
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(key)
+    if not cleaned:
+        return {}
+    factor_ids = sorted({key[0] for key in cleaned})
+    database = settings().clickhouse_database
+    rows = client().query(
+        f"""
+        SELECT *
+        FROM {database}.factor_definitions
+        WHERE factor_id IN {{factor_ids:Array(String)}}
+        ORDER BY factor_id ASC, version DESC
+        """,
+        parameters={"factor_ids": factor_ids},
+    ).result_rows
+    versions = _factor_versions(factor_ids)
+    by_factor: dict[str, dict[int, FactorOut]] = {}
+    for row in rows:
+        item = _factor_from_row(row, available_versions=versions.get(str(row[0]), ()))
+        by_factor.setdefault(str(item.factor_id), {})[int(item.version)] = item
+    resolved: dict[tuple[str, Optional[int]], FactorOut] = {}
+    for factor_id, version in cleaned:
+        candidates = by_factor.get(factor_id)
+        if not candidates:
+            continue
+        item = candidates.get(version) if version is not None else candidates.get(max(candidates))
+        if item is not None:
+            resolved[(factor_id, version)] = item
+    return resolved
+
+
 def _factor_versions(
     factor_ids: list[str],
 ) -> dict[str, tuple[int, ...]]:

@@ -222,6 +222,38 @@ def test_split_rejects_too_little_history() -> None:
         split_trading_dates(pd.Index(pd.date_range("2024-01-02", periods=30, freq="B")))
 
 
+def test_split_honors_custom_valid_and_test_ratios() -> None:
+    dates = pd.date_range("2024-01-02", periods=200, freq="B")
+    segments = split_trading_dates(
+        pd.Index(dates), embargo_days=5,
+        train_ratio=0.7, valid_ratio=0.15,
+    )
+    train_end = dates.get_loc(pd.Timestamp(segments["train"][1]))
+    valid_start = dates.get_loc(pd.Timestamp(segments["valid"][0]))
+    valid_end = dates.get_loc(pd.Timestamp(segments["valid"][1]))
+    test_start = dates.get_loc(pd.Timestamp(segments["test"][0]))
+    # 200 * 0.7 = 140，训练集约占前140个交易日（含末尾5日隔离）
+    assert valid_start == 140
+    # 200 * 0.85 = 170，测试集从第170个交易日开始
+    assert test_start == 170
+    assert valid_start - train_end == 6
+    assert test_start - valid_end == 6
+    assert segments["test"][1] == dates[-1].date().isoformat()
+
+
+def test_split_rejects_invalid_ratios() -> None:
+    with pytest.raises(ValueError, match="不得低于5%"):
+        split_trading_dates(
+            pd.Index(pd.date_range("2024-01-02", periods=200, freq="B")),
+            train_ratio=0.98, valid_ratio=0.01,
+        )
+    with pytest.raises(ValueError, match="必须是有效数字"):
+        split_trading_dates(
+            pd.Index(pd.date_range("2024-01-02", periods=200, freq="B")),
+            train_ratio=0.6, valid_ratio=float("nan"),
+        )
+
+
 def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> None:
     dates = pd.date_range("2018-01-02", periods=1600, freq="B")
     windows = walk_forward_segments(

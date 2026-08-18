@@ -75,6 +75,12 @@ class DailyInferenceRunner:
 
         lookback_window = 1
         feature_date_start = trade_date
+        universe_id = str(dataset_spec.get("universe_id") or "csi500")
+        index_code = str(dataset_spec.get("index_code") or "000905.SH")
+        universe_label = {
+            "csi300": "沪深300", "csi500": "中证500", "csi800": "中证800",
+            "csi1000": "中证1000", "all_a": "全A",
+        }.get(universe_id, universe_id)
         if model_kind in {"lstm", "transformer_lstm"}:
             lookback_window = int(
                 dict(training_manifest.get("model_params") or {}).get("lookback_window") or 60
@@ -82,16 +88,22 @@ class DailyInferenceRunner:
             try:
                 sequence_dates = self.dataset_builder.trading_dates_ending_at(
                     trade_date, lookback_window,
+                    index_code=index_code, universe_id=universe_id,
                 )
             except ValueError as exc:
                 raise PermanentJobError(str(exc)) from exc
             feature_date_start = sequence_dates[0]
 
         _progress(progress, "building_inference_features", 35, {"trade_date": trade_date})
-        target_membership = self.dataset_builder._membership(trade_date, trade_date)
+        target_membership = self.dataset_builder._membership(
+            trade_date, trade_date, universe_id=universe_id, index_code=index_code,
+        )
         if target_membership.empty:
-            raise PermanentJobError(f"{trade_date}不是中证500可推理交易日")
-        membership = self.dataset_builder._membership(feature_date_start, trade_date)
+            raise PermanentJobError(f"{trade_date}不是{universe_label}可推理交易日")
+        membership = self.dataset_builder._membership(
+            feature_date_start, trade_date,
+            universe_id=universe_id, index_code=index_code,
+        )
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}
         expected_count = max(1, len(features))

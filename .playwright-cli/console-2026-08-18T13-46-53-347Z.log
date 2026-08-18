@@ -1,0 +1,167 @@
+[    1534ms] [WARNING] [Vue Router warn]: uncaught error during route navigation: @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/devtools-EWN81iOl.mjs?v=954381be:34
+[    1534ms] [ERROR] SyntaxError: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/vue-router.mjs?v=954381be:1239
+[    1535ms] [ERROR] [nuxt] error caught during app initialization H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' @ http://127.0.0.1:3000/_nuxt/node_modules/nuxt/dist/app/nuxt.js?v=954381be:123
+[    1535ms] [WARNING] [Vue Router warn]: Unexpected error when starting the router: SyntaxError: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/devtools-EWN81iOl.mjs?v=954381be:34
+[    1537ms] [LOG] %cssr:success%c Vite server hmr 12 files 
+      background: #2ecc71;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      in 153.572ms 
+  at vite_node_entry_default (node_modules/@nuxt/vite-builder/dist/vite-node-entry.mjs)
+  at process.processTicksAndRejections (node:internal/process/task_queues)
+  at async Object.renderToString (node_modules/vue-bundle-renderer/dist/runtime.mjs)
+ @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[    1537ms] [WARNING] %cssr:warn%c [Vue warn]: Invalid vnode type when creating vnode: undefined. 
+      background: #f39c12;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      at <ElIcon>
+at <Training>
+at <RouteProvider>
+at <RouterView>
+at <NuxtPage>
+at <Default>
+at <AsyncComponentWrapper>
+at <LayoutLoader>
+at <NuxtLayoutProvider>
+at <NuxtLayout>
+at <App>
+at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[    1537ms] [WARNING] %cssr:warn%c [Vue warn]: Invalid vnode type when creating vnode: undefined. 
+      background: #f39c12;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      at <ElIcon>
+at <Training>
+at <RouteProvider>
+at <RouterView>
+at <NuxtPage>
+at <Default>
+at <AsyncComponentWrapper>
+at <LayoutLoader>
+at <NuxtLayoutProvider>
+at <NuxtLayout>
+at <App>
+at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[    1541ms] [ERROR] [nuxt] error caught during app initialization H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' @ http://127.0.0.1:3000/_nuxt/node_modules/nuxt/dist/app/nuxt.js?v=954381be:123
+[    1544ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[    1568ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51
+[    1573ms] [WARNING] [Vue warn]: Hydration class mismatch on JSHandle@node 
+  - rendered on server: class="platform-backdrop-top"
+  - expected on client: class="-bottom-1/2 fixed h-1/2 left-0 right-0 spotlight"
+  Note: this mismatch is check-only. The DOM will not be rectified in production due to performance overhead.
+  You should fix the source of the mismatch. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    1573ms] [ERROR] Hydration completed but contains mismatches. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:1882
+[    1573ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node  
+- expected on client: div 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    1573ms] [WARNING] [Vue warn]: Hydration children mismatch on JSHandle@node 
+Server rendered element contains more child nodes than client vdom. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    1574ms] [WARNING] [Vue warn]: Hydration class mismatch on JSHandle@node 
+  - rendered on server: class="platform-shell-top"
+  - expected on client: class="antialiased bg-white dark:bg-black dark:text-white font-sans grid min-h-screen overflow-hidden place-content-center text-black"
+  Note: this mismatch is check-only. The DOM will not be rectified in production due to performance overhead.
+  You should fix the source of the mismatch. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'FileText' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[   37498ms] [WARNING] [Vue Router warn]: uncaught error during route navigation: @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/devtools-EWN81iOl.mjs?v=954381be:34
+[   37498ms] [ERROR] SyntaxError: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/vue-router.mjs?v=954381be:1239
+[   37498ms] [ERROR] [nuxt] error caught during app initialization H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' @ http://127.0.0.1:3000/_nuxt/node_modules/nuxt/dist/app/nuxt.js?v=954381be:123
+[   37498ms] [WARNING] [Vue Router warn]: Unexpected error when starting the router: SyntaxError: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' @ http://127.0.0.1:3000/_nuxt/node_modules/vue-router/dist/devtools-EWN81iOl.mjs?v=954381be:34
+[   37500ms] [LOG] %cssr:success%c Vite server hmr 12 files 
+      background: #2ecc71;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      in 153.66ms 
+  at vite_node_entry_default (node_modules/@nuxt/vite-builder/dist/vite-node-entry.mjs)
+  at process.processTicksAndRejections (node:internal/process/task_queues)
+  at async Object.renderToString (node_modules/vue-bundle-renderer/dist/runtime.mjs)
+ @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[   37501ms] [WARNING] %cssr:warn%c [Vue warn]: Invalid vnode type when creating vnode: undefined. 
+      background: #f39c12;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      at <ElIcon>
+at <Training>
+at <RouteProvider>
+at <RouterView>
+at <NuxtPage>
+at <Default>
+at <AsyncComponentWrapper>
+at <LayoutLoader>
+at <NuxtLayoutProvider>
+at <NuxtLayout>
+at <App>
+at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[   37504ms] [ERROR] [nuxt] error caught during app initialization H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' @ http://127.0.0.1:3000/_nuxt/node_modules/nuxt/dist/app/nuxt.js?v=954381be:123
+[   37504ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[   37512ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51
+[   37518ms] [WARNING] [Vue warn]: Hydration class mismatch on JSHandle@node 
+  - rendered on server: class="platform-backdrop-top"
+  - expected on client: class="-bottom-1/2 fixed h-1/2 left-0 right-0 spotlight"
+  Note: this mismatch is check-only. The DOM will not be rectified in production due to performance overhead.
+  You should fix the source of the mismatch. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[   37518ms] [ERROR] Hydration completed but contains mismatches. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:1882
+[   37518ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node  
+- expected on client: div 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[   37518ms] [WARNING] [Vue warn]: Hydration children mismatch on JSHandle@node 
+Server rendered element contains more child nodes than client vdom. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[   37519ms] [WARNING] [Vue warn]: Hydration class mismatch on JSHandle@node 
+  - rendered on server: class="platform-shell-top"
+  - expected on client: class="antialiased bg-white dark:bg-black dark:text-white font-sans grid min-h-screen overflow-hidden place-content-center text-black"
+  Note: this mismatch is check-only. The DOM will not be rectified in production due to performance overhead.
+  You should fix the source of the mismatch. 
+  at <Error500 status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <AsyncComponentWrapper status=500 statusText="Internal Server Error" statusCode=500  ... > 
+  at <NuxtErrorPage key=1 error= H3Error: The requested module '/_nuxt/node_modules/.cache/vite/client/deps/@element-plus_icons-vue.js?v=954381be' does not provide an export named 'Play' > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[   61133ms] [LOG] %cssr:success%c Vite server hmr 12 files 
+      background: #2ecc71;
+      border-radius: 0.5em;
+      color: white;
+      font-weight: bold;
+      padding: 2px 0.5em;
+      in 162.129ms 
+  at vite_node_entry_default (node_modules/@nuxt/vite-builder/dist/vite-node-entry.mjs)
+  at process.processTicksAndRejections (node:internal/process/task_queues)
+  at async Object.renderToString (node_modules/vue-bundle-renderer/dist/runtime.mjs)
+ @ http://127.0.0.1:3000/_nuxt/node_modules/consola/dist/browser.mjs?v=954381be:47
+[   61134ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[   61205ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51

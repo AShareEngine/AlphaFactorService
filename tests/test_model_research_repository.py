@@ -83,6 +83,44 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     }
 
 
+def test_dataset_spec_accepts_custom_split_ratios() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "split": {"valid": 0.15, "test": 0.1},
+    })
+
+    assert spec["split"]["train"] == pytest.approx(0.75)
+    assert spec["split"]["valid"] == pytest.approx(0.15)
+    assert spec["split"]["test"] == pytest.approx(0.1)
+    assert spec["split"]["embargo_days"] == 5
+
+
+def test_dataset_spec_accepts_custom_universe() -> None:
+    spec = _dataset_spec({**_source(), "universe_id": "all_a"})
+
+    assert spec["universe_id"] == "all_a"
+    assert spec["index_code"] == "000985.SH"
+    assert spec["benchmark_code"] == "000985.SH"
+
+    csi300 = _dataset_spec({**_source(), "universe_id": "csi300"})
+    assert csi300["universe_id"] == "csi300"
+    assert csi300["index_code"] == "000300.SH"
+
+
+def test_dataset_spec_rejects_unknown_universe() -> None:
+    with pytest.raises(ModelResearchError, match="不支持的股票池"):
+        _dataset_spec({**_source(), "universe_id": "csi2000"})
+
+
+def test_dataset_spec_rejects_invalid_split_ratios() -> None:
+    with pytest.raises(ModelResearchError, match="训练集不低于30%"):
+        _dataset_spec({**_source(), "split": {"valid": 0.5, "test": 0.4}})
+    with pytest.raises(ModelResearchError, match="不低于5%"):
+        _dataset_spec({**_source(), "split": {"valid": 0.0, "test": 0.1}})
+    with pytest.raises(ModelResearchError, match="必须是数字"):
+        _dataset_spec({**_source(), "split": {"valid": "high", "test": 0.2}})
+
+
 def test_research_template_freezes_complete_single_training_contract() -> None:
     spec = _research_template_spec({
         "name": "LGBM 基线",
@@ -224,6 +262,18 @@ def test_dataset_contract_accepts_single_horizon_range(horizon) -> None:
     })
     assert spec["label"]["horizon_trading_days"] == horizon
     assert spec["split"]["embargo_days"] == horizon
+
+
+def test_training_job_freezes_remote_execution_node() -> None:
+    # The normalizer is exercised separately from database writes through the
+    # exported job spec helpers used by repository tests.
+    from factor_service.model_research_repository import _execution_spec
+
+    assert _execution_spec({"node_id": "autodl-gpu-01"}) == {
+        "node_id": "autodl-gpu-01",
+        "mode": "remote_ssh_docker",
+    }
+    assert _execution_spec({}) == {"node_id": "local", "mode": "local"}
 
 
 def test_market_style_dataset_contract_freezes_target_and_style_label() -> None:

@@ -1,0 +1,271 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: AlphaBlocksStudio
+        - menubar [ref=e8]:
+          - menuitem "模式运行" [ref=e9]
+          - menuitem "数据资产" [ref=e14]
+          - menuitem "数据同步" [ref=e19]
+          - menuitem "因子库" [ref=e24]
+          - menuitem "模型中心" [ref=e29]
+          - menuitem "其他" [ref=e34]
+        - generic [ref=e39]:
+          - button "实体资产 已同步 9/55" [ref=e190] [cursor=pointer]:
+            - generic [ref=e44]: 实体资产
+            - strong [ref=e45]: 已同步 9/55
+          - button "切换主题" [ref=e46] [cursor=pointer]
+    - main [ref=e51]:
+      - generic [ref=e54]:
+        - complementary [ref=e55]:
+          - generic [ref=e56]:
+            - generic [ref=e57]: TRAINING WORKFLOW
+            - strong [ref=e58]: 训练流程
+            - generic [ref=e59]: 按步骤完成配置，最后统一提交。
+          - navigation "训练步骤" [ref=e60]:
+            - button "1 特征选择 选择并冻结训练因子" [ref=e61] [cursor=pointer]:
+              - generic [ref=e62]: "1"
+              - generic [ref=e63]:
+                - strong [ref=e64]: 特征选择
+                - generic [ref=e65]: 选择并冻结训练因子
+            - button "2 训练目标 2 项待处理" [ref=e193] [cursor=pointer]:
+              - generic [ref=e67]: "2"
+              - generic [ref=e68]:
+                - strong [ref=e69]: 训练目标
+                - generic [ref=e70]: 2 项待处理
+            - button "✓ 参数配置 LightGBM · 单模型训练" [ref=e71] [cursor=pointer]:
+              - generic [ref=e72]: ✓
+              - generic [ref=e73]:
+                - strong [ref=e74]: 参数配置
+                - generic [ref=e75]: LightGBM · 单模型训练
+            - button "4 执行训练 创建任务并进入队列" [ref=e76] [cursor=pointer]:
+              - generic [ref=e77]: "4"
+              - generic [ref=e78]:
+                - strong [ref=e79]: 执行训练
+                - generic [ref=e80]: 创建任务并进入队列
+            - button "5 结果入库 等待训练提交" [ref=e81] [cursor=pointer]:
+              - generic [ref=e82]: "5"
+              - generic [ref=e83]:
+                - strong [ref=e84]: 结果入库
+                - generic [ref=e85]: 等待训练提交
+          - generic [ref=e86]:
+            - text: 当前配置
+            - generic [ref=e87]:
+              - generic [ref=e88]:
+                - term [ref=e89]: 目标
+                - definition [ref=e90]: 个股选股
+              - generic [ref=e91]:
+                - term [ref=e92]: 算法
+                - definition [ref=e93]: LightGBM
+              - generic [ref=e94]:
+                - term [ref=e95]: 特征
+                - definition [ref=e96]: 0 个
+              - generic [ref=e97]:
+                - term [ref=e98]: 标签
+                - definition [ref=e99]: T+5
+          - generic [ref=e100]:
+            - generic [ref=e101]:
+              - generic [ref=e102]: 训练节点
+              - button "检查" [ref=e103] [cursor=pointer]
+            - button "本机训练 LOCAL" [ref=e195] [cursor=pointer]:
+              - generic [ref=e197]:
+                - strong [ref=e198]: 本机训练
+                - generic [ref=e199]: LOCAL
+          - generic [ref=e104]:
+            - button "参数实验" [ref=e105] [cursor=pointer]
+            - button "训练任务" [ref=e106] [cursor=pointer]
+        - generic [ref=e107]:
+          - generic [ref=e108]:
+            - generic [ref=e109]:
+              - generic [ref=e110]: MODEL TRAINING
+              - strong [ref=e111]: 模型训练
+              - generic [ref=e112]: 选择因子并形成可复现的 Qlib 训练任务
+            - generic [ref=e113]:
+              - generic [ref=e114]:
+                - generic [ref=e115]: 草稿
+                - strong [ref=e116]: 等待修改
+              - button "研究模板（0）" [ref=e201] [cursor=pointer]
+              - button "保存为模板" [ref=e119] [cursor=pointer]
+          - generic [ref=e121]:
+            - generic [ref=e122]:
+              - generic [ref=e123]: 研究目标
+              - strong [ref=e124]: 个股选股
+            - generic [ref=e125]:
+              - generic [ref=e126]: 股票池
+              - generic [ref=e203]:
+                - generic [ref=e204] [cursor=pointer]:
+                  - generic:
+                    - combobox [expanded] [active] [ref=e206]
+                    - generic [ref=e207]: 中证500
+                - tooltip "中证500" [ref=e401]:
+                  - listbox [ref=e405]:
+                    - option "沪深300" [ref=e406] [cursor=pointer]
+                    - option "中证500" [selected] [ref=e407] [cursor=pointer]
+                    - option "中证800" [ref=e408] [cursor=pointer]
+                    - option "中证1000" [ref=e409] [cursor=pointer]
+                    - option "全A" [ref=e410] [cursor=pointer]
+            - generic [ref=e127]:
+              - generic [ref=e128]: 特征数
+              - strong [ref=e129]: "0"
+            - generic [ref=e130]:
+              - generic [ref=e131]: 预测周期
+              - strong [ref=e132]: T+5
+            - generic [ref=e133]:
+              - generic [ref=e134]: 数据集天数
+              - strong [ref=e135]: "--"
+            - generic [ref=e136]:
+              - generic [ref=e137]: 状态
+              - strong [ref=e138]: 待配置
+          - generic [ref=e140]:
+            - generic [ref=e141]:
+              - generic [ref=e142]: 步骤 1
+              - heading "选择训练特征" [level=2] [ref=e143]
+            - alert [ref=e144]:
+              - generic [ref=e148]: 基础行情与所有启用因子均可选择；提交时锁定版本、公式参数和params_hash，训练任务直接从源数据计算并冻结Parquet。
+            - generic [ref=e150]:
+              - group "checkbox-group" [ref=e212]:
+                - generic [ref=e213]:
+                  - button "基础行情 9 个候选特征 · 已选 0 项 已选 0 ›" [expanded] [ref=e214] [cursor=pointer]:
+                    - generic [ref=e219]:
+                      - strong [ref=e220]: 基础行情
+                      - generic [ref=e221]: 9 个候选特征 · 已选 0 项
+                    - generic [ref=e222]: 已选 0
+                    - generic [ref=e224]: ›
+                  - generic [ref=e225]:
+                    - generic [ref=e226]:
+                      - generic [ref=e227] [cursor=pointer]:
+                        - checkbox "全选本类特征（9）" [ref=e228]
+                        - generic: 全选本类特征（9）
+                      - generic: 0 / 9
+                    - generic [ref=e229]:
+                      - generic "成交额" [ref=e230] [cursor=pointer]:
+                        - generic [ref=e231]:
+                          - checkbox "成交额 · v1"
+                        - generic [ref=e233]:
+                          - text: 成交额
+                          - generic [ref=e234]: · v1
+                      - generic "收盘价" [ref=e235] [cursor=pointer]:
+                        - generic [ref=e236]:
+                          - checkbox "收盘价 · v1"
+                        - generic [ref=e238]:
+                          - text: 收盘价
+                          - generic [ref=e239]: · v1
+                      - generic "最高价" [ref=e240] [cursor=pointer]:
+                        - generic [ref=e241]:
+                          - checkbox "最高价 · v1"
+                        - generic [ref=e243]:
+                          - text: 最高价
+                          - generic [ref=e244]: · v1
+                      - generic "最低价" [ref=e245] [cursor=pointer]:
+                        - generic [ref=e246]:
+                          - checkbox "最低价 · v1"
+                        - generic [ref=e248]:
+                          - text: 最低价
+                          - generic [ref=e249]: · v1
+                      - generic "开盘价" [ref=e250] [cursor=pointer]:
+                        - generic [ref=e251]:
+                          - checkbox "开盘价 · v1"
+                        - generic [ref=e253]:
+                          - text: 开盘价
+                          - generic [ref=e254]: · v1
+                      - generic "当日涨跌幅" [ref=e255] [cursor=pointer]:
+                        - generic [ref=e256]:
+                          - checkbox "当日涨跌幅 · v1"
+                        - generic [ref=e258]:
+                          - text: 当日涨跌幅
+                          - generic [ref=e259]: · v1
+                      - generic "昨收价" [ref=e260] [cursor=pointer]:
+                        - generic [ref=e261]:
+                          - checkbox "昨收价 · v1"
+                        - generic [ref=e263]:
+                          - text: 昨收价
+                          - generic [ref=e264]: · v1
+                      - generic "换手率" [ref=e265] [cursor=pointer]:
+                        - generic [ref=e266]:
+                          - checkbox "换手率 · v1"
+                        - generic [ref=e268]:
+                          - text: 换手率
+                          - generic [ref=e269]: · v1
+                      - generic "成交量" [ref=e270] [cursor=pointer]:
+                        - generic [ref=e271]:
+                          - checkbox "成交量 · v1"
+                        - generic [ref=e273]:
+                          - text: 成交量
+                          - generic [ref=e274]: · v1
+                - button "情绪类因子 28 个候选特征 · 已选 0 项 已选 0 ›" [ref=e276] [cursor=pointer]:
+                  - generic [ref=e281]:
+                    - strong [ref=e282]: 情绪类因子
+                    - generic [ref=e283]: 28 个候选特征 · 已选 0 项
+                  - generic [ref=e284]: 已选 0
+                  - generic [ref=e286]: ›
+                - button "动量类因子 25 个候选特征 · 已选 0 项 已选 0 ›" [ref=e288] [cursor=pointer]:
+                  - generic [ref=e294]:
+                    - strong [ref=e295]: 动量类因子
+                    - generic [ref=e296]: 25 个候选特征 · 已选 0 项
+                  - generic [ref=e297]: 已选 0
+                  - generic [ref=e299]: ›
+                - button "技术指标因子 13 个候选特征 · 已选 0 项 已选 0 ›" [ref=e301] [cursor=pointer]:
+                  - generic [ref=e306]:
+                    - strong [ref=e307]: 技术指标因子
+                    - generic [ref=e308]: 13 个候选特征 · 已选 0 项
+                  - generic [ref=e309]: 已选 0
+                  - generic [ref=e311]: ›
+                - button "风险类因子 12 个候选特征 · 已选 0 项 已选 0 ›" [ref=e313] [cursor=pointer]:
+                  - generic [ref=e318]:
+                    - strong [ref=e319]: 风险类因子
+                    - generic [ref=e320]: 12 个候选特征 · 已选 0 项
+                  - generic [ref=e321]: 已选 0
+                  - generic [ref=e323]: ›
+                - button "风险因子 - 风格因子 5 个候选特征 · 已选 0 项 已选 0 ›" [ref=e325] [cursor=pointer]:
+                  - generic [ref=e331]:
+                    - strong [ref=e332]: 风险因子 - 风格因子
+                    - generic [ref=e333]: 5 个候选特征 · 已选 0 项
+                  - generic [ref=e334]: 已选 0
+                  - generic [ref=e336]: ›
+                - button "风险因子 - 新风格因子 1 个候选特征 · 已选 0 项 已选 0 ›" [ref=e338] [cursor=pointer]:
+                  - generic [ref=e344]:
+                    - strong [ref=e345]: 风险因子 - 新风格因子
+                    - generic [ref=e346]: 1 个候选特征 · 已选 0 项
+                  - generic [ref=e347]: 已选 0
+                  - generic [ref=e349]: ›
+                - button "涨停因子 2 个候选特征 · 已选 0 项 已选 0 ›" [ref=e351] [cursor=pointer]:
+                  - generic [ref=e357]:
+                    - strong [ref=e358]: 涨停因子
+                    - generic [ref=e359]: 2 个候选特征 · 已选 0 项
+                  - generic [ref=e360]: 已选 0
+                  - generic [ref=e362]: ›
+                - button "量价因子 4 个候选特征 · 已选 0 项 已选 0 ›" [ref=e364] [cursor=pointer]:
+                  - generic [ref=e369]:
+                    - strong [ref=e370]: 量价因子
+                    - generic [ref=e371]: 4 个候选特征 · 已选 0 项
+                  - generic [ref=e372]: 已选 0
+                  - generic [ref=e374]: ›
+                - button "风险情绪因子 1 个候选特征 · 已选 0 项 已选 0 ›" [ref=e376] [cursor=pointer]:
+                  - generic [ref=e381]:
+                    - strong [ref=e382]: 风险情绪因子
+                    - generic [ref=e383]: 1 个候选特征 · 已选 0 项
+                  - generic [ref=e384]: 已选 0
+                  - generic [ref=e386]: ›
+              - complementary [ref=e151]:
+                - generic [ref=e152]:
+                  - generic [ref=e153]:
+                    - generic [ref=e154]: 特征预览
+                    - strong [ref=e155]: 0 个特征 · 0 个类别
+                  - generic [ref=e156]: 待选择
+                - paragraph [ref=e177]: 请从左侧选择至少一个因子
+                - paragraph [ref=e178]: 尚未选择特征。请按分类展开选择，再根据研究假设增删。
+                - generic [ref=e179]: 覆盖率会在冻结的历史股票池上由服务端重新计算；测试段不参与因子删选和参数选择。
+          - generic [ref=e180]:
+            - generic [ref=e181]:
+              - generic [ref=e182]: 步骤 1 / 5
+              - strong [ref=e183]: 特征选择
+              - generic [ref=e184]: 选择并冻结训练因子
+            - generic [ref=e185]:
+              - button "上一步" [disabled] [ref=e186]
+              - button "下一步" [ref=e188] [cursor=pointer]
+  - generic [ref=e387]:
+    - button "Toggle Nuxt DevTools" [ref=e388] [cursor=pointer]
+    - generic "Page load time" [ref=e392]:
+      - generic [ref=e393]: "282"
+      - generic [ref=e394]: ms
+    - button "Toggle Component Inspector" [ref=e396] [cursor=pointer]
