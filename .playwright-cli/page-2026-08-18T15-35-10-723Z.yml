@@ -1,0 +1,727 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: AlphaBlocksStudio
+        - menubar [ref=e8]:
+          - menuitem "模式运行" [ref=e9]
+          - menuitem "数据资产" [ref=e14]
+          - menuitem "数据同步" [ref=e19]
+          - menuitem "因子库" [ref=e24]
+          - menuitem "模型中心" [ref=e29]
+          - menuitem "其他" [ref=e34]
+        - generic [ref=e39]:
+          - button "实体资产 已同步 9/55" [ref=e114] [cursor=pointer]:
+            - generic [ref=e44]: 实体资产
+            - strong [ref=e45]: 已同步 9/55
+          - button "切换主题" [ref=e46] [cursor=pointer]
+    - main [ref=e51]:
+      - generic [ref=e54]:
+        - complementary [ref=e55]:
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - strong [ref=e58]: 模型列表
+              - generic [ref=e59]: 38 个版本
+            - generic [ref=e60]:
+              - button "刷新" [ref=e61] [cursor=pointer]
+              - button "训练新模型" [ref=e63] [cursor=pointer]
+          - generic [ref=e117]:
+            - textbox "搜索模型" [ref=e120]
+            - generic [ref=e121]:
+              - button "使用中 38" [ref=e122] [cursor=pointer]
+              - button "已归档 0" [ref=e123] [cursor=pointer]
+            - generic [ref=e124]:
+              - generic [ref=e126] [cursor=pointer]:
+                - generic:
+                  - combobox [ref=e128]
+                  - generic [ref=e129]: 全部算法
+              - generic [ref=e135] [cursor=pointer]:
+                - generic:
+                  - combobox [ref=e137]
+                  - generic [ref=e138]: 验证状态
+          - generic [ref=e65]:
+            - button "加入模型比较 中证500 多因子模型 候选 model_1d4ce69d0adc4681 · v1 lightgbm 个股选股 RankIC -0.0059" [ref=e143] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e144]:
+                - generic [ref=e145]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e147]:
+                - generic [ref=e148]:
+                  - strong [ref=e149]: 中证500 多因子模型
+                  - generic [ref=e150]: 候选
+                - code [ref=e152]: model_1d4ce69d0adc4681 · v1
+                - generic [ref=e153]:
+                  - generic [ref=e154]: lightgbm
+                  - generic [ref=e155]: 个股选股
+                  - generic [ref=e156]: RankIC -0.0059
+            - button "加入模型比较 中证500 多因子模型 候选 model_3e921d7a4ca94904 · v1 lightgbm 个股选股 RankIC -0.0028" [ref=e157] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e158]:
+                - generic [ref=e159]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e161]:
+                - generic [ref=e162]:
+                  - strong [ref=e163]: 中证500 多因子模型
+                  - generic [ref=e164]: 候选
+                - code [ref=e166]: model_3e921d7a4ca94904 · v1
+                - generic [ref=e167]:
+                  - generic [ref=e168]: lightgbm
+                  - generic [ref=e169]: 个股选股
+                  - generic [ref=e170]: RankIC -0.0028
+            - button "加入模型比较 中证500 多类别因子消融 · Price3M / btop · 3/3 · btop 候选 csi500_lgbm_factor_ablation_20260815 · v3 lightgbm 个股选股 RankIC 0.0536" [ref=e171] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e172]:
+                - generic [ref=e173]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e175]:
+                - generic [ref=e176]:
+                  - strong [ref=e177]: 中证500 多类别因子消融 · Price3M / btop · 3/3 · btop
+                  - generic [ref=e178]: 候选
+                - code [ref=e180]: csi500_lgbm_factor_ablation_20260815 · v3
+                - generic [ref=e181]:
+                  - generic [ref=e182]: lightgbm
+                  - generic [ref=e183]: 个股选股
+                  - generic [ref=e184]: RankIC 0.0536
+            - button "加入模型比较 中证500 多类别因子消融 · Price3M / btop · 2/3 · Price3M 候选 csi500_lgbm_factor_ablation_20260815 · v2 lightgbm 个股选股 RankIC 0.0573" [ref=e185] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e186]:
+                - generic [ref=e187]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e189]:
+                - generic [ref=e190]:
+                  - strong [ref=e191]: 中证500 多类别因子消融 · Price3M / btop · 2/3 · Price3M
+                  - generic [ref=e192]: 候选
+                - code [ref=e194]: csi500_lgbm_factor_ablation_20260815 · v2
+                - generic [ref=e195]:
+                  - generic [ref=e196]: lightgbm
+                  - generic [ref=e197]: 个股选股
+                  - generic [ref=e198]: RankIC 0.0573
+            - button "加入模型比较 中证500 多类别因子消融 · Price3M / btop · 1/3 · __baseline__ 候选 csi500_lgbm_factor_ablation_20260815 · v1 lightgbm 个股选股 RankIC 0.0541" [ref=e199] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e200]:
+                - generic [ref=e201]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e203]:
+                - generic [ref=e204]:
+                  - strong [ref=e205]: 中证500 多类别因子消融 · Price3M / btop · 1/3 · __baseline__
+                  - generic [ref=e206]: 候选
+                - code [ref=e208]: csi500_lgbm_factor_ablation_20260815 · v1
+                - generic [ref=e209]:
+                  - generic [ref=e210]: lightgbm
+                  - generic [ref=e211]: 个股选股
+                  - generic [ref=e212]: RankIC 0.0541
+            - button "加入模型比较 中证500 多类别 LightGBM · 3窗口滚动稳定性验证（最新日期锚定） 候选 csi500_lgbm_wfa_3window_20260815 · v2 lightgbm 个股选股 RankIC 0.0541" [ref=e213] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e214]:
+                - generic [ref=e215]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e217]:
+                - generic [ref=e218]:
+                  - strong [ref=e219]: 中证500 多类别 LightGBM · 3窗口滚动稳定性验证（最新日期锚定）
+                  - generic [ref=e220]: 候选
+                - code [ref=e222]: csi500_lgbm_wfa_3window_20260815 · v2
+                - generic [ref=e223]:
+                  - generic [ref=e224]: lightgbm
+                  - generic [ref=e225]: 个股选股
+                  - generic [ref=e226]: RankIC 0.0541
+            - button "加入模型比较 中证500 多类别 LightGBM · 3窗口滚动稳定性验证 候选 csi500_lgbm_wfa_3window_20260815 · v1 lightgbm 个股选股 RankIC 0.0535" [ref=e227] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e228]:
+                - generic [ref=e229]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e231]:
+                - generic [ref=e232]:
+                  - strong [ref=e233]: 中证500 多类别 LightGBM · 3窗口滚动稳定性验证
+                  - generic [ref=e234]: 候选
+                - code [ref=e236]: csi500_lgbm_wfa_3window_20260815 · v1
+                - generic [ref=e237]:
+                  - generic [ref=e238]: lightgbm
+                  - generic [ref=e239]: 个股选股
+                  - generic [ref=e240]: RankIC 0.0535
+            - button "加入模型比较 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 4/4 候选 csi500_lgbm_cross_category_chunked_20260815 · v4 lightgbm 个股选股 RankIC 0.0507" [ref=e241] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e242]:
+                - generic [ref=e243]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e245]:
+                - generic [ref=e246]:
+                  - strong [ref=e247]: 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 4/4
+                  - generic [ref=e248]: 候选
+                - code [ref=e250]: csi500_lgbm_cross_category_chunked_20260815 · v4
+                - generic [ref=e251]:
+                  - generic [ref=e252]: lightgbm
+                  - generic [ref=e253]: 个股选股
+                  - generic [ref=e254]: RankIC 0.0507
+            - button "加入模型比较 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 3/4 候选 csi500_lgbm_cross_category_chunked_20260815 · v3 lightgbm 个股选股 RankIC 0.0532" [ref=e255] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e256]:
+                - generic [ref=e257]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e259]:
+                - generic [ref=e260]:
+                  - strong [ref=e261]: 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 3/4
+                  - generic [ref=e262]: 候选
+                - code [ref=e264]: csi500_lgbm_cross_category_chunked_20260815 · v3
+                - generic [ref=e265]:
+                  - generic [ref=e266]: lightgbm
+                  - generic [ref=e267]: 个股选股
+                  - generic [ref=e268]: RankIC 0.0532
+            - button "加入模型比较 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 2/4 候选 csi500_lgbm_cross_category_chunked_20260815 · v2 lightgbm 个股选股 RankIC 0.0515" [ref=e269] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e270]:
+                - generic [ref=e271]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e273]:
+                - generic [ref=e274]:
+                  - strong [ref=e275]: 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 2/4
+                  - generic [ref=e276]: 候选
+                - code [ref=e278]: csi500_lgbm_cross_category_chunked_20260815 · v2
+                - generic [ref=e279]:
+                  - generic [ref=e280]: lightgbm
+                  - generic [ref=e281]: 个股选股
+                  - generic [ref=e282]: RankIC 0.0515
+            - button "加入模型比较 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 1/4 已验证 csi500_lgbm_cross_category_chunked_20260815 · v1 lightgbm 个股选股 RankIC 0.0516" [ref=e283] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e284]:
+                - generic [ref=e285]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e287]:
+                - generic [ref=e288]:
+                  - strong [ref=e289]: 中证500 多类别因子 LightGBM 验证集选优（分块物化） · 1/4
+                  - generic [ref=e290]: 已验证
+                - code [ref=e292]: csi500_lgbm_cross_category_chunked_20260815 · v1
+                - generic [ref=e293]:
+                  - generic [ref=e294]: lightgbm
+                  - generic [ref=e295]: 个股选股
+                  - generic [ref=e296]: RankIC 0.0516
+            - button "加入模型比较 中证500 XGBoost 完整冻结参数生产候选 候选 csi500_xgboost_frozen_params_20260815 · v1 xgboost 个股选股 RankIC 0.0920" [ref=e297] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e298]:
+                - generic [ref=e299]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e301]:
+                - generic [ref=e302]:
+                  - strong [ref=e303]: 中证500 XGBoost 完整冻结参数生产候选
+                  - generic [ref=e304]: 候选
+                - code [ref=e306]: csi500_xgboost_frozen_params_20260815 · v1
+                - generic [ref=e307]:
+                  - generic [ref=e308]: xgboost
+                  - generic [ref=e309]: 个股选股
+                  - generic [ref=e310]: RankIC 0.0920
+            - button "加入模型比较 中证500 T+1/T+5 多周期验证ICIR融合 候选 stock_selection_lgbm_horizon_fusion_20260815 · v1 ensemble 个股选股 RankIC -0.0039" [ref=e311] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e312]:
+                - generic [ref=e313]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e315]:
+                - generic [ref=e316]:
+                  - strong [ref=e317]: 中证500 T+1/T+5 多周期验证ICIR融合
+                  - generic [ref=e318]: 候选
+                - code [ref=e320]: stock_selection_lgbm_horizon_fusion_20260815 · v1
+                - generic [ref=e321]:
+                  - generic [ref=e322]: ensemble
+                  - generic [ref=e323]: 个股选股
+                  - generic [ref=e324]: RankIC -0.0039
+            - button "加入模型比较 中证500 T+1/T+5 多周期冒烟 · T+5 候选 stock_selection_lgbm_horizon_smoke_20260815 · v2 lightgbm 个股选股 RankIC -0.0025" [ref=e325] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e326]:
+                - generic [ref=e327]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e329]:
+                - generic [ref=e330]:
+                  - strong [ref=e331]: 中证500 T+1/T+5 多周期冒烟 · T+5
+                  - generic [ref=e332]: 候选
+                - code [ref=e334]: stock_selection_lgbm_horizon_smoke_20260815 · v2
+                - generic [ref=e335]:
+                  - generic [ref=e336]: lightgbm
+                  - generic [ref=e337]: 个股选股
+                  - generic [ref=e338]: RankIC -0.0025
+            - button "加入模型比较 中证500 T+1/T+5 多周期冒烟 · T+1 候选 stock_selection_lgbm_horizon_smoke_20260815 · v1 lightgbm 个股选股 RankIC 0.0105" [ref=e339] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e340]:
+                - generic [ref=e341]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e343]:
+                - generic [ref=e344]:
+                  - strong [ref=e345]: 中证500 T+1/T+5 多周期冒烟 · T+1
+                  - generic [ref=e346]: 候选
+                - code [ref=e348]: stock_selection_lgbm_horizon_smoke_20260815 · v1
+                - generic [ref=e349]:
+                  - generic [ref=e350]: lightgbm
+                  - generic [ref=e351]: 个股选股
+                  - generic [ref=e352]: RankIC 0.0105
+            - button "加入模型比较 个股选股 LightGBM 多类别因子去冗余复核 候选 stock_selection_lgbm_factor_audit_20260815 · v2 lightgbm 个股选股 RankIC 0.0450" [ref=e353] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e354]:
+                - generic [ref=e355]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e357]:
+                - generic [ref=e358]:
+                  - strong [ref=e359]: 个股选股 LightGBM 多类别因子去冗余复核
+                  - generic [ref=e360]: 候选
+                - code [ref=e362]: stock_selection_lgbm_factor_audit_20260815 · v2
+                - generic [ref=e363]:
+                  - generic [ref=e364]: lightgbm
+                  - generic [ref=e365]: 个股选股
+                  - generic [ref=e366]: RankIC 0.0450
+            - button "加入模型比较 个股选股 LightGBM 多类别因子审计基线 候选 stock_selection_lgbm_factor_audit_20260815 · v1 lightgbm 个股选股 RankIC 0.0440" [ref=e367] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e368]:
+                - generic [ref=e369]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e371]:
+                - generic [ref=e372]:
+                  - strong [ref=e373]: 个股选股 LightGBM 多类别因子审计基线
+                  - generic [ref=e374]: 候选
+                - code [ref=e376]: stock_selection_lgbm_factor_audit_20260815 · v1
+                - generic [ref=e377]:
+                  - generic [ref=e378]: lightgbm
+                  - generic [ref=e379]: 个股选股
+                  - generic [ref=e380]: RankIC 0.0440
+            - button "加入模型比较 个股选股 LightGBM 对齐WFA三窗口 候选 stock_selection_lgbm_wfa_aligned_20260815 · v1 lightgbm 个股选股 RankIC 0.0373" [ref=e381] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e382]:
+                - generic [ref=e383]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e385]:
+                - generic [ref=e386]:
+                  - strong [ref=e387]: 个股选股 LightGBM 对齐WFA三窗口
+                  - generic [ref=e388]: 候选
+                - code [ref=e390]: stock_selection_lgbm_wfa_aligned_20260815 · v1
+                - generic [ref=e391]:
+                  - generic [ref=e392]: lightgbm
+                  - generic [ref=e393]: 个股选股
+                  - generic [ref=e394]: RankIC 0.0373
+            - button "加入模型比较 申万一级行业轮动 LightGBM 对齐WFA三窗口 候选 industry_rotation_lgbm_wfa_aligned_20260815 · v1 lightgbm 行业轮动 RankIC 0.0450" [ref=e395] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e396]:
+                - generic [ref=e397]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e399]:
+                - generic [ref=e400]:
+                  - strong [ref=e401]: 申万一级行业轮动 LightGBM 对齐WFA三窗口
+                  - generic [ref=e402]: 候选
+                - code [ref=e404]: industry_rotation_lgbm_wfa_aligned_20260815 · v1
+                - generic [ref=e405]:
+                  - generic [ref=e406]: lightgbm
+                  - generic [ref=e407]: 行业轮动
+                  - generic [ref=e408]: RankIC 0.0450
+            - button "加入模型比较 大小盘风格 LightGBM 对齐WFA三窗口 候选 market_style_lgbm_wfa_aligned_20260815 · v1 lightgbm 大小盘风格 RankIC -0.0826" [ref=e409] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e410]:
+                - generic [ref=e411]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e413]:
+                - generic [ref=e414]:
+                  - strong [ref=e415]: 大小盘风格 LightGBM 对齐WFA三窗口
+                  - generic [ref=e416]: 候选
+                - code [ref=e418]: market_style_lgbm_wfa_aligned_20260815 · v1
+                - generic [ref=e419]:
+                  - generic [ref=e420]: lightgbm
+                  - generic [ref=e421]: 大小盘风格
+                  - generic [ref=e422]: RankIC -0.0826
+            - button "加入模型比较 申万一级行业轮动 LightGBM 真实验收 候选 industry_rotation_lgbm_sw2021_acceptance · v1 lightgbm 行业轮动 RankIC 0.0958" [ref=e423] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e424]:
+                - generic [ref=e425]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e427]:
+                - generic [ref=e428]:
+                  - strong [ref=e429]: 申万一级行业轮动 LightGBM 真实验收
+                  - generic [ref=e430]: 候选
+                - code [ref=e432]: industry_rotation_lgbm_sw2021_acceptance · v1
+                - generic [ref=e433]:
+                  - generic [ref=e434]: lightgbm
+                  - generic [ref=e435]: 行业轮动
+                  - generic [ref=e436]: RankIC 0.0958
+            - button "加入模型比较 大小盘风格 LightGBM 真实验收 候选 market_style_lgbm_pit_acceptance · v1 lightgbm 大小盘风格 RankIC -0.0909" [ref=e437] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e438]:
+                - generic [ref=e439]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e441]:
+                - generic [ref=e442]:
+                  - strong [ref=e443]: 大小盘风格 LightGBM 真实验收
+                  - generic [ref=e444]: 候选
+                - code [ref=e446]: market_style_lgbm_pit_acceptance · v1
+                - generic [ref=e447]:
+                  - generic [ref=e448]: lightgbm
+                  - generic [ref=e449]: 大小盘风格
+                  - generic [ref=e450]: RankIC -0.0909
+            - button "加入模型比较 Transformer+LSTM WFA三窗口轻量验收 候选 transformer_lstm_wfa_20260815 · v1 transformer_lstm 个股选股 RankIC 0.0569" [ref=e451] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e452]:
+                - generic [ref=e453]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e455]:
+                - generic [ref=e456]:
+                  - strong [ref=e457]: Transformer+LSTM WFA三窗口轻量验收
+                  - generic [ref=e458]: 候选
+                - code [ref=e460]: transformer_lstm_wfa_20260815 · v1
+                - generic [ref=e461]:
+                  - generic [ref=e462]: transformer_lstm
+                  - generic [ref=e463]: 个股选股
+                  - generic [ref=e464]: RankIC 0.0569
+            - button "加入模型比较 LightGBM + Transformer-LSTM 融合验收（含独立IC） 候选 lgbm_transformer_ensemble_smoke_20260815 · v2 ensemble 个股选股 RankIC 0.0542" [ref=e465] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e466]:
+                - generic [ref=e467]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e469]:
+                - generic [ref=e470]:
+                  - strong [ref=e471]: LightGBM + Transformer-LSTM 融合验收（含独立IC）
+                  - generic [ref=e472]: 候选
+                - code [ref=e474]: lgbm_transformer_ensemble_smoke_20260815 · v2
+                - generic [ref=e475]:
+                  - generic [ref=e476]: ensemble
+                  - generic [ref=e477]: 个股选股
+                  - generic [ref=e478]: RankIC 0.0542
+            - button "加入模型比较 LightGBM + Transformer-LSTM 融合验收 候选 lgbm_transformer_ensemble_smoke_20260815 · v1 ensemble 个股选股 RankIC --" [ref=e479] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e480]:
+                - generic [ref=e481]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e483]:
+                - generic [ref=e484]:
+                  - strong [ref=e485]: LightGBM + Transformer-LSTM 融合验收
+                  - generic [ref=e486]: 候选
+                - code [ref=e488]: lgbm_transformer_ensemble_smoke_20260815 · v1
+                - generic [ref=e489]:
+                  - generic [ref=e490]: ensemble
+                  - generic [ref=e491]: 个股选股
+                  - generic [ref=e492]: RankIC --
+            - button "加入模型比较 WFA三窗口稳定性冒烟 候选 wfa_stability_smoke_20260815 · v1 lightgbm 个股选股 RankIC 0.0415" [ref=e493] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e494]:
+                - generic [ref=e495]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e497]:
+                - generic [ref=e498]:
+                  - strong [ref=e499]: WFA三窗口稳定性冒烟
+                  - generic [ref=e500]: 候选
+                - code [ref=e502]: wfa_stability_smoke_20260815 · v1
+                - generic [ref=e503]:
+                  - generic [ref=e504]: lightgbm
+                  - generic [ref=e505]: 个股选股
+                  - generic [ref=e506]: RankIC 0.0415
+            - button "加入模型比较 LightGBM两组参数真实验收 · 2/2 候选 lgbm_grid_smoke_20260814 · v2 lightgbm 个股选股 RankIC 0.0666" [ref=e507] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e508]:
+                - generic [ref=e509]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e511]:
+                - generic [ref=e512]:
+                  - strong [ref=e513]: LightGBM两组参数真实验收 · 2/2
+                  - generic [ref=e514]: 候选
+                - code [ref=e516]: lgbm_grid_smoke_20260814 · v2
+                - generic [ref=e517]:
+                  - generic [ref=e518]: lightgbm
+                  - generic [ref=e519]: 个股选股
+                  - generic [ref=e520]: RankIC 0.0666
+            - button "加入模型比较 LightGBM两组参数真实验收 · 1/2 候选 lgbm_grid_smoke_20260814 · v1 lightgbm 个股选股 RankIC 0.0309" [ref=e521] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e522]:
+                - generic [ref=e523]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e525]:
+                - generic [ref=e526]:
+                  - strong [ref=e527]: LightGBM两组参数真实验收 · 1/2
+                  - generic [ref=e528]: 候选
+                - code [ref=e530]: lgbm_grid_smoke_20260814 · v1
+                - generic [ref=e531]:
+                  - generic [ref=e532]: lightgbm
+                  - generic [ref=e533]: 个股选股
+                  - generic [ref=e534]: RankIC 0.0309
+            - button "加入模型比较 Transformer LSTM 真实数据冒烟 候选 transformer_lstm_smoke_20260814 · v1 transformer_lstm 个股选股 RankIC 0.0401" [ref=e535] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e536]:
+                - generic [ref=e537]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e539]:
+                - generic [ref=e540]:
+                  - strong [ref=e541]: Transformer LSTM 真实数据冒烟
+                  - generic [ref=e542]: 候选
+                - code [ref=e544]: transformer_lstm_smoke_20260814 · v1
+                - generic [ref=e545]:
+                  - generic [ref=e546]: transformer_lstm
+                  - generic [ref=e547]: 个股选股
+                  - generic [ref=e548]: RankIC 0.0401
+            - button "加入模型比较 Phase2 mlp 隔离进程最终验收 候选 csi500_mlp_phase2_20260814 · v1 mlp 个股选股 RankIC 0.0718" [ref=e549] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e550]:
+                - generic [ref=e551]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e553]:
+                - generic [ref=e554]:
+                  - strong [ref=e555]: Phase2 mlp 隔离进程最终验收
+                  - generic [ref=e556]: 候选
+                - code [ref=e558]: csi500_mlp_phase2_20260814 · v1
+                - generic [ref=e559]:
+                  - generic [ref=e560]: mlp
+                  - generic [ref=e561]: 个股选股
+                  - generic [ref=e562]: RankIC 0.0718
+            - button "加入模型比较 Phase2 catboost 真实验收 候选 csi500_catboost_phase2_20260814 · v1 catboost 个股选股 RankIC 0.1007" [ref=e563] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e564]:
+                - generic [ref=e565]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e567]:
+                - generic [ref=e568]:
+                  - strong [ref=e569]: Phase2 catboost 真实验收
+                  - generic [ref=e570]: 候选
+                - code [ref=e572]: csi500_catboost_phase2_20260814 · v1
+                - generic [ref=e573]:
+                  - generic [ref=e574]: catboost
+                  - generic [ref=e575]: 个股选股
+                  - generic [ref=e576]: RankIC 0.1007
+            - button "加入模型比较 Phase2 xgboost 真实验收 候选 csi500_xgboost_phase2_20260814 · v1 xgboost 个股选股 RankIC 0.0882" [ref=e577] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e578]:
+                - generic [ref=e579]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e581]:
+                - generic [ref=e582]:
+                  - strong [ref=e583]: Phase2 xgboost 真实验收
+                  - generic [ref=e584]: 候选
+                - code [ref=e586]: csi500_xgboost_phase2_20260814 · v1
+                - generic [ref=e587]:
+                  - generic [ref=e588]: xgboost
+                  - generic [ref=e589]: 个股选股
+                  - generic [ref=e590]: RankIC 0.0882
+            - button "加入模型比较 本机Worker API中断恢复验收 候选 csi500_lgbm_api_outage_audit_20260813 · v1 lightgbm 个股选股 RankIC 0.0184" [ref=e591] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e592]:
+                - generic [ref=e593]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e595]:
+                - generic [ref=e596]:
+                  - strong [ref=e597]: 本机Worker API中断恢复验收
+                  - generic [ref=e598]: 候选
+                - code [ref=e600]: csi500_lgbm_api_outage_audit_20260813 · v1
+                - generic [ref=e601]:
+                  - generic [ref=e602]: lightgbm
+                  - generic [ref=e603]: 个股选股
+                  - generic [ref=e604]: RankIC 0.0184
+            - button "加入模型比较 本机Worker PM2重启恢复验收 候选 csi500_lgbm_restart_audit_20260813 · v1 lightgbm 个股选股 RankIC 0.0184" [ref=e605] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e606]:
+                - generic [ref=e607]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e609]:
+                - generic [ref=e610]:
+                  - strong [ref=e611]: 本机Worker PM2重启恢复验收
+                  - generic [ref=e612]: 候选
+                - code [ref=e614]: csi500_lgbm_restart_audit_20260813 · v1
+                - generic [ref=e615]:
+                  - generic [ref=e616]: lightgbm
+                  - generic [ref=e617]: 个股选股
+                  - generic [ref=e618]: RankIC 0.0184
+            - button "加入模型比较 本机Worker 0.4.0三因子闭环验收 候选 csi500_lgbm_local_20260813 · v1 lightgbm 个股选股 RankIC 0.0188" [ref=e619] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e620]:
+                - generic [ref=e621]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e623]:
+                - generic [ref=e624]:
+                  - strong [ref=e625]: 本机Worker 0.4.0三因子闭环验收
+                  - generic [ref=e626]: 候选
+                - code [ref=e628]: csi500_lgbm_local_20260813 · v1
+                - generic [ref=e629]:
+                  - generic [ref=e630]: lightgbm
+                  - generic [ref=e631]: 个股选股
+                  - generic [ref=e632]: RankIC 0.0188
+            - button "加入模型比较 中证500三因子LightGBM首轮正式训练 候选 csi500_lgbm_3factor_20260813 · v1 lightgbm 个股选股 RankIC 0.0188" [ref=e633] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e634]:
+                - generic [ref=e635]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e637]:
+                - generic [ref=e638]:
+                  - strong [ref=e639]: 中证500三因子LightGBM首轮正式训练
+                  - generic [ref=e640]: 候选
+                - code [ref=e642]: csi500_lgbm_3factor_20260813 · v1
+                - generic [ref=e643]:
+                  - generic [ref=e644]: lightgbm
+                  - generic [ref=e645]: 个股选股
+                  - generic [ref=e646]: RankIC 0.0188
+            - button "加入模型比较 中证500三因子Qlib真实冒烟 候选 smoke_csi500_lgbm_20260813 · v2 lightgbm 个股选股 RankIC 0.0247" [ref=e647] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e648]:
+                - generic [ref=e649]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e651]:
+                - generic [ref=e652]:
+                  - strong [ref=e653]: 中证500三因子Qlib真实冒烟
+                  - generic [ref=e654]: 候选
+                - code [ref=e656]: smoke_csi500_lgbm_20260813 · v2
+                - generic [ref=e657]:
+                  - generic [ref=e658]: lightgbm
+                  - generic [ref=e659]: 个股选股
+                  - generic [ref=e660]: RankIC 0.0247
+            - button "加入模型比较 中证500三因子Qlib真实冒烟 候选 smoke_csi500_lgbm_20260813 · v1 lightgbm 个股选股 RankIC 0.0247" [ref=e661] [cursor=pointer]:
+              - generic "加入模型比较" [ref=e662]:
+                - generic [ref=e663]:
+                  - checkbox "加入模型比较"
+              - generic [ref=e665]:
+                - generic [ref=e666]:
+                  - strong [ref=e667]: 中证500三因子Qlib真实冒烟
+                  - generic [ref=e668]: 候选
+                - code [ref=e670]: smoke_csi500_lgbm_20260813 · v1
+                - generic [ref=e671]:
+                  - generic [ref=e672]: lightgbm
+                  - generic [ref=e673]: 个股选股
+                  - generic [ref=e674]: RankIC 0.0247
+          - generic [ref=e86]:
+            - generic [ref=e87]: 已选 0 个模型
+            - generic [ref=e88]:
+              - button "比较" [disabled] [ref=e89]
+              - button "融合" [disabled] [ref=e91]
+        - main [ref=e93]:
+          - generic [ref=e675]:
+            - generic [ref=e676]:
+              - generic [ref=e677]:
+                - generic [ref=e678]: 候选
+                - generic [ref=e680]: lightgbm
+                - generic [ref=e682]: 个股选股
+              - heading "中证500 多类别因子消融 · Price3M / btop · 3/3 · btop" [level=2] [ref=e684]
+              - paragraph [ref=e685]: csi500_lgbm_factor_ablation_20260815 · v3 · 2018-01-02 至 2025-12-31
+            - generic [ref=e686]:
+              - button "完整详情" [ref=e687] [cursor=pointer]
+              - button "研究报告" [ref=e689] [cursor=pointer]
+              - button "归档" [ref=e691] [cursor=pointer]
+          - generic [ref=e693]:
+            - tablist [ref=e697]:
+              - tab "模型详情" [ref=e699]
+              - tab "训练溯源" [active] [selected] [ref=e700] [cursor=pointer]
+              - tab "归因分析" [ref=e701]
+              - tab "生产监控" [ref=e702]
+              - tab "推理中心" [ref=e703]
+              - tab "推理回测" [ref=e704]
+              - tab "选股" [ref=e705]
+              - tab "负分参考" [ref=e706]
+              - tab "推理研究" [ref=e707]
+              - tab "模型分数研究" [ref=e708]
+            - tabpanel "训练溯源" [ref=e766]:
+              - generic [ref=e767]:
+                - generic [ref=e768]:
+                  - generic [ref=e769]: 训练任务 ID
+                  - strong [ref=e770]:
+                    - code [ref=e771]: model_job_bc094f9be3214fe7921e58da8566d232
+                - generic [ref=e772]:
+                  - generic [ref=e773]: 任务状态
+                  - strong [ref=e774]:
+                    - generic [ref=e775]: 成功
+                - generic [ref=e777]:
+                  - generic [ref=e778]: 训练算法
+                  - strong [ref=e779]: lightgbm
+                - generic [ref=e780]:
+                  - generic [ref=e781]: 请求时间
+                  - strong [ref=e782]: 2026-08-15 12:48:42
+              - generic [ref=e783]:
+                - generic [ref=e784]:
+                  - generic [ref=e789]: Training Execution Logs
+                  - generic [ref=e790]: 5 条事件
+                - generic [ref=e791]:
+                  - generic [ref=e792]:
+                    - generic [ref=e793]: "1"
+                    - generic [ref=e794]: 12:48:42
+                    - generic [ref=e795]: job.queued
+                    - generic [ref=e796]: queued
+                    - code [ref=e797]: "{\"trial_count\":3,\"trial_index\":3,\"dataset_hash\":\"6cbc87167ff022048b41fbb21c4f9c161b54ec96f2dc46cdf9e3f95ff7acfbc1\",\"experiment_id\":\"model_experiment_5f1ad81b91384dbc80405280477dc62a\"}"
+                  - generic [ref=e798]:
+                    - generic [ref=e799]: "2"
+                    - generic [ref=e800]: 12:52:51
+                    - generic [ref=e801]: job.leased
+                    - generic [ref=e802]: leased
+                    - code [ref=e803]: "{\"dispatch_mode\":\"experiment_queue\",\"lease_expires_at\":\"2026-08-15T04:54:21.535561+00:00\"}"
+                  - generic [ref=e804]:
+                    - generic [ref=e805]: "3"
+                    - generic [ref=e806]: 12:52:51
+                    - generic [ref=e807]: job.running
+                    - generic [ref=e808]: running
+                    - code [ref=e809]: "{\"stage\":\"accepted\",\"percent\":1}"
+                  - generic [ref=e810]:
+                    - generic [ref=e811]: "4"
+                    - generic [ref=e812]: 12:56:35
+                    - generic [ref=e813]: job.uploading
+                    - generic [ref=e814]: uploading
+                    - code [ref=e815]: "{\"stage\":\"uploading\",\"percent\":90,\"artifact_count\":7}"
+                  - generic [ref=e816]:
+                    - generic [ref=e817]: "5"
+                    - generic [ref=e818]: 12:56:46
+                    - generic [ref=e819]: job.succeeded
+                    - generic [ref=e820]: succeeded
+                    - code [ref=e821]: "{\"model_id\":\"csi500_lgbm_factor_ablation_20260815\",\"model_version\":3}"
+              - generic [ref=e822]:
+                - generic [ref=e823]:
+                  - generic [ref=e824]: 训练段
+                  - strong [ref=e825]: 2018-01-02 至 2022-10-14
+                - generic [ref=e826]:
+                  - generic [ref=e827]: 验证段
+                  - strong [ref=e828]: 2022-10-24 至 2024-05-22
+                - generic [ref=e829]:
+                  - generic [ref=e830]: 测试段
+                  - strong [ref=e831]: 2024-05-30 至 2025-12-31
+              - generic [ref=e833]:
+                - table [ref=e835]:
+                  - rowgroup [ref=e841]:
+                    - row [ref=e842]:
+                      - columnheader "因子" [ref=e843]
+                      - columnheader "版本" [ref=e845]
+                      - columnheader "分类" [ref=e847]
+                      - columnheader "Params Hash" [ref=e849]
+                - table [ref=e855]:
+                  - rowgroup [ref=e861]:
+                    - row [ref=e862]:
+                      - cell "当前股价除以过去一个月股价均值再减1 Price1M" [ref=e863]:
+                        - generic [ref=e864]:
+                          - strong [ref=e865]: 当前股价除以过去一个月股价均值再减1
+                          - generic [ref=e866]: Price1M
+                      - cell [ref=e867]
+                      - cell "动量类因子" [ref=e868]
+                      - cell [ref=e870]:
+                        - code [ref=e872]: 1f1305a4e279a14c
+                    - row [ref=e873]:
+                      - cell "当前股价除以过去三个月股价均值再减1 Price3M" [ref=e874]:
+                        - generic [ref=e875]:
+                          - strong [ref=e876]: 当前股价除以过去三个月股价均值再减1
+                          - generic [ref=e877]: Price3M
+                      - cell [ref=e878]
+                      - cell "动量类因子" [ref=e879]
+                      - cell [ref=e881]:
+                        - code [ref=e883]: f409110af06de03b
+                    - row [ref=e884]:
+                      - cell "20日平均换手率与120日平均换手率之比 DAVOL20" [ref=e885]:
+                        - generic [ref=e886]:
+                          - strong [ref=e887]: 20日平均换手率与120日平均换手率之比
+                          - generic [ref=e888]: DAVOL20
+                      - cell [ref=e889]
+                      - cell "情绪类因子" [ref=e890]
+                      - cell [ref=e892]:
+                        - code [ref=e894]: 96250622f6e9ab26
+                    - row [ref=e895]:
+                      - cell "14日均幅指标 ATR14" [ref=e896]:
+                        - generic [ref=e897]:
+                          - strong [ref=e898]: 14日均幅指标
+                          - generic [ref=e899]: ATR14
+                      - cell [ref=e900]
+                      - cell "情绪类因子" [ref=e901]
+                      - cell [ref=e903]:
+                        - code [ref=e905]: 9ac4980034cbab1e
+                    - row [ref=e906]:
+                      - cell "20日收益方差 Variance20" [ref=e907]:
+                        - generic [ref=e908]:
+                          - strong [ref=e909]: 20日收益方差
+                          - generic [ref=e910]: Variance20
+                      - cell [ref=e911]
+                      - cell "风险类因子" [ref=e912]
+                      - cell [ref=e914]:
+                        - code [ref=e916]: f31b594206a7436a
+                    - row [ref=e917]:
+                      - cell "20日夏普比率 sharpe_ratio_20" [ref=e918]:
+                        - generic [ref=e919]:
+                          - strong [ref=e920]: 20日夏普比率
+                          - generic [ref=e921]: sharpe_ratio_20
+                      - cell [ref=e922]
+                      - cell "风险类因子" [ref=e923]
+                      - cell [ref=e925]:
+                        - code [ref=e927]: a5338d7549cda188
+                    - row [ref=e928]:
+                      - cell "利润市值比 earnings_to_price_ratio" [ref=e929]:
+                        - generic [ref=e930]:
+                          - strong [ref=e931]: 利润市值比
+                          - generic [ref=e932]: earnings_to_price_ratio
+                      - cell [ref=e933]
+                      - cell "风险因子 - 风格因子" [ref=e934]
+                      - cell [ref=e936]:
+                        - code [ref=e938]: cb07098f6354b843
+                    - row [ref=e939]:
+                      - cell "个股恐慌度 stock_fear_proxy" [ref=e940]:
+                        - generic [ref=e941]:
+                          - strong [ref=e942]: 个股恐慌度
+                          - generic [ref=e943]: stock_fear_proxy
+                      - cell [ref=e944]
+                      - cell "风险情绪因子" [ref=e945]
+                      - cell [ref=e947]:
+                        - code [ref=e949]: ec6beb8947ab5692
+                    - row [ref=e950]:
+                      - cell "N日涨跌幅 period_return" [ref=e951]:
+                        - generic [ref=e952]:
+                          - strong [ref=e953]: N日涨跌幅
+                          - generic [ref=e954]: period_return
+                      - cell [ref=e955]
+                      - cell "量价因子" [ref=e956]
+                      - cell [ref=e958]:
+                        - code [ref=e960]: cf5994b758d69a32
+              - generic [ref=e961]:
+                - button "查看训练任务与事件日志" [ref=e962] [cursor=pointer]
+                - button "复用训练配置" [ref=e964] [cursor=pointer]
+  - generic [ref=e752]:
+    - button "Toggle Nuxt DevTools" [ref=e753] [cursor=pointer]
+    - generic "Page load time" [ref=e757]:
+      - generic [ref=e758]: "166"
+      - generic [ref=e759]: ms
+    - button "Toggle Component Inspector" [ref=e761] [cursor=pointer]

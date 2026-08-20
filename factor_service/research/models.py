@@ -184,6 +184,7 @@ class QlibTorchLSTMModel:
         self.weight_decay = float(weight_decay)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
+        self.model_name = "LSTM"
         if self.lookback_window < 2:
             raise ValueError("lookback_window必须至少为2")
         torch.manual_seed(self.seed)
@@ -458,6 +459,495 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
         return projection.weight.detach().abs().mean(dim=0).cpu().numpy().tolist()
 
 
+_SEQUENCE_BASE_PARAMS = frozenset({
+    "input_dim", "lookback_window", "hidden_size", "num_layers", "dropout",
+    "learning_rate", "max_steps", "batch_size", "early_stopping_rounds",
+    "eval_steps", "weight_decay", "seed", "num_threads",
+})
+
+
+def _sequence_base_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in kwargs.items()
+        if key in _SEQUENCE_BASE_PARAMS
+    }
+
+
+class QlibTorchGRUModel(QlibTorchLSTMModel):
+    """门控循环单元，训练循环与LSTM完全一致，编码器替换为GRU。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        import torch
+        from torch import nn
+
+        super().__init__(**_sequence_base_kwargs(kwargs))
+        self.model_name = "GRU"
+        torch.manual_seed(self.seed)
+        self.encoder = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+            batch_first=True,
+        ).to(self.device)
+        self.head = nn.Linear(self.hidden_size, 1).to(self.device)
+        self.fitted = False
+
+
+class QlibTorchALSTMModel(QlibTorchLSTMModel):
+    """带加性注意力的LSTM：注意力在隐藏状态序列上加权得到上下文向量。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        import torch
+        from torch import nn
+
+        super().__init__(**_sequence_base_kwargs(kwargs))
+        self.model_name = "ALSTM"
+        torch.manual_seed(self.seed)
+        self.encoder = nn.ModuleDict({
+            "lstm": nn.LSTM(
+                input_size=self.input_dim,
+                hidden_size=self.hidden_size,
+                num_layers=self.num_layers,
+                dropout=self.dropout if self.num_layers > 1 else 0.0,
+                batch_first=True,
+            ),
+            "attn_proj": nn.Linear(self.hidden_size, self.hidden_size),
+            "attn_last": nn.Linear(self.hidden_size, self.hidden_size),
+            "attn_v": nn.Linear(self.hidden_size, 1),
+        }).to(self.device)
+        self.head = nn.Linear(self.hidden_size, 1).to(self.device)
+        self.fitted = False
+
+    def _forward(self, features: Any) -> Any:
+        import torch
+
+        encoded, _ = self.encoder["lstm"](features)
+        last = encoded[:, -1:, :]
+        scores = self.encoder["attn_v"](torch.tanh(
+            self.encoder["attn_proj"](encoded) + self.encoder["attn_last"](last),
+        ))
+        attention = torch.softmax(scores, dim=1)
+        context = (attention * encoded).sum(dim=1)
+        return self.head(context).reshape(-1)
+
+    def get_feature_importance(self) -> list[float]:
+        weights = self.encoder["lstm"].weight_ih_l0.detach().abs().mean(dim=0)
+        return weights.cpu().numpy().tolist()
+
+
+class QlibTorchTransformerModel(QlibTorchLSTMModel):
+    """因果Transformer编码器，输出最后一个时间步。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        import torch
+        from torch import nn
+
+        d_model = int(kwargs.get("d_model", 64))
+        nhead = int(kwargs.get("nhead", 4))
+        if d_model % nhead != 0:
+            raise ValueError("d_model必须能被nhead整除")
+        transformer_layers = int(kwargs.get("transformer_layers", 2))
+        dim_feedforward = int(kwargs.get("dim_feedforward", 256))
+        dropout = float(kwargs.get("dropout", 0.2))
+        base_kwargs = _sequence_base_kwargs(kwargs)
+        base_kwargs.update({
+            "hidden_size": d_model,
+            "num_layers": 1,
+            "dropout": dropout,
+        })
+        super().__init__(**base_kwargs)
+        self.model_name = "Transformer"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.transformer_layers = transformer_layers
+        self.dim_feedforward = dim_feedforward
+        torch.manual_seed(self.seed)
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.encoder = nn.ModuleDict({
+            "input_projection": nn.Linear(self.input_dim, self.d_model),
+            "position_embedding": nn.Embedding(self.lookback_window, self.d_model),
+            "transformer": nn.TransformerEncoder(
+                layer, num_layers=self.transformer_layers,
+            ),
+        }).to(self.device)
+        self.head = nn.Linear(self.d_model, 1).to(self.device)
+        self.fitted = False
+
+    def _forward(self, features: Any) -> Any:
+        import torch
+
+        steps = int(features.shape[1])
+        if steps > self.lookback_window:
+            raise ValueError("输入序列长度超过lookback_window")
+        positions = torch.arange(steps, device=features.device)
+        encoded = self.encoder["input_projection"](features)
+        encoded = encoded + self.encoder["position_embedding"](positions).unsqueeze(0)
+        causal_mask = torch.triu(
+            torch.full((steps, steps), float("-inf"), device=features.device),
+            diagonal=1,
+        )
+        encoded = self.encoder["transformer"](encoded, mask=causal_mask)
+        return self.head(encoded[:, -1, :]).reshape(-1)
+
+    def get_feature_importance(self) -> list[float]:
+        projection = self.encoder["input_projection"]
+        return projection.weight.detach().abs().mean(dim=0).cpu().numpy().tolist()
+
+
+try:
+    import torch as _torch
+except ImportError:  # pragma: no cover - torch缺失时仅树/线性模型可用
+    _torch = None
+
+
+if _torch is not None:
+    class _CausalConv1d(_torch.nn.Module):
+        """因果膨胀卷积：右侧输出裁剪保证t时刻只使用<=t的输入。"""
+
+        def __init__(
+            self, in_channels: int, out_channels: int,
+            kernel_size: int, dilation: int,
+        ) -> None:
+            super().__init__()
+            self.conv = _torch.nn.Conv1d(
+                in_channels, out_channels, kernel_size,
+                dilation=dilation,
+                padding=(kernel_size - 1) * dilation,
+            )
+
+        def forward(self, x: Any) -> Any:
+            length = int(x.shape[-1])
+            return self.conv(x)[:, :, :length]
+
+
+    class _TCNResidualBlock(_torch.nn.Module):
+        def __init__(
+            self, channels: int, kernel_size: int,
+            dilation: int, dropout: float,
+        ) -> None:
+            super().__init__()
+            self.conv1 = _CausalConv1d(channels, channels, kernel_size, dilation)
+            self.conv2 = _CausalConv1d(channels, channels, kernel_size, dilation)
+            self.activation = _torch.nn.ReLU()
+            self.dropout = _torch.nn.Dropout(dropout)
+
+        def forward(self, x: Any) -> Any:
+            out = self.dropout(self.activation(self.conv1(x)))
+            out = self.dropout(self.activation(self.conv2(out)))
+            return x + out
+
+
+class QlibTorchTCNModel(QlibTorchLSTMModel):
+    """时间卷积网络：膨胀因果卷积 + 残差连接，输出最后一个时间步。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        import torch
+        from torch import nn
+
+        kernel_size = int(kwargs.get("kernel_size", 5))
+        num_layers = int(kwargs.get("num_layers", 5))
+        dropout = float(kwargs.get("dropout", 0.5))
+        base_kwargs = _sequence_base_kwargs(kwargs)
+        base_kwargs.update({
+            "num_layers": 1,
+            "dropout": dropout,
+        })
+        super().__init__(**base_kwargs)
+        self.model_name = "TCN"
+        self.kernel_size = kernel_size
+        self.tcn_layers = num_layers
+        torch.manual_seed(self.seed)
+        self.encoder = nn.ModuleDict({
+            "stem": nn.Conv1d(self.input_dim, self.hidden_size, kernel_size=1),
+            "blocks": nn.ModuleList([
+                _TCNResidualBlock(
+                    self.hidden_size, self.kernel_size,
+                    dilation=2 ** index, dropout=self.dropout,
+                )
+                for index in range(self.tcn_layers)
+            ]),
+        }).to(self.device)
+        self.head = nn.Linear(self.hidden_size, 1).to(self.device)
+        self.fitted = False
+
+    def _forward(self, features: Any) -> Any:
+        encoded = features.transpose(1, 2)
+        encoded = self.encoder["stem"](encoded)
+        for block in self.encoder["blocks"]:
+            encoded = block(encoded)
+        encoded = encoded.transpose(1, 2)
+        return self.head(encoded[:, -1, :]).reshape(-1)
+
+    def get_feature_importance(self) -> list[float]:
+        weights = self.encoder["stem"].weight.detach().abs().mean(dim=(0, 2))
+        return weights.cpu().numpy().tolist()
+
+
+class QlibTorchNativeTFTModel(QlibTorchLSTMModel):
+    """轻量TFT变体：GRU编码 + 前馈 + 因果多头注意力 + 门控残差。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        import torch
+        from torch import nn
+
+        d_model = int(kwargs.get("d_model", 64))
+        nhead = int(kwargs.get("nhead", 4))
+        if d_model % nhead != 0:
+            raise ValueError("d_model必须能被nhead整除")
+        gru_hidden_size = int(kwargs.get("gru_hidden_size", 64))
+        num_layers = int(kwargs.get("num_layers", 1))
+        dim_feedforward = int(kwargs.get("dim_feedforward", 128))
+        dropout = float(kwargs.get("dropout", 0.2))
+        base_kwargs = _sequence_base_kwargs(kwargs)
+        base_kwargs.update({
+            "hidden_size": gru_hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+        })
+        super().__init__(**base_kwargs)
+        self.model_name = "NativeTFT"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.gru_hidden_size = gru_hidden_size
+        self.gru_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        torch.manual_seed(self.seed)
+        self.encoder = nn.ModuleDict({
+            "input_projection": nn.Linear(self.input_dim, self.d_model),
+            "position_embedding": nn.Embedding(self.lookback_window, self.d_model),
+            "gru": nn.GRU(
+                input_size=self.d_model,
+                hidden_size=self.gru_hidden_size,
+                num_layers=self.gru_layers,
+                dropout=self.dropout if self.gru_layers > 1 else 0.0,
+                batch_first=True,
+            ),
+            "feedforward": nn.Sequential(
+                nn.Linear(self.gru_hidden_size, self.dim_feedforward),
+                nn.GELU(),
+                nn.Linear(self.dim_feedforward, self.d_model),
+            ),
+            "attention": nn.MultiheadAttention(
+                self.d_model, self.nhead, dropout=self.dropout, batch_first=True,
+            ),
+            "gate": nn.Sequential(
+                nn.Linear(self.d_model, self.d_model), nn.Sigmoid(),
+            ),
+        }).to(self.device)
+        self.head = nn.Linear(self.d_model, 1).to(self.device)
+        self.fitted = False
+
+    def _forward(self, features: Any) -> Any:
+        import torch
+
+        steps = int(features.shape[1])
+        if steps > self.lookback_window:
+            raise ValueError("输入序列长度超过lookback_window")
+        positions = torch.arange(steps, device=features.device)
+        sequence = self.encoder["input_projection"](features)
+        sequence = sequence + self.encoder["position_embedding"](positions).unsqueeze(0)
+        gru_out, _ = self.encoder["gru"](sequence)
+        projected = self.encoder["feedforward"](gru_out)
+        causal_mask = torch.triu(
+            torch.full((steps, steps), float("-inf"), device=features.device),
+            diagonal=1,
+        )
+        attended, _ = self.encoder["attention"](
+            projected, projected, projected, attn_mask=causal_mask,
+        )
+        gated = self.encoder["gate"](attended) * attended
+        return self.head((gated + sequence)[:, -1, :]).reshape(-1)
+
+    def get_feature_importance(self) -> list[float]:
+        projection = self.encoder["input_projection"]
+        return projection.weight.detach().abs().mean(dim=0).cpu().numpy().tolist()
+
+
+class _QlibSklearnMixin:
+    """sklearn回归器的Qlib数据集适配：fit/predict遵循Qlib Model接口。"""
+
+    def fit(
+        self, dataset: Any, *, evals_result: dict[str, Any] | None = None,
+        cancellation: Any = None, progress: Any = None,
+    ) -> None:
+        from qlib.data.dataset import DataHandlerLP
+
+        evaluations = evals_result if evals_result is not None else {}
+        if cancellation is not None:
+            cancellation.checkpoint()
+        train, valid = dataset.prepare(
+            ["train", "valid"], col_set=["feature", "label"],
+            data_key=DataHandlerLP.DK_L,
+        )
+        train = train.dropna()
+        valid = valid.dropna()
+        if train.empty or valid.empty:
+            raise ValueError(f"{self.model_name}训练集或验证集为空")
+        x_train = np.asarray(train["feature"].values, dtype=float)
+        y_train = np.asarray(train["label"].values, dtype=float).reshape(-1)
+        x_valid = np.asarray(valid["feature"].values, dtype=float)
+        y_valid = np.asarray(valid["label"].values, dtype=float).reshape(-1)
+        self.model.fit(x_train, y_train)
+        prediction = np.asarray(self.model.predict(x_valid), dtype=float).reshape(-1)
+        loss = float(np.sqrt(np.mean(np.square(prediction - y_valid))))
+        evaluations.update({"train": [loss], "valid": [loss], "steps": [1]})
+        self.fitted = True
+        if progress is not None:
+            progress("training", 80, {"iteration": 1, "total_iterations": 1})
+        try:
+            from qlib.workflow import R
+
+            R.log_metrics(train_loss=loss, valid_loss=loss, step=1)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def predict(self, dataset: Any, segment: str = "test") -> pd.Series:
+        from qlib.data.dataset import DataHandlerLP
+
+        frame = dataset.prepare(
+            segment, col_set="feature", data_key=DataHandlerLP.DK_I,
+        )
+        values = np.asarray(frame.values, dtype=float)
+        predictions = np.asarray(self.model.predict(values), dtype=float).reshape(-1)
+        return pd.Series(predictions, index=frame.index).sort_index()
+
+    def to_cpu(self) -> None:
+        return None
+
+
+class QlibSklearnRidgeModel(_QlibSklearnMixin):
+    """Ridge线性回归基线，sanity check用。"""
+
+    def __init__(
+        self, *, input_dim: int, alpha: float = 1.0,
+        fit_intercept: bool = False, solver: str = "auto",
+        max_iter: int = 1000, seed: int = 42, num_threads: int = 4,
+    ) -> None:
+        from sklearn.linear_model import Ridge
+
+        self.input_dim = int(input_dim)
+        self.seed = int(seed)
+        self.num_threads = int(num_threads)
+        self.model = Ridge(
+            alpha=float(alpha),
+            fit_intercept=bool(fit_intercept),
+            solver=str(solver),
+            max_iter=int(max_iter),
+            random_state=int(seed),
+        )
+        self.model_name = "Ridge"
+        self.fitted = False
+
+    def get_feature_importance(self) -> list[float]:
+        coefficients = np.asarray(self.model.coef_, dtype=float).reshape(-1)
+        return np.abs(coefficients).tolist()
+
+
+class QlibSklearnRandomForestModel(_QlibSklearnMixin):
+    """随机森林回归基线，用于与Boosting模型对比。"""
+
+    def __init__(
+        self, *, input_dim: int, n_estimators: int = 500,
+        max_depth: int = 0, min_samples_split: int = 2,
+        min_samples_leaf: int = 1, max_features: float = 1.0,
+        seed: int = 42, num_threads: int = 4,
+    ) -> None:
+        from sklearn.ensemble import RandomForestRegressor
+
+        self.input_dim = int(input_dim)
+        self.seed = int(seed)
+        self.num_threads = int(num_threads)
+        depth = int(max_depth)
+        self.model = RandomForestRegressor(
+            n_estimators=int(n_estimators),
+            max_depth=None if depth <= 0 else depth,
+            min_samples_split=int(min_samples_split),
+            min_samples_leaf=int(min_samples_leaf),
+            max_features=float(max_features),
+            n_jobs=int(num_threads),
+            random_state=int(seed),
+            verbose=0,
+        )
+        self.model_name = "RandomForest"
+        self.fitted = False
+
+    def get_feature_importance(self) -> list[float]:
+        return np.asarray(self.model.feature_importances_, dtype=float).tolist()
+
+
+class QlibNativeTabNetAdapter:
+    """Qlib TabNet适配：统一取消/进度接口，并规避小样本下空验证批导致的崩溃。"""
+
+    def __init__(self, *, input_dim: int, **kwargs: Any) -> None:
+        import torch
+
+        self.input_dim = int(input_dim)
+        self.kwargs = dict(kwargs)
+        self.seed = int(self.kwargs.get("seed", 42))
+        self.device = _torch_device(torch)
+        self.model = None
+        self.model_name = "TabNet"
+        self.fitted = False
+
+    def fit(
+        self, dataset: Any, *, evals_result: dict[str, Any] | None = None,
+        cancellation: Any = None, progress: Any = None,
+    ) -> None:
+        import torch
+        from qlib.contrib.model.pytorch_tabnet import TabnetModel
+        from qlib.data.dataset import DataHandlerLP
+
+        evaluations = evals_result if evals_result is not None else {}
+        if cancellation is not None:
+            cancellation.checkpoint()
+        train, valid = dataset.prepare(
+            ["train", "valid"], col_set=["feature", "label"],
+            data_key=DataHandlerLP.DK_L,
+        )
+        if train.empty or valid.empty:
+            raise ValueError("TabNet训练集或验证集为空")
+        batch_size = int(self.kwargs.get("batch_size", 4096))
+        # qlib的test_epoch会丢弃最后一个不足batch_size的批次，小样本下会得到
+        # 空指标并触发best_param未初始化错误，这里把batch钳制到样本量以内。
+        batch_size = max(1, min(batch_size, len(train), len(valid)))
+        torch.manual_seed(self.seed)
+        self.model = TabnetModel(
+            d_feat=self.input_dim,
+            **{**self.kwargs, "batch_size": batch_size, "GPU": -1},
+        )
+        self.model.fit(dataset, evals_result=evaluations)
+        self.fitted = True
+        if progress is not None:
+            progress("training", 80, {"iteration": 1, "total_iterations": 1})
+        try:
+            from qlib.workflow import R
+
+            for step, (train_loss, valid_loss) in enumerate(
+                zip(evaluations.get("train", []), evaluations.get("valid", [])),
+                start=1,
+            ):
+                R.log_metrics(train_loss=train_loss, valid_loss=valid_loss, step=step)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def predict(self, dataset: Any, segment: str = "test") -> pd.Series:
+        if self.model is None or not self.fitted:
+            raise ValueError("TabNet模型尚未训练")
+        return self.model.predict(dataset, segment)
+
+    def to_cpu(self) -> None:
+        return None
+
+
 def _sequence_batch(
     sampler: Any,
     indices: list[int],
@@ -500,5 +990,8 @@ def _torch_device(torch: Any) -> Any:
 
 
 __all__ = [
-    "QlibTorchLSTMModel", "QlibTorchMLPModel", "QlibTorchTransformerLSTMModel",
+    "QlibNativeTabNetAdapter", "QlibSklearnRandomForestModel", "QlibSklearnRidgeModel",
+    "QlibTorchALSTMModel", "QlibTorchGRUModel", "QlibTorchLSTMModel",
+    "QlibTorchMLPModel", "QlibTorchNativeTFTModel", "QlibTorchTCNModel",
+    "QlibTorchTransformerLSTMModel", "QlibTorchTransformerModel",
 ]

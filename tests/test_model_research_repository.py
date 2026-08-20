@@ -1158,6 +1158,114 @@ def test_factor_ablation_experiment_freezes_variants_and_selection_policy() -> N
     assert result["lineage_trial_remaining"] == 21
 
 
+def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    captured = []
+
+    def create_job(payload):
+        captured.append(payload)
+        index = len(captured)
+        return {
+            "job_id": f"ensemble-job-{index}",
+            "model_id": payload["model_id"],
+            "model_kind": payload["model"]["kind"],
+            "status": "queued",
+            "dataset_hash": "0" * 64,
+            "dataset_spec": payload["dataset"],
+            "requested_at": f"2026-08-15T04:0{index}:00+00:00",
+            "updated_at": f"2026-08-15T04:0{index}:00+00:00",
+            "config_json": {"experiment": payload["experiment"]},
+        }
+
+    repository.create_training_job = create_job
+    result = repository.create_training_experiment({
+        "title": "多模型对比",
+        "model_id": "ensemble-model",
+        "dataset": _source(),
+        "model": {"kind": "lightgbm", "params": {}},
+        "search": {
+            "strategy": "model_ensemble",
+            "model_kinds": ["lightgbm", "xgboost", "mlp"],
+            "model_params_by_kind": {
+                "lightgbm": {"num_leaves": 15},
+                "xgboost": {"max_depth": 4},
+                "mlp": {"hidden_layers": [32, 64]},
+            },
+        },
+    })
+
+    assert result["strategy"] == "model_ensemble"
+    assert result["shared_dataset"] is True
+    assert result["dataset_count"] == 1
+    assert result["trial_count"] == 3
+    assert result["search_parameters"] == ["model_kind"]
+    assert result["selection"]["policy"] == "alphablocks.model-ensemble-selection.v1"
+    assert result["selection"]["selection_unit"] == "model_kind"
+    assert [
+        item["model"]["kind"] for item in captured
+    ] == ["lightgbm", "xgboost", "mlp"]
+    assert [
+        item["experiment"]["search_params"]["model_kind"] for item in captured
+    ] == ["lightgbm", "xgboost", "mlp"]
+    assert captured[0]["model"]["params"]["num_leaves"] == 15
+    assert captured[1]["model"]["params"]["max_depth"] == 4
+    assert captured[2]["model"]["params"]["hidden_layers"] == [32, 64]
+    assert all(
+        item["dataset"] == _dataset_spec(_source()) for item in captured
+    )
+
+
+def test_model_ensemble_rejects_too_few_or_unknown_kinds() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    repository.create_training_job = lambda _payload: None
+
+    with pytest.raises(ModelResearchError, match="2到8"):
+        repository.create_training_experiment({
+            "dataset": _source(),
+            "search": {
+                "strategy": "model_ensemble",
+                "model_kinds": ["lightgbm"],
+                "model_params_by_kind": {"lightgbm": {}},
+            },
+        })
+    with pytest.raises(ModelResearchError, match="只允许"):
+        repository.create_training_experiment({
+            "dataset": _source(),
+            "search": {
+                "strategy": "model_ensemble",
+                "model_kinds": ["lightgbm", "unknown_model"],
+                "model_params_by_kind": {"lightgbm": {}, "unknown_model": {}},
+            },
+        })
+
+
+def test_model_spec_supports_all_available_model_kinds() -> None:
+    expected = {
+        "lightgbm": "qlib.contrib.model.gbdt.LGBModel",
+        "xgboost": "qlib.contrib.model.xgboost.XGBModel",
+        "catboost": "qlib.contrib.model.catboost_model.CatBoostModel",
+        "random_forest": "factor_service.research.models.QlibSklearnRandomForestModel",
+        "linear": "factor_service.research.models.QlibSklearnRidgeModel",
+        "mlp": "factor_service.research.models.QlibTorchMLPModel",
+        "gru": "factor_service.research.models.QlibTorchGRUModel",
+        "lstm": "factor_service.research.models.QlibTorchLSTMModel",
+        "alstm": "factor_service.research.models.QlibTorchALSTMModel",
+        "transformer": "factor_service.research.models.QlibTorchTransformerModel",
+        "tabnet": "factor_service.research.models.QlibNativeTabNetAdapter",
+        "tcn": "factor_service.research.models.QlibTorchTCNModel",
+        "nativetft": "factor_service.research.models.QlibTorchNativeTFTModel",
+        "transformer_lstm": "factor_service.research.models.QlibTorchTransformerLSTMModel",
+    }
+    for kind, qlib_model in expected.items():
+        spec = _model_spec({"kind": kind, "params": {}})
+        assert spec["kind"] == kind
+        assert spec["qlib_model"] == qlib_model
+        assert spec["params"]["seed"] == 42
+        assert spec["params"]["num_threads"] == 4
+    with pytest.raises(ModelResearchError, match="只允许"):
+        _model_spec({"kind": "unknown_model", "params": {}})
+
+
 def test_next_ablation_inherits_selected_parent_and_freezes_lineage_budget() -> None:
     repository = object.__new__(ModelResearchRepository)
     captured = []

@@ -1,0 +1,159 @@
+- generic [ref=e1]:
+  - generic [ref=e3]:
+    - banner [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]: AlphaBlocksStudio
+        - menubar [ref=e8]:
+          - menuitem "模式运行" [ref=e9]
+          - menuitem "数据资产" [ref=e14]
+          - menuitem "数据同步" [ref=e19]
+          - menuitem "因子库" [ref=e24]
+          - menuitem "模型中心" [ref=e29]
+          - menuitem "其他" [ref=e34]
+        - generic [ref=e39]:
+          - button "实体资产 已同步 9/55" [ref=e211] [cursor=pointer]:
+            - generic [ref=e44]: 实体资产
+            - strong [ref=e45]: 已同步 9/55
+          - button "切换主题" [ref=e46] [cursor=pointer]
+    - main [ref=e51]:
+      - generic [ref=e54]:
+        - complementary [ref=e55]:
+          - generic [ref=e56]:
+            - generic [ref=e57]: TRAINING WORKFLOW
+            - strong [ref=e58]: 训练流程
+            - generic [ref=e59]: 按步骤完成配置，最后统一提交。
+          - navigation "训练步骤" [ref=e60]:
+            - button "1 特征选择 0 个特征" [ref=e422] [cursor=pointer]:
+              - generic [ref=e62]: "1"
+              - generic [ref=e63]:
+                - strong [ref=e64]: 特征选择
+                - generic [ref=e65]: 0 个特征
+            - button "2 训练目标 2 项待处理" [ref=e214] [cursor=pointer]:
+              - generic [ref=e67]: "2"
+              - generic [ref=e68]:
+                - strong [ref=e69]: 训练目标
+                - generic [ref=e70]: 2 项待处理
+            - button "✓ 参数配置 LightGBM · 单模型训练" [ref=e71] [cursor=pointer]:
+              - generic [ref=e72]: ✓
+              - generic [ref=e73]:
+                - strong [ref=e74]: 参数配置
+                - generic [ref=e75]: LightGBM · 单模型训练
+            - button "4 执行训练 确认配置并创建任务" [active] [ref=e423] [cursor=pointer]:
+              - generic [ref=e77]: "4"
+              - generic [ref=e78]:
+                - strong [ref=e79]: 执行训练
+                - generic [ref=e80]: 确认配置并创建任务
+            - button "5 结果入库 等待训练提交" [ref=e81] [cursor=pointer]:
+              - generic [ref=e82]: "5"
+              - generic [ref=e83]:
+                - strong [ref=e84]: 结果入库
+                - generic [ref=e85]: 等待训练提交
+          - generic [ref=e86]:
+            - text: 当前配置
+            - generic [ref=e87]:
+              - generic [ref=e88]:
+                - term [ref=e89]: 目标
+                - definition [ref=e90]: 个股选股
+              - generic [ref=e91]:
+                - term [ref=e92]: 算法
+                - definition [ref=e93]: LightGBM
+              - generic [ref=e94]:
+                - term [ref=e95]: 特征
+                - definition [ref=e96]: 0 个
+              - generic [ref=e97]:
+                - term [ref=e98]: 标签
+                - definition [ref=e99]: T+5
+          - generic [ref=e100]:
+            - generic [ref=e101]:
+              - generic [ref=e102]: 训练节点
+              - button "检查" [ref=e103] [cursor=pointer]
+            - button "本机训练 LOCAL" [ref=e216] [cursor=pointer]:
+              - generic [ref=e218]:
+                - strong [ref=e219]: 本机训练
+                - generic [ref=e220]: LOCAL
+          - generic [ref=e104]:
+            - button "参数实验" [ref=e105] [cursor=pointer]
+            - button "训练任务" [ref=e106] [cursor=pointer]
+        - generic [ref=e107]:
+          - generic [ref=e108]:
+            - generic [ref=e109]:
+              - generic [ref=e110]: MODEL TRAINING
+              - strong [ref=e111]: 模型训练
+              - generic [ref=e112]: 选择因子并形成可复现的 Qlib 训练任务
+            - generic [ref=e113]:
+              - generic [ref=e114]:
+                - generic [ref=e115]: 草稿
+                - strong [ref=e116]: 等待修改
+              - button "研究模板（0）" [ref=e222] [cursor=pointer]
+              - button "保存为模板" [ref=e119] [cursor=pointer]
+          - generic [ref=e122]:
+            - generic [ref=e123]:
+              - generic [ref=e124]: 研究目标
+              - strong [ref=e125]: 个股选股
+            - generic [ref=e126]:
+              - generic [ref=e127]: 股票池
+              - strong [ref=e128]: 中证500
+            - generic [ref=e129]:
+              - generic [ref=e130]: 特征数
+              - strong [ref=e131]: "0"
+            - generic [ref=e132]:
+              - generic [ref=e133]: 预测周期
+              - strong [ref=e134]: T+5
+            - generic [ref=e135]:
+              - generic [ref=e136]: 数据集天数
+              - strong [ref=e137]: "--"
+            - generic [ref=e424]:
+              - generic [ref=e425]: 状态
+              - strong [ref=e426]: 待配置
+          - generic [ref=e428]:
+            - generic [ref=e429]:
+              - generic [ref=e430]: 步骤 4
+              - heading "执行训练" [level=2] [ref=e431]
+            - generic [ref=e432]:
+              - generic [ref=e433]:
+                - generic [ref=e438]:
+                  - heading "第四步：执行训练" [level=3] [ref=e439]
+                  - paragraph [ref=e440]: 顶部工具栏统一承载训练操作，这里只保留状态、进度和编排详情，避免重复按钮干扰。
+                - generic [ref=e441]:
+                  - alert [ref=e442]:
+                    - generic [ref=e446]:
+                      - generic [ref=e447]: 仍有配置或检查项未通过，请返回对应步骤处理
+                      - paragraph [ref=e448]: 提交后由 AlphaFactorService 即时计算所选因子，在 work_root 暂存并原子发布为不可变 Parquet 数据集。
+                  - generic [ref=e449]:
+                    - generic [ref=e450]:
+                      - generic [ref=e451]: 请求状态
+                      - strong [ref=e452]: 待提交
+                      - generic [ref=e453]: 后端状态：draft · T+5 · 个股选股
+                    - generic [ref=e454]:
+                      - generic [ref=e455]: 总样本周期
+                      - strong [ref=e456]: 0 天
+                      - generic [ref=e457]: 训练/验证/测试：0/0/0
+                  - generic [ref=e458]:
+                    - generic [ref=e459]:
+                      - generic [ref=e460]: 执行进度 · 待完成配置
+                      - generic [ref=e461]: 未开始
+                    - progressbar [ref=e462]
+              - generic [ref=e465]:
+                - generic [ref=e470]:
+                  - heading "训练编排详情" [level=3] [ref=e471]
+                  - paragraph [ref=e472]: 请求预览和前置检查分开展示，减少重复信息干扰。
+                - generic [ref=e474]:
+                  - tablist [ref=e478]:
+                    - tab "请求预览" [selected] [ref=e480]
+                    - tab "前置检查" [ref=e481]
+                  - tabpanel "请求预览" [ref=e483]:
+                    - generic [ref=e484]: "{ \"title\": \"中证500 多因子模型\", \"model\": { \"kind\": \"lightgbm\", \"params\": { \"learning_rate\": 0.05, \"n_estimators\": 1000, \"early_stopping_rounds\": 50, \"num_threads\": 4, \"num_leaves\": 31, \"max_depth\": -1, \"min_child_samples\": 20, \"subsample\": 0.9, \"colsample_bytree\": 0.9, \"reg_alpha\": 0, \"reg_lambda\": 1 } }, \"dataset\": { \"name\": \"中证500 多因子模型\", \"universe_id\": \"csi500\", \"research_target\": \"stock_selection\", \"label_horizon_trading_days\": 5, \"date_start\": null, \"date_end\": null, \"data_cutoff\": \"2026-08-18T15:24:48.196Z\", \"split\": { \"train\": 0.6, \"valid\": 0.2, \"test\": 0.2 }, \"factors\": [] }, \"walk_forward\": { \"enabled\": false, \"strategy\": \"rolling\", \"train_years\": 1, \"valid_months\": 3, \"test_months\": 12, \"step_months\": 12, \"max_windows\": 4, \"embargo_days\": 5 }, \"context\": { \"initial_capital\": 1000000, \"benchmark\": \"000905.SH\", \"commission_rate\": 0.0003, \"slippage\": 0.001, \"deal_price\": \"open\", \"industry_as_feature\": false, \"preprocessing_enabled\": true }, \"execution\": { \"node_id\": \"local\" } }"
+          - generic [ref=e201]:
+            - generic [ref=e202]:
+              - generic [ref=e203]: 步骤 4 / 5
+              - strong [ref=e204]: 执行训练
+              - generic [ref=e205]: 确认配置并创建任务
+            - generic [ref=e206]:
+              - button "上一步" [ref=e207] [cursor=pointer]
+              - button "提交训练" [disabled] [ref=e485]
+  - generic [ref=e408]:
+    - button "Toggle Nuxt DevTools" [ref=e409] [cursor=pointer]
+    - generic "Page load time" [ref=e413]:
+      - generic [ref=e414]: "439"
+      - generic [ref=e415]: ms
+    - button "Toggle Component Inspector" [ref=e417] [cursor=pointer]

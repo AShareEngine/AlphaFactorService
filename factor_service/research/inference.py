@@ -16,7 +16,11 @@ from factor_service.research.config import Settings
 from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
 from factor_service.research.job import CancellationToken, ProgressCallback
-from factor_service.research.trainer import TrainingResult, predict_feature_frame
+from factor_service.research.trainer import (
+    SEQUENCE_MODEL_KINDS,
+    TrainingResult,
+    predict_feature_frame,
+)
 
 
 class DailyInferenceRunner:
@@ -156,7 +160,7 @@ class DailyInferenceRunner:
         _progress(progress, "inferencing", 68, {"row_count": len(features)})
         sequence_coverage: float | None = None
         try:
-            if model_kind in {"lstm", "transformer_lstm"}:
+            if model_kind in SEQUENCE_MODEL_KINDS:
                 from qlib.data.dataset import DataHandlerLP, TSDatasetH
 
                 sequence_frame = features.set_index(["trade_date", "instrument"])[expected_names]

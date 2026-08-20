@@ -29,6 +29,12 @@ from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.training_diagnostics import build_training_diagnostics
 
 
+SEQUENCE_MODEL_KINDS = frozenset({
+    "gru", "lstm", "alstm", "transformer", "tcn", "nativetft",
+    "transformer_lstm",
+})
+
+
 @dataclass(frozen=True)
 class TrainingResult:
     result: dict[str, Any]
@@ -718,6 +724,8 @@ def _fit_model(
                         "valid": list(valid_metrics[metric]),
                     })
         else:
+            import inspect
+
             def mapped_progress(
                 _stage: str, percent: int, details: dict[str, Any],
             ) -> None:
@@ -725,10 +733,27 @@ def _fit_model(
                 mapped = progress_start + int((progress_end - progress_start) * ratio)
                 _progress(progress, stage, mapped, {**(progress_details or {}), **details})
 
-            model.fit(
-                dataset, evals_result=evals_result,
-                cancellation=cancellation, progress=mapped_progress,
+            try:
+                fit_signature = inspect.signature(model.fit)
+            except (TypeError, ValueError):
+                fit_signature = None
+            cooperative_fit = (
+                fit_signature is not None
+                and {"cancellation", "progress"} <= set(fit_signature.parameters)
             )
+            if cooperative_fit:
+                model.fit(
+                    dataset, evals_result=evals_result,
+                    cancellation=cancellation, progress=mapped_progress,
+                )
+            else:
+                _checkpoint(cancellation)
+                model.fit(dataset, evals_result=evals_result)
+                if progress is not None:
+                    _progress(
+                        progress, stage, progress_end,
+                        {**(progress_details or {}), "model_kind": model_kind},
+                    )
         _checkpoint(cancellation)
         _progress(
             progress, stage, progress_end,
@@ -960,6 +985,155 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "num_threads": int(source.get("num_threads", 4)),
         }
         return QlibTorchTransformerLSTMModel(**params), params
+    if kind in {"gru", "alstm"}:
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        if kind == "gru":
+            from factor_service.research.models import QlibTorchGRUModel as ModelClass
+        else:
+            from factor_service.research.models import QlibTorchALSTMModel as ModelClass
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "hidden_size": int(source.get("hidden_size", 128)),
+            "num_layers": int(source.get("num_layers", 2)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 512)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return ModelClass(**params), params
+    if kind == "transformer":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibTorchTransformerModel
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "d_model": int(source.get("d_model", 64)),
+            "nhead": int(source.get("nhead", 4)),
+            "transformer_layers": int(source.get("transformer_layers", 2)),
+            "dim_feedforward": int(source.get("dim_feedforward", 256)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 256)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return QlibTorchTransformerModel(**params), params
+    if kind == "tcn":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibTorchTCNModel
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "hidden_size": int(source.get("hidden_size", 128)),
+            "kernel_size": int(source.get("kernel_size", 5)),
+            "num_layers": int(source.get("num_layers", 5)),
+            "dropout": float(source.get("dropout", 0.5)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 256)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return QlibTorchTCNModel(**params), params
+    if kind == "nativetft":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibTorchNativeTFTModel
+
+        params = {
+            "learning_rate": float(source.get("learning_rate", 0.001)),
+            "lookback_window": int(source.get("lookback_window", 60)),
+            "d_model": int(source.get("d_model", 64)),
+            "nhead": int(source.get("nhead", 4)),
+            "gru_hidden_size": int(source.get("gru_hidden_size", 64)),
+            "num_layers": int(source.get("num_layers", 1)),
+            "dim_feedforward": int(source.get("dim_feedforward", 128)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 300)),
+            "batch_size": int(source.get("batch_size", 256)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "eval_steps": int(source.get("eval_steps", 10)),
+            "seed": int(source.get("seed", 42)),
+            "weight_decay": float(source.get("weight_decay", 0.0001)),
+            "input_dim": feature_count,
+            "num_threads": int(source.get("num_threads", 4)),
+        }
+        return QlibTorchNativeTFTModel(**params), params
+    if kind == "tabnet":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("PyTorch尚未安装，请执行uv sync") from exc
+        from factor_service.research.models import QlibNativeTabNetAdapter
+
+        params = {
+            "lr": float(source.get("learning_rate", 0.01)),
+            "n_d": int(source.get("n_d", 64)),
+            "n_a": int(source.get("n_a", 64)),
+            "n_steps": int(source.get("n_steps", 5)),
+            "n_shared": int(source.get("n_shared", 2)),
+            "n_ind": int(source.get("n_ind", 2)),
+            "batch_size": int(source.get("batch_size", 4096)),
+            "n_epochs": int(source.get("max_steps", 100)),
+            "early_stop": int(source.get("early_stopping_rounds", 20)),
+            "seed": int(source.get("seed", 42)),
+            "pretrain": bool(source.get("pretrain", False)),
+        }
+        return QlibNativeTabNetAdapter(input_dim=feature_count, **params), params
+    if kind == "linear":
+        from factor_service.research.models import QlibSklearnRidgeModel
+
+        params = {
+            "alpha": float(source.get("alpha", 1.0)),
+            "fit_intercept": bool(source.get("fit_intercept", False)),
+            "solver": str(source.get("solver", "auto")),
+            "max_iter": int(source.get("max_iter", 1000)),
+            "seed": int(source.get("seed", 42)),
+            "num_threads": int(source.get("num_threads", 4)),
+            "input_dim": feature_count,
+        }
+        return QlibSklearnRidgeModel(**params), params
+    if kind == "random_forest":
+        from factor_service.research.models import QlibSklearnRandomForestModel
+
+        params = {
+            "n_estimators": int(source.get("n_estimators", 500)),
+            "max_depth": int(source.get("max_depth", 0)),
+            "min_samples_split": int(source.get("min_samples_split", 2)),
+            "min_samples_leaf": int(source.get("min_samples_leaf", 1)),
+            "max_features": float(source.get("max_features", 1.0)),
+            "seed": int(source.get("seed", 42)),
+            "num_threads": int(source.get("num_threads", 4)),
+            "input_dim": feature_count,
+        }
+        return QlibSklearnRandomForestModel(**params), params
     raise ValueError(f"不支持的模型: {kind}")
 
 
@@ -979,7 +1153,7 @@ def _dataset_for_model(
     params: dict[str, Any],
     DatasetH: Any,
 ) -> Any:
-    if model_kind not in {"lstm", "transformer_lstm"}:
+    if model_kind not in SEQUENCE_MODEL_KINDS:
         return DatasetH(handler=handler, segments=segments)
     from qlib.data.dataset import TSDatasetH
 
@@ -998,7 +1172,7 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
         return np.asarray(model.model.predict(xgb.DMatrix(features.values)), dtype=float)
     if model_kind == "mlp":
         return np.asarray(model.predict_frame(features), dtype=float).reshape(-1)
-    if model_kind in {"lstm", "transformer_lstm"}:
+    if model_kind in SEQUENCE_MODEL_KINDS:
         raise ValueError("时序模型推理必须通过TSDatasetH提供按股票组织的历史窗口")
     predictor = getattr(model, "model", None)
     if predictor is None or not hasattr(predictor, "predict"):
@@ -1010,7 +1184,10 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
 def _model_package_version(kind: str) -> dict[str, str]:
     package = {
         "lightgbm": "lightgbm", "xgboost": "xgboost", "catboost": "catboost",
-        "mlp": "torch", "lstm": "torch", "transformer_lstm": "torch",
+        "random_forest": "sklearn", "linear": "sklearn",
+        "mlp": "torch", "gru": "torch", "lstm": "torch", "alstm": "torch",
+        "transformer": "torch", "tabnet": "torch", "tcn": "torch",
+        "nativetft": "torch", "transformer_lstm": "torch",
     }[kind]
     module = __import__(package)
     return {package: str(getattr(module, "__version__", "unknown"))}

@@ -1,0 +1,254 @@
+[    1972ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[    2107ms] [WARNING] [Vue warn]: Hydration children mismatch on JSHandle@node 
+Server rendered element contains fewer child nodes than client vdom. 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="速度快、效果稳，基线必备" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2108ms] [ERROR] Hydration completed but contains mismatches. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:1882
+[    2110ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="与LGB异构，集成提升明显" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2111ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="类别特征友好，自带有序提升" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2112ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="Bagging 基线，对比 Boosting 是否真优" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2113ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="简单线性回归基线，sanity check 用" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2115ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="神经网络最简基线，验证 RNN 是否真优于全连接" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2116ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="门控循环单元，时序建模性价比最高" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2117ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="长短期记忆网络" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2118ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="带注意力的LSTM" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2119ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="标准Transformer" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2120ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="Google表格数据SOTA，自带特征选择" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2121ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="时间卷积网络，比RNN快" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2122ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="轻量TFT变体，GRU+注意力+门控残差" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2124ms] [WARNING] [Vue warn]: Hydration node mismatch:
+- rendered on server: JSHandle@node (text) 
+- expected on client: Symbol(v-fgt) 
+  at <Teleport disabled=false to="#el-popper-container-1024" > 
+  at <ElTooltipContent ref_key="contentRef" ref=Ref< undefined > aria-label=undefined  ... > 
+  at <ElPopper ref_key="popperRef" ref=Ref< undefined > role="tooltip" > 
+  at <ElTooltip content="因果注意力与LSTM组合的时序模型" placement="top" show-after=200 > 
+  at <Training onVnodeUnmounted=fn<onVnodeUnmounted> ref=Ref< undefined > > 
+  at <RouteProvider key="/model-center/training" vnode= {__v_isVNode: true, __v_skip: true, type: Object, props: Object, key: null} route= {fullPath: /model-center/training, hash: , query: Object, name: model-center-training, path: /model-center/training}  ... > 
+  at <RouterView name=undefined route=undefined > 
+  at <NuxtPage > 
+  at <Default ref=Ref< undefined > > 
+  at <AsyncComponentWrapper ref=Ref< undefined > > 
+  at <LayoutLoader key="default" layoutProps= {ref: RefImpl} name="default" > 
+  at <NuxtLayoutProvider layoutProps= {ref: RefImpl} key="default" name="default"  ... > 
+  at <NuxtLayout > 
+  at <App key=4 > 
+  at <NuxtRoot> @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:49
+[    2305ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51

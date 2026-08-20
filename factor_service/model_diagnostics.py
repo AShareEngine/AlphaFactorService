@@ -956,7 +956,11 @@ def _cached_artifact_model_permutation_importance(
 ) -> dict[str, Any]:
     from qlib.data.dataset import DataHandlerLP, DatasetH
 
-    from factor_service.research.trainer import _dataset_for_model, _metrics
+    from factor_service.research.trainer import (
+        SEQUENCE_MODEL_KINDS,
+        _dataset_for_model,
+        _metrics,
+    )
 
     segment_map = {name: (start, end) for name, start, end in segments}
     if "test" not in segment_map:
@@ -968,7 +972,7 @@ def _cached_artifact_model_permutation_importance(
         raise ValueError("冻结数据集缺少解释特征: " + ", ".join(missing))
     evaluation_segments = dict(segment_map)
     sampled_test_days = None
-    if model_kind in {"lstm", "transformer_lstm"}:
+    if model_kind in SEQUENCE_MODEL_KINDS:
         import torch
 
         torch.set_num_threads(1)

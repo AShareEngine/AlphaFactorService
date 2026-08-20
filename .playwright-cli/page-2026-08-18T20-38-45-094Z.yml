@@ -1,0 +1,29 @@
+- generic [ref=e3]:
+  - banner [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]: AlphaBlocksStudio
+      - menubar [ref=e8]:
+        - menuitem "模式运行" [ref=e9]
+        - menuitem "数据资产" [ref=e14]
+        - menuitem "数据同步" [ref=e19]
+        - menuitem "因子库" [ref=e24]
+        - menuitem "模型中心" [ref=e29]
+        - menuitem "其他" [ref=e34]
+      - generic [ref=e39]:
+        - button "实体资产 未配置" [ref=e40] [cursor=pointer]:
+          - generic [ref=e44]: 实体资产
+          - strong [ref=e45]: 未配置
+        - button "切换主题" [ref=e46] [cursor=pointer]
+  - main [ref=e51]:
+    - generic [ref=e54]:
+      - generic [ref=e55]:
+        - generic [ref=e56] [cursor=pointer]: ← 返回模型库
+        - heading "模型版本" [level=1] [ref=e58]
+        - paragraph [ref=e59]: csi500_lgbm_local_20260813 · v1 · 不可变数据集与训练产物
+      - generic [ref=e60]:
+        - generic [ref=e61]: 个股选股
+        - button "研究报告" [ref=e63] [cursor=pointer]
+        - button "复用训练配置" [ref=e65] [cursor=pointer]
+        - button "生成每日预测" [ref=e67] [cursor=pointer]
+        - button "加入模拟盘" [disabled] [ref=e69]
+        - button "暂不可回测" [disabled] [ref=e72]

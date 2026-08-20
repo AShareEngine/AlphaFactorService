@@ -139,6 +139,10 @@ def select_parameter_trial(
             "model_version": int(job.get("model_version") or 0),
             "trial_index": int(experiment.get("trial_index") or 0),
             "status": str(job.get("status") or "unknown"),
+            "model_kind": str(
+                dict(experiment.get("search_params") or {}).get("model_kind")
+                or job.get("model_kind") or ""
+            ),
             "search_params": dict(experiment.get("search_params") or {}),
             "metrics": validation_metrics,
             **assessment,
@@ -169,8 +173,10 @@ def select_parameter_trial(
         "selected_model_id": selected["model_id"] if selected else "",
         "selected_model_version": selected["model_version"] if selected else 0,
         "selected_trial_index": selected["trial_index"] if selected else 0,
+        "selected_model_kind": selected["model_kind"] if selected else "",
         "best_observed_job_id": best_observed["job_id"] if best_observed else "",
         "best_observed_trial_index": best_observed["trial_index"] if best_observed else 0,
+        "best_observed_model_kind": best_observed["model_kind"] if best_observed else "",
         "best_observed_rank_ic": (
             _number(best_observed["metrics"].get("rank_ic")) if best_observed else None
         ),

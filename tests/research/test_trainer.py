@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from pathlib import Path
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -187,6 +188,46 @@ def test_lightgbm_incremental_fit_appends_trees_to_source_booster() -> None:
         check=False, capture_output=True, text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_new_model_kinds_instantiate_and_pickle() -> None:
+    scenarios = {
+        "random_forest": {"n_estimators": 10, "max_depth": 3, "num_threads": 2},
+        "linear": {"alpha": 1.0},
+        "gru": {
+            "lookback_window": 8, "hidden_size": 16, "num_layers": 1,
+            "max_steps": 2, "batch_size": 64,
+        },
+        "alstm": {
+            "lookback_window": 8, "hidden_size": 16, "num_layers": 1,
+            "max_steps": 2, "batch_size": 64,
+        },
+        "transformer": {
+            "lookback_window": 8, "d_model": 16, "nhead": 4,
+            "transformer_layers": 1, "max_steps": 2, "batch_size": 64,
+        },
+        "tabnet": {
+            "n_d": 8, "n_a": 8, "n_steps": 2, "max_steps": 2,
+            "batch_size": 64, "pretrain": False,
+        },
+        "tcn": {
+            "lookback_window": 8, "hidden_size": 16, "kernel_size": 3,
+            "num_layers": 2, "max_steps": 2, "batch_size": 64,
+        },
+        "nativetft": {
+            "lookback_window": 8, "d_model": 16, "nhead": 4,
+            "gru_hidden_size": 16, "num_layers": 1,
+            "max_steps": 2, "batch_size": 64,
+        },
+        "transformer_lstm": {
+            "lookback_window": 8, "d_model": 16, "nhead": 4,
+            "transformer_layers": 1, "max_steps": 2, "batch_size": 64,
+        },
+    }
+    for kind, params in scenarios.items():
+        model, _ = _create_model(kind, params, 8)
+        restored = pickle.loads(pickle.dumps(model))
+        assert restored.__class__ is model.__class__
 
 
 def test_supported_model_factories_are_available() -> None:

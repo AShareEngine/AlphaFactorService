@@ -35,6 +35,11 @@ from factor_service.model_registry import (
     render_model_research_report_markdown,
 )
 from factor_service.model_reproducibility import build_model_reproducibility_audit
+from factor_service.model_selection import (
+    daily_selection as run_daily_selection,
+    negative_selection as run_negative_selection,
+    run_inference_backtest,
+)
 from factor_service.research.config import load_settings as load_research_settings
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.model_research_repository import (
@@ -46,6 +51,7 @@ from factor_service.model_research_repository import (
 from factor_service.research.worker import ResearchWorker
 from factor_service.research.schedule import dispatch_job as dispatch_model_job
 from factor_service.research.schedule import run_inference_schedule_tick
+from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
 from factor_service.schemas import ModelBacktestJobCreate
 
 
@@ -105,6 +111,7 @@ def _experiment_view(
     unit = {
         "horizon_grid": "标签周期",
         "factor_ablation": "因子消融方案",
+        "model_ensemble": "模型",
     }.get(strategy, "参数组合")
     if summary is None:
         experiment.update({
@@ -1583,9 +1590,9 @@ def get_model_permutation_importance(
             str(item.get("factor") or ""): index
             for index, item in enumerate(stored_importance)
         }
-        effective_limit = min(limit, 8) if str(model.get("model_kind") or "") in {
-            "lstm", "transformer_lstm",
-        } else limit
+        model_kind = str(model.get("model_kind") or "")
+        is_sequence_model = model_kind in SEQUENCE_MODEL_KINDS
+        effective_limit = min(limit, 8) if is_sequence_model else limit
         selected = sorted(
             feature_names,
             key=lambda item: (importance_order.get(item, len(feature_names)), item),
@@ -1596,13 +1603,13 @@ def get_model_permutation_importance(
         )
         diagnostics_runner = (
             isolated_artifact_model_permutation_importance
-            if str(model.get("model_kind") or "") in {"lstm", "transformer_lstm"}
+            if is_sequence_model
             else artifact_model_permutation_importance
         )
         diagnostics = diagnostics_runner(
             bundle_path,
             dataset_path,
-            model_kind=str(model.get("model_kind") or ""),
+            model_kind=model_kind,
             segments=dict(manifest.get("segments") or {}),
             model_params=dict(manifest.get("model_params") or {}),
             feature_names=selected,
@@ -2365,6 +2372,77 @@ def list_signals(
             top_n=top_n,
         )
         return {"ok": True, "signals": rows}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/models/{model_id}/versions/{version}/selection/daily")
+def get_daily_selection(
+    model_id: str,
+    version: int,
+    strategy: str = Query(default="balanced"),
+    trade_date: str = "",
+    ignore_ma20: bool = Query(default=False),
+) -> dict[str, Any]:
+    """今日选股：市场状态 + 行业排行 + 候选股 + 被排除示例（对齐 QuantMind）。"""
+    try:
+        model = repository.get_model(model_id, version)
+        _assert_stock_prediction_scope(model, "生成个股选股参考")
+        result = run_daily_selection(
+            model_id=model_id,
+            model_version=version,
+            strategy=strategy,
+            trade_date=trade_date or None,
+            ignore_ma20=ignore_ma20,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/models/{model_id}/versions/{version}/selection/negative")
+def get_negative_selection(
+    model_id: str,
+    version: int,
+    trade_date: str = "",
+) -> dict[str, Any]:
+    """负分多空参考：做空候选 + 错杀参考 + 分数×市值矩阵（对齐 QuantMind）。"""
+    try:
+        model = repository.get_model(model_id, version)
+        _assert_stock_prediction_scope(model, "生成负分参考")
+        result = run_negative_selection(
+            model_id=model_id,
+            model_version=version,
+            trade_date=trade_date or None,
+        )
+        return {"ok": True, **result}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/models/{model_id}/versions/{version}/inference-backtests")
+def create_inference_backtest(
+    model_id: str,
+    version: int,
+    payload: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """事件驱动推理回测（stored 信号：读已有模型预测，对齐 QuantMind 推理回测）。"""
+    try:
+        model = repository.get_model(model_id, version)
+        _assert_stock_prediction_scope(model, "运行推理回测")
+        strategy = payload.get("strategy") or {}
+        start_date = str(payload.get("start_date") or "")
+        end_date = str(payload.get("end_date") or "")
+        if not start_date or not end_date:
+            raise ValueError("start_date 与 end_date 必填")
+        result = run_inference_backtest(
+            model_id=model_id,
+            model_version=version,
+            start_date=start_date,
+            end_date=end_date,
+            strategy=strategy,
+        )
+        return {"ok": True, **result}
     except Exception as exc:
         _raise(exc)
 

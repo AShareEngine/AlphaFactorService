@@ -39,13 +39,46 @@ SEARCHABLE_MODEL_PARAMS: dict[str, frozenset[str]] = {
         "learning_rate", "depth", "n_estimators", "l2_leaf_reg",
         "random_strength",
     }),
+    "random_forest": frozenset({
+        "n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
+        "max_features",
+    }),
+    "linear": frozenset({
+        "alpha", "fit_intercept", "solver", "max_iter",
+    }),
     "mlp": frozenset({
         "learning_rate", "hidden_layers", "max_steps", "batch_size",
         "weight_decay",
     }),
+    "gru": frozenset({
+        "learning_rate", "lookback_window", "hidden_size", "num_layers",
+        "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
     "lstm": frozenset({
         "learning_rate", "lookback_window", "hidden_size", "num_layers",
         "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
+    "alstm": frozenset({
+        "learning_rate", "lookback_window", "hidden_size", "num_layers",
+        "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
+    "transformer": frozenset({
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "transformer_layers", "dim_feedforward", "dropout", "max_steps",
+        "batch_size", "weight_decay",
+    }),
+    "tabnet": frozenset({
+        "learning_rate", "n_d", "n_a", "n_steps", "n_shared", "n_ind",
+        "batch_size", "max_steps", "pretrain",
+    }),
+    "tcn": frozenset({
+        "learning_rate", "lookback_window", "hidden_size", "kernel_size",
+        "num_layers", "dropout", "max_steps", "batch_size", "weight_decay",
+    }),
+    "nativetft": frozenset({
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "gru_hidden_size", "num_layers", "dim_feedforward", "dropout",
+        "max_steps", "batch_size", "weight_decay",
     }),
     "transformer_lstm": frozenset({
         "learning_rate", "lookback_window", "d_model", "nhead",
@@ -336,9 +369,9 @@ class ModelResearchRepository:
         model_source = dict(payload.get("model") or {})
         search = dict(payload.get("search") or {})
         strategy = str(search.get("strategy") or "grid").strip().lower()
-        if strategy not in {"grid", "horizon_grid", "factor_ablation"}:
+        if strategy not in {"grid", "horizon_grid", "factor_ablation", "model_ensemble"}:
             raise ModelResearchError(
-                "实验策略只支持grid、horizon_grid或factor_ablation"
+                "实验策略只支持grid、horizon_grid、factor_ablation或model_ensemble"
             )
         experiment_id = f"model_experiment_{uuid4().hex}"
         parent_experiment_id = str(
@@ -363,6 +396,7 @@ class ModelResearchRepository:
             payload.get("title") or {
                 "horizon_grid": f"{model_source.get('kind') or 'model'} 多周期研究",
                 "factor_ablation": f"{model_source.get('kind') or 'model'} 因子消融实验",
+                "model_ensemble": "多模型对比研究",
             }.get(strategy, f"{model_source.get('kind') or 'model'} 参数实验")
         ).strip()[:160]
         model_id = _clean_identifier(
@@ -429,6 +463,27 @@ class ModelResearchRepository:
             normalized_trials = _factor_ablation_trials(dataset_source, search)
             for trial in normalized_trials:
                 trial["model"] = model
+        elif strategy == "model_ensemble":
+            dataset = _dataset_spec(dataset_source)
+            model_kinds = search.get("model_kinds")
+            if not isinstance(model_kinds, list) or not 2 <= len(model_kinds) <= 8:
+                raise ModelResearchError("model_ensemble需要选择2到8个模型")
+            params_by_kind = search.get("model_params_by_kind") or {}
+            if not isinstance(params_by_kind, Mapping):
+                raise ModelResearchError("model_params_by_kind必须是对象")
+            normalized_trials = []
+            for kind in model_kinds:
+                trial_kind = str(kind).strip().lower()
+                params_source = params_by_kind.get(trial_kind) or {}
+                if not isinstance(params_source, Mapping):
+                    raise ModelResearchError(f"{trial_kind}的参数配置无效")
+                normalized_trials.append({
+                    "dataset": dataset,
+                    "model": _model_spec({
+                        "kind": trial_kind, "params": params_source,
+                    }),
+                    "search_params": {"model_kind": trial_kind},
+                })
         else:
             dataset = _dataset_spec(dataset_source)
             trials = _grid_search_trials(model_source, search)
@@ -468,6 +523,9 @@ class ModelResearchRepository:
                     else f"{experiment_title} · {index}/{trial_count} · "
                     f"{trial['search_params']['removed_factor_id']}"
                     if strategy == "factor_ablation"
+                    else f"{experiment_title} · {index}/{trial_count} · "
+                    f"{trial['model']['kind']}"
+                    if strategy == "model_ensemble"
                     else f"{experiment_title} · {index}/{trial_count}"
                 ),
                 "model_id": model_id,
@@ -2532,9 +2590,9 @@ def _experiment_ref(source: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(search_params, Mapping) or not search_params:
         raise ModelResearchError("参数实验缺少search_params")
     strategy = str(source.get("strategy") or "grid").strip().lower()
-    if strategy not in {"grid", "horizon_grid", "factor_ablation"}:
+    if strategy not in {"grid", "horizon_grid", "factor_ablation", "model_ensemble"}:
         raise ModelResearchError(
-            "实验策略只支持grid、horizon_grid或factor_ablation"
+            "实验策略只支持grid、horizon_grid、factor_ablation或model_ensemble"
         )
     parent_experiment_id = str(source.get("parent_experiment_id") or "").strip()
     parent_job_id = str(source.get("parent_job_id") or "").strip()
@@ -2618,6 +2676,12 @@ def _experiment_summary(
             **selection,
             "policy": "alphablocks.factor-ablation-selection.v1",
             "selection_unit": "removed_factor_id",
+        }
+    elif strategy == "model_ensemble":
+        selection = {
+            **selection,
+            "policy": "alphablocks.model-ensemble-selection.v1",
+            "selection_unit": "model_kind",
         }
     dataset_hashes = sorted({
         str(job.get("dataset_hash") or "") for job in jobs
@@ -4137,6 +4201,28 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
                 "random_strength": 1.0, "early_stopping_rounds": 50,
             },
         },
+        "random_forest": {
+            "qlib_model": "factor_service.research.models.QlibSklearnRandomForestModel",
+            "allowed": {
+                "n_estimators", "max_depth", "min_samples_split",
+                "min_samples_leaf", "max_features", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "n_estimators": 500, "max_depth": 0,
+                "min_samples_split": 2, "min_samples_leaf": 1,
+                "max_features": 1.0,
+            },
+        },
+        "linear": {
+            "qlib_model": "factor_service.research.models.QlibSklearnRidgeModel",
+            "allowed": {
+                "alpha", "fit_intercept", "solver", "max_iter", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "alpha": 1.0, "fit_intercept": False,
+                "solver": "auto", "max_iter": 1000,
+            },
+        },
         "mlp": {
             "qlib_model": "factor_service.research.models.QlibTorchMLPModel",
             "allowed": {
@@ -4148,6 +4234,22 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
                 "loss": "mse", "learning_rate": 0.001,
                 "hidden_layers": [64, 128, 256],
                 "max_steps": 300, "batch_size": 2048,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "gru": {
+            "qlib_model": "factor_service.research.models.QlibTorchGRUModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "hidden_size", "num_layers",
+                "dropout", "max_steps", "batch_size", "early_stopping_rounds",
+                "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "hidden_size": 128,
+                "num_layers": 2, "dropout": 0.2,
+                "max_steps": 300, "batch_size": 512,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4164,6 +4266,88 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
                 "lookback_window": 60, "hidden_size": 128,
                 "num_layers": 2, "dropout": 0.2,
                 "max_steps": 300, "batch_size": 512,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "alstm": {
+            "qlib_model": "factor_service.research.models.QlibTorchALSTMModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "hidden_size", "num_layers",
+                "dropout", "max_steps", "batch_size", "early_stopping_rounds",
+                "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "hidden_size": 128,
+                "num_layers": 2, "dropout": 0.2,
+                "max_steps": 300, "batch_size": 512,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "transformer": {
+            "qlib_model": "factor_service.research.models.QlibTorchTransformerModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "d_model", "nhead",
+                "transformer_layers", "dim_feedforward", "dropout",
+                "max_steps", "batch_size", "early_stopping_rounds",
+                "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "d_model": 64, "nhead": 4,
+                "transformer_layers": 2, "dim_feedforward": 256,
+                "dropout": 0.2, "max_steps": 300, "batch_size": 256,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "tabnet": {
+            "qlib_model": "factor_service.research.models.QlibNativeTabNetAdapter",
+            "allowed": {
+                "learning_rate", "n_d", "n_a", "n_steps", "n_shared",
+                "n_ind", "batch_size", "max_steps", "early_stopping_rounds",
+                "pretrain", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.01, "n_d": 64, "n_a": 64,
+                "n_steps": 5, "n_shared": 2, "n_ind": 2,
+                "batch_size": 4096, "max_steps": 100,
+                "early_stopping_rounds": 20, "pretrain": False,
+            },
+        },
+        "tcn": {
+            "qlib_model": "factor_service.research.models.QlibTorchTCNModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "hidden_size",
+                "kernel_size", "num_layers", "dropout", "max_steps",
+                "batch_size", "early_stopping_rounds", "eval_steps",
+                "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "hidden_size": 128,
+                "kernel_size": 5, "num_layers": 5, "dropout": 0.5,
+                "max_steps": 300, "batch_size": 256,
+                "early_stopping_rounds": 10, "eval_steps": 10,
+                "weight_decay": 0.0001,
+            },
+        },
+        "nativetft": {
+            "qlib_model": "factor_service.research.models.QlibTorchNativeTFTModel",
+            "allowed": {
+                "learning_rate", "lookback_window", "d_model", "nhead",
+                "gru_hidden_size", "num_layers", "dim_feedforward", "dropout",
+                "max_steps", "batch_size", "early_stopping_rounds",
+                "eval_steps", "weight_decay", "num_threads",
+            },
+            "defaults": {
+                "loss": "mse", "learning_rate": 0.001,
+                "lookback_window": 60, "d_model": 64, "nhead": 4,
+                "gru_hidden_size": 64, "num_layers": 1,
+                "dim_feedforward": 128, "dropout": 0.2,
+                "max_steps": 300, "batch_size": 256,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4189,7 +4373,9 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     }
     if kind not in definitions:
         raise ModelResearchError(
-            "model.kind只允许lightgbm、xgboost、catboost、mlp、lstm或transformer_lstm"
+            "model.kind只允许lightgbm、xgboost、catboost、random_forest、"
+            "linear、mlp、gru、lstm、alstm、transformer、tabnet、tcn、"
+            "nativetft或transformer_lstm"
         )
     definition = definitions[kind]
     allowed = definition["allowed"]
@@ -4219,7 +4405,7 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "data_random_seed": 42,
         })
     defaults.update(params)
-    if kind == "transformer_lstm":
+    if kind in {"transformer", "nativetft", "transformer_lstm"}:
         try:
             d_model = int(defaults["d_model"])
             nhead = int(defaults["nhead"])
