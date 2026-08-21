@@ -15,6 +15,10 @@ from psycopg.types.json import Jsonb
 
 from factor_service.control_database import ControlDatabase, get_control_database
 from factor_service.factor_backtest import UNIVERSES
+from factor_service.entity_field_feature import (
+    is_entity_field_feature,
+    normalize_entity_field_feature,
+)
 from factor_service.model_validation import select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
 
@@ -4009,13 +4013,27 @@ def _research_template_spec(source: Mapping[str, Any]) -> dict[str, Any]:
 def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     factors = source.get("factors")
     if not isinstance(factors, list) or not factors:
-        raise ModelResearchError("至少选择一个因子")
+        raise ModelResearchError("至少选择一个训练特征")
     if len(factors) > 100:
-        raise ModelResearchError("一次最多选择100个因子")
+        raise ModelResearchError("一次最多选择100个训练特征")
     normalized_factors = []
     seen: set[tuple[str, int, str]] = set()
     for item in factors:
         item = item if isinstance(item, Mapping) else {}
+        if is_entity_field_feature(item):
+            try:
+                normalized = normalize_entity_field_feature(item)
+            except ValueError as exc:
+                raise ModelResearchError(str(exc)) from exc
+            key = (
+                normalized["factor_id"],
+                normalized["factor_version"],
+                normalized["params_hash"],
+            )
+            if key not in seen:
+                seen.add(key)
+                normalized_factors.append(normalized)
+            continue
         factor_id = str(item.get("factor_id") or "").strip()
         version = int(item.get("factor_version") or item.get("version") or 0)
         params_hash = str(item.get("params_hash") or "").strip()

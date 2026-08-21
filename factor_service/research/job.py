@@ -9,6 +9,10 @@ import threading
 from typing import Any, Callable
 
 from factor_service.factor_backtest import UNIVERSES
+from factor_service.entity_field_feature import (
+    is_entity_field_feature,
+    validate_entity_field_feature_identity,
+)
 from factor_service.research.errors import JobCanceled, PermanentJobError, WorkerShutdown
 
 
@@ -106,6 +110,11 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             raise PermanentJobError(f"因子{factor_id}的params_hash无效")
         if not isinstance(factor.get("params"), dict):
             raise PermanentJobError(f"因子{factor_id}缺少冻结params")
+        if is_entity_field_feature(factor):
+            try:
+                validate_entity_field_feature_identity(factor)
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
         key = (factor_id, version, params_hash)
         if key in seen:
             raise PermanentJobError(f"因子{factor_id}重复")

@@ -40,6 +40,11 @@ sources:
     stock_basic_table: stock_basic_factor_source
     stock_basic_type_column: type
     stock_basic_stock_type_value: "1"
+    # Used only when a formula references an authorized stock entity-asset
+    # field that is not already materialized in stock_daily_factor_source.
+    entity_asset_api_base_url: http://127.0.0.1:8001/api/data-sdk
+    entity_asset_query_timeout_seconds: 120
+    entity_asset_query_concurrency: 4
   research:
     database: starlight
 

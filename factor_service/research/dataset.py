@@ -13,10 +13,14 @@ import numpy as np
 import pandas as pd
 
 from factor_service import repository as factor_repository
+from factor_service.entity_field_feature import (
+    is_entity_field_feature,
+    virtual_entity_field_factor,
+)
 from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
-from factor_service.worker import build_factor_query_plan
+from factor_service.worker import build_factor_query_plan, factor_query_source
 
 
 FACTOR_COMPUTED_CUTOFF = "computed_at <= {cutoff:DateTime}"
@@ -471,13 +475,17 @@ class DatasetBuilder:
         ).replace(hour=15)
         if cutoff < signal_close:
             raise ValueError(f"因子{item['factor_id']}的数据截止时间早于信号日收盘")
-        factor = factor_repository.get_factor(
-            str(item["factor_id"]), version=int(item["factor_version"]),
-        )
-        if factor is None:
-            raise ValueError(
-                f"冻结因子不存在: {item['factor_id']} v{item['factor_version']}"
+        entity_field = is_entity_field_feature(item)
+        if entity_field:
+            factor = virtual_entity_field_factor(item)
+        else:
+            factor = factor_repository.get_factor(
+                str(item["factor_id"]), version=int(item["factor_version"]),
             )
+            if factor is None:
+                raise ValueError(
+                    f"冻结因子不存在: {item['factor_id']} v{item['factor_version']}"
+                )
         params = item.get("params")
         if not isinstance(params, dict):
             raise ValueError(f"冻结因子{item['factor_id']}缺少params")
@@ -491,33 +499,40 @@ class DatasetBuilder:
                 chunk_start + timedelta(days=FACTOR_QUERY_CHUNK_DAYS - 1),
                 final_end,
             )
-            plan = build_factor_query_plan(
+            with factor_query_source(
                 factor,
                 overrides=params,
-                entity_type="stock",
                 date_start=chunk_start,
                 date_end=chunk_end,
                 job_id="model-dataset",
-            )
-            if plan.params_hash != expected_hash:
-                raise ValueError(
-                    f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+            ) as source_binding:
+                plan = build_factor_query_plan(
+                    factor,
+                    overrides=params,
+                    entity_type="stock",
+                    date_start=chunk_start,
+                    date_end=chunk_end,
+                    job_id="model-dataset",
+                    source_binding=source_binding,
                 )
-            # The canonical query retains its own factor-specific lookback for
-            # every chunk. Only the requested output dates are concatenated, so
-            # rolling windows stay identical at chunk boundaries while the
-            # ClickHouse working set remains bounded on long research ranges.
-            feature_sql = f"""
-            SELECT trade_date, entity_code, score AS value
-            FROM (
-                {plan.sql}
-            )
-            """
-            rows.extend(
-                self.client.query(
-                    feature_sql, parameters=plan.params,
-                ).result_rows
-            )
+                if not entity_field and plan.params_hash != expected_hash:
+                    raise ValueError(
+                        f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+                    )
+                # The canonical query retains its own factor-specific lookback
+                # for every chunk. Only requested output dates are concatenated,
+                # so rolling windows stay identical at chunk boundaries.
+                feature_sql = f"""
+                SELECT trade_date, entity_code, score AS value
+                FROM (
+                    {plan.sql}
+                )
+                """
+                rows.extend(
+                    self.client.query(
+                        feature_sql, parameters=plan.params,
+                    ).result_rows
+                )
             chunk_start = chunk_end + timedelta(days=1)
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument", "value"])
         if not frame.empty:

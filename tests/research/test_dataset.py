@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import pandas as pd
 import pytest
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from factor_service.research.dataset import (
 )
 from factor_service.research.errors import JobCanceled
 from factor_service.research.job import CancellationToken
+from factor_service.entity_field_feature import normalize_entity_field_feature
 from tests.research.utils import valid_job
 
 
@@ -337,6 +339,10 @@ def test_factor_query_calculates_on_demand_without_factor_value_persistence(monk
             params_hash="a" * 64,
         ),
     )
+    monkeypatch.setattr(
+        dataset_module, "factor_query_source",
+        lambda *args, **kwargs: nullcontext(None),
+    )
 
     frame = builder._factor_values(
         {
@@ -351,6 +357,60 @@ def test_factor_query_calculates_on_demand_without_factor_value_persistence(monk
     assert "score AS value" in builder.client.query_text
     assert "factor_values_daily" not in builder.client.query_text
     assert "INSERT" not in builder.client.query_text.upper()
+
+
+def test_entity_asset_field_query_uses_virtual_definition_without_factor_repository(monkeypatch) -> None:
+    class _Client:
+        def query(self, query, parameters):
+            return SimpleNamespace(result_rows=[
+                (pd.Timestamp("2024-01-02"), "000001.SZ", 0.5),
+            ])
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace()
+    builder.client = _Client()
+    feature = normalize_entity_field_feature({
+        "feature_kind": "entity_field",
+        "factor_id": "entity_stock_daily_close_1234abcd",
+        "entity_id": "stock",
+        "asset_id": "asset_stock_daily_stock_daily_real",
+        "asset_name": "股票日线数据",
+        "asset_updated_at": "2026-08-12T16:14:50+00:00",
+        "provider_node": "stock_daily_real",
+        "field": "close",
+        "label": "收盘价",
+        "data_type": "number",
+    })
+    monkeypatch.setattr(
+        dataset_module.factor_repository,
+        "get_factor",
+        lambda *_args, **_kwargs: pytest.fail("实体字段不应读取因子定义库"),
+    )
+    captured = {}
+
+    def fake_plan(factor, **kwargs):
+        captured["factor"] = factor
+        return SimpleNamespace(
+            sql="SELECT trade_date, entity_code, score FROM entity_asset_daily",
+            params={"date_start": kwargs["date_start"], "date_end": kwargs["date_end"]},
+            params_hash="b" * 64,
+        )
+
+    monkeypatch.setattr(dataset_module, "build_factor_query_plan", fake_plan)
+    monkeypatch.setattr(
+        dataset_module, "factor_query_source", lambda *args, **kwargs: nullcontext(None),
+    )
+
+    frame = builder._factor_values(
+        feature,
+        pd.Timestamp("2024-01-02 15:00:00").to_pydatetime(),
+        "2024-01-02",
+        "2024-01-02",
+    )
+
+    assert frame["value"].tolist() == [0.5]
+    assert captured["factor"].expression == "$close"
+    assert captured["factor"].category == "基础行情"
 
 
 def test_factor_query_chunks_long_ranges_without_losing_boundaries(monkeypatch) -> None:
@@ -379,6 +439,10 @@ def test_factor_query_chunks_long_ranges_without_losing_boundaries(monkeypatch) 
             params={"date_start": kwargs["date_start"], "date_end": kwargs["date_end"]},
             params_hash="a" * 64,
         ),
+    )
+    monkeypatch.setattr(
+        dataset_module, "factor_query_source",
+        lambda *args, **kwargs: nullcontext(None),
     )
 
     frame = builder._factor_values(
@@ -409,6 +473,10 @@ def test_factor_query_rejects_changed_frozen_params(monkeypatch) -> None:
     monkeypatch.setattr(
         dataset_module, "build_factor_query_plan",
         lambda *args, **kwargs: SimpleNamespace(sql="SELECT 1", params={}, params_hash="b" * 64),
+    )
+    monkeypatch.setattr(
+        dataset_module, "factor_query_source",
+        lambda *args, **kwargs: nullcontext(None),
     )
 
     with pytest.raises(ValueError, match="params_hash"):

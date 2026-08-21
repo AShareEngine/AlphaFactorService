@@ -18,7 +18,6 @@ from factor_service.api.models import router as models_router
 from factor_service.api.research import router as research_router
 from factor_service.api.values import router as values_router
 from factor_service.clickhouse import init_schema, settings
-from factor_service.builtin_factors import ensure_builtin_factor_definitions
 from factor_service.research.config import load_settings as load_research_settings
 from factor_service.research.worker import ResearchWorker
 
@@ -41,7 +40,6 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         init_schema()
-        ensure_builtin_factor_definitions()
         worker = ResearchWorker(load_research_settings())
         worker.start()
         app.state.research_worker = worker

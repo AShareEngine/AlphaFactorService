@@ -37,3 +37,12 @@
 [112594424ms] [LOG] [vite] server connection lost. Polling for restart... @ http://127.0.0.1:3000/_nuxt/@vite/client:864
 [112594992ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
 [112595072ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51
+[135346521ms] [LOG] [vite] server connection lost. Polling for restart... @ http://127.0.0.1:3000/_nuxt/@vite/client:864
+[135347249ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[135347360ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51
+[136610052ms] [ERROR] Failed to load resource: the server responded with a status of 502 (Bad Gateway) @ http://127.0.0.1:3000/api/sync-table-status:0
+[136763143ms] [LOG] [vite] server connection lost. Polling for restart... @ http://127.0.0.1:3000/_nuxt/@vite/client:864
+[136763163ms] [ERROR] Failed to load resource: net::ERR_NETWORK_IO_SUSPENDED @ http://127.0.0.1:3000/api/data-assets?_=1787221396027:0
+[136763709ms] [INFO] <Suspense> is an experimental feature and its API will likely change. @ http://127.0.0.1:3000/_nuxt/node_modules/@vue/runtime-core/dist/runtime-core.esm-bundler.js?v=954381be:7234
+[136763805ms] [LOG] ✨ %cNuxt DevTools %c Press Shift + Option + D to open DevTools color: black; border-radius: 3px 0 0 3px; padding: 2px 2px 1px 10px; background: #00DC82 border-radius: 0 3px 3px 0; padding: 2px 10px 1px 2px; background: #00DC8220  @ http://127.0.0.1:3000/_nuxt/node_modules/@nuxt/devtools/dist/runtime/plugins/devtools.client.js?v=954381be:51
+[141054861ms] [ERROR] Failed to load resource: the server responded with a status of 500 (INTERNAL SERVER ERROR) @ http://127.0.0.1:3000/api/model-research/models?_=1787222806962:0

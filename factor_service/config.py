@@ -34,6 +34,9 @@ class Settings:
     stock_basic_table: str
     stock_basic_type_column: str
     stock_basic_stock_type_value: str
+    entity_asset_api_base_url: str
+    entity_asset_query_timeout_seconds: float
+    entity_asset_query_concurrency: int
     model_database: str
     model_artifacts_root: Path
 
@@ -66,6 +69,15 @@ def load_settings() -> Settings:
         stock_basic_stock_type_value=str(
             source.get("stock_basic_stock_type_value") or "1"
         ).strip(),
+        entity_asset_api_base_url=str(
+            source.get("entity_asset_api_base_url") or ""
+        ).strip().rstrip("/"),
+        entity_asset_query_timeout_seconds=float(
+            source.get("entity_asset_query_timeout_seconds") or 120
+        ),
+        entity_asset_query_concurrency=max(
+            1, int(source.get("entity_asset_query_concurrency") or 4)
+        ),
         model_database=str(clickhouse.get("model_database") or "ab_model").strip(),
         model_artifacts_root=resolve_project_path(
             research_storage.get("model_artifacts_root"), "data/model_artifacts"

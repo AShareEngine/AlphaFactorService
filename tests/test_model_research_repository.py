@@ -83,6 +83,32 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     }
 
 
+def test_dataset_contract_freezes_stock_entity_asset_fields_without_factor_definition() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "factors": [{
+            "feature_kind": "entity_field",
+            "factor_id": "entity_stock_daily_close_1234abcd",
+            "entity_id": "stock",
+            "asset_id": "asset_stock_daily_stock_daily_real",
+            "asset_name": "股票日线数据",
+            "asset_updated_at": "2026-08-12T16:14:50+00:00",
+            "provider_node": "stock_daily_real",
+            "field": "close",
+            "label": "收盘价",
+            "data_type": "number",
+        }],
+    })
+
+    feature = spec["factors"][0]
+    assert feature["feature_kind"] == "entity_field"
+    assert feature["asset_id"] == "asset_stock_daily_stock_daily_real"
+    assert feature["field"] == "close"
+    assert feature["factor_version"] == 1
+    assert len(feature["params_hash"]) == 64
+    assert feature["params"] == {}
+
+
 def test_dataset_spec_accepts_custom_split_ratios() -> None:
     spec = _dataset_spec({
         **_source(),

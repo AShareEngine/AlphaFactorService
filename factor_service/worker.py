@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
@@ -8,10 +9,14 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Iterator, Optional
 
 from factor_service import repository
 from factor_service.clickhouse import client, settings
+from factor_service.entity_asset_source import (
+    FactorSourceBinding,
+    staged_entity_asset_source,
+)
 from factor_service.qlib_formula import compile_qlib_formula
 from factor_service.schemas import FactorJobOut, FactorOut
 
@@ -80,8 +85,19 @@ def run_job(job_id: str) -> FactorJobOut:
             raise ValueError(f"因子不存在: {job.factor_id}")
         if not factor.enabled:
             raise ValueError(f"因子已停用: {job.factor_id}")
-        plan = build_compute_plan(factor, job)
-        client().command(plan.sql, parameters=plan.params)
+        with factor_query_source(
+            factor,
+            overrides=job.params or {},
+            date_start=job.date_start,
+            date_end=job.date_end,
+            job_id=job.job_id,
+        ) as source_binding:
+            plan = build_compute_plan(
+                factor,
+                job,
+                source_binding=source_binding,
+            )
+            client().command(plan.sql, parameters=plan.params)
         _cleanup_superseded_values(plan)
         row_count = _count_job_values(job.job_id)
         return repository.update_job_status(
@@ -102,7 +118,90 @@ def run_job(job_id: str) -> FactorJobOut:
         )
 
 
-def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
+@contextmanager
+def factor_query_source(
+    factor: FactorOut,
+    *,
+    overrides: dict,
+    date_start: Optional[date],
+    date_end: Optional[date],
+    job_id: str,
+) -> Iterator[FactorSourceBinding]:
+    """Resolve the canonical source, staging the composite entity asset if needed."""
+
+    config = settings()
+    source_db = _identifier(config.source_database, "source database")
+    source_table = _identifier(config.stock_daily_table, "stock daily table")
+    code_column = _identifier(config.stock_code_column, "stock code column")
+    date_column = _identifier(config.stock_date_column, "stock date column")
+    resolved_start, resolved_end = _resolve_date_range(
+        date_start,
+        date_end,
+        source_db,
+        source_table,
+        date_column,
+    )
+    params = _formula_params(factor, overrides)
+    window = _positive_int(params.get("window", 20), "window")
+    compiled = compile_qlib_formula(
+        factor.expression,
+        params={**params, "window": window},
+        code_column=code_column,
+        date_column=date_column,
+    )
+    available_fields = _source_columns(source_db, source_table)
+    missing_fields = sorted(set(compiled.fields) - available_fields)
+    if not missing_fields:
+        yield FactorSourceBinding(
+            database=source_db,
+            table=source_table,
+            code_column=code_column,
+            date_column=date_column,
+            source_vintage=(
+                f"{source_db}.{source_table}@{resolved_end.isoformat()}"
+            ),
+            date_start=resolved_start,
+            date_end=resolved_end,
+        )
+        return
+
+    lookback_days = max(compiled.max_window * 4 + 20, 90)
+    source_start = resolved_start - timedelta(days=lookback_days)
+    trading_dates = _source_trading_dates(
+        source_db,
+        source_table,
+        date_column,
+        source_start,
+        resolved_end,
+    )
+    logger.info(
+        "factor %s uses composite entity asset fields %s across %s trading dates",
+        factor.factor_id,
+        ", ".join(missing_fields),
+        len(trading_dates),
+    )
+    with staged_entity_asset_source(
+        db_client=client(),
+        database=config.clickhouse_database,
+        api_base_url=config.entity_asset_api_base_url,
+        timeout_seconds=config.entity_asset_query_timeout_seconds,
+        concurrency=config.entity_asset_query_concurrency,
+        entity_id=factor.asset_id or factor.entity_type,
+        fields=compiled.fields,
+        trading_dates=trading_dates,
+        date_start=resolved_start,
+        date_end=resolved_end,
+        job_id=job_id,
+    ) as binding:
+        yield binding
+
+
+def build_compute_plan(
+    factor: FactorOut,
+    job: FactorJobOut,
+    *,
+    source_binding: FactorSourceBinding | None = None,
+) -> ComputePlan:
     query_plan = build_factor_query_plan(
         factor,
         overrides=job.params or {},
@@ -110,6 +209,7 @@ def build_compute_plan(factor: FactorOut, job: FactorJobOut) -> ComputePlan:
         date_start=job.date_start,
         date_end=job.date_end,
         job_id=job.job_id,
+        source_binding=source_binding,
     )
     config = settings()
     factor_db = _identifier(config.clickhouse_database, "factor database")
@@ -171,6 +271,7 @@ def build_factor_query_plan(
     date_start: Optional[date],
     date_end: Optional[date],
     job_id: str,
+    source_binding: FactorSourceBinding | None = None,
 ) -> FactorQueryPlan:
     """Build the canonical factor SELECT without persisting factor values."""
     if factor.frequency != "daily":
@@ -178,17 +279,30 @@ def build_factor_query_plan(
             "分钟因子必须由分钟计算器写入，daily worker 不接受 minute 因子"
         )
     config = settings()
-    source_db = _identifier(config.source_database, "source database")
-    source_table = _identifier(config.stock_daily_table, "stock daily table")
+    source_db = _identifier(
+        source_binding.database if source_binding else config.source_database,
+        "source database",
+    )
+    source_table = _identifier(
+        source_binding.table if source_binding else config.stock_daily_table,
+        "stock daily table",
+    )
+    code_column = _identifier(
+        source_binding.code_column if source_binding else config.stock_code_column,
+        "stock code column",
+    )
+    date_column = _identifier(
+        source_binding.date_column if source_binding else config.stock_date_column,
+        "stock date column",
+    )
+    stock_basic_db = _identifier(config.source_database, "stock basic database")
     stock_basic_table = _identifier(config.stock_basic_table, "stock basic table")
-    code_column = _identifier(config.stock_code_column, "stock code column")
-    date_column = _identifier(config.stock_date_column, "stock date column")
     stock_type_column = _identifier(config.stock_basic_type_column, "stock basic type column")
 
     params = _formula_params(factor, overrides)
     window = _positive_int(params.get("window", 20), "window")
     source = f"{source_db}.{source_table}"
-    stock_basic = f"{source_db}.{stock_basic_table}"
+    stock_basic = f"{stock_basic_db}.{stock_basic_table}"
     universe_filter = f"""
         AND {code_column} IN (
             SELECT {code_column}
@@ -210,16 +324,22 @@ def build_factor_query_plan(
         output_type=factor.output_type,
         processing=processing,
     )
-    date_start, date_end = _resolve_date_range(
-        date_start, date_end, source_db, source_table, date_column,
-    )
+    if source_binding is not None:
+        date_start = source_binding.date_start
+        date_end = source_binding.date_end
+    else:
+        date_start, date_end = _resolve_date_range(
+            date_start, date_end, source_db, source_table, date_column,
+        )
     lookback_days = max(value_plan.max_window * 4 + 20, 90)
     source_start = date_start - timedelta(days=lookback_days)
     _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
     _ensure_source_has_rows(source, date_column, source_start, date_end)
     params_hash = _params_hash(factor.factor_id, factor.version, params)
     source_vintage = (
-        f"{source_db}.{source_table}@{date_end.isoformat()}#{job_id}"
+        f"{source_binding.source_vintage}#{job_id}"
+        if source_binding is not None
+        else f"{source_db}.{source_table}@{date_end.isoformat()}#{job_id}"
     )
     base_params = {
         "date_start": date_start,
@@ -475,11 +595,37 @@ def _resolve_date_range(
 
 
 def _ensure_source_columns(source_db: str, source_table: str, fields: list[str]) -> None:
-    rows = client().query(f"DESCRIBE TABLE {source_db}.{source_table}").result_rows
-    columns = {row[0] for row in rows}
+    columns = _source_columns(source_db, source_table)
     missing = sorted({field for field in fields if field not in columns})
     if missing:
         raise ValueError(f"源表缺少因子所需字段: {', '.join(missing)}")
+
+
+def _source_columns(source_db: str, source_table: str) -> set[str]:
+    rows = client().query(
+        f"DESCRIBE TABLE {source_db}.{source_table}"
+    ).result_rows
+    return {str(row[0]) for row in rows}
+
+
+def _source_trading_dates(
+    source_db: str,
+    source_table: str,
+    date_column: str,
+    date_start: date,
+    date_end: date,
+) -> list[date]:
+    rows = client().query(
+        f"""
+        SELECT DISTINCT toDate({date_column}) AS trade_date
+        FROM {source_db}.{source_table}
+        WHERE {date_column} >= {{date_start:Date}}
+          AND {date_column} <= {{date_end:Date}}
+        ORDER BY trade_date
+        """,
+        parameters={"date_start": date_start, "date_end": date_end},
+    ).result_rows
+    return [row[0] for row in rows]
 
 
 def _ensure_source_has_rows(source: str, date_column: str, source_start: date, date_end: date) -> None:

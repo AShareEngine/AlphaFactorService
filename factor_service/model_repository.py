@@ -12,6 +12,10 @@ import pandas as pd
 
 from factor_service import repository as factor_repository
 from factor_service.clickhouse import client, settings
+from factor_service.entity_field_feature import (
+    is_entity_field_feature,
+    validate_entity_field_feature_identity,
+)
 from factor_service.factor_backtest import UNIVERSES
 from factor_service.schemas import (
     ModelBacktestDailyOut,
@@ -3344,6 +3348,13 @@ def _factor_source_ready_dates(
     date_column = _source_identifier(config.stock_date_column, "source date column")
     coverage_checks: list[str] = []
     for index, item in enumerate(factors):
+        if is_entity_field_feature(item):
+            validate_entity_field_feature_identity(item)
+            coverage_checks.append(
+                f"countIf(isNotNull(source.{code_column})) / greatest(count(), 1) "
+                f">= {{minimum_coverage_{index}:Float64}}"
+            )
+            continue
         factor = factor_repository.get_factor(
             str(item.get("factor_id") or ""),
             version=int(item.get("factor_version") or 0),
@@ -3466,6 +3477,9 @@ def _factor_source_ready_dates(
 
 def _validate_frozen_factors(factors: list[dict]) -> None:
     for item in factors:
+        if is_entity_field_feature(item):
+            validate_entity_field_feature_identity(item)
+            continue
         factor_id = str(item.get("factor_id") or "")
         version = int(item.get("factor_version") or 0)
         params = item.get("params")

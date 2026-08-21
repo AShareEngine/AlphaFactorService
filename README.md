@@ -158,7 +158,9 @@ research:
 
 AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独的研究服务地址或端口。
 模型任务、事件、版本和产物元数据由AlphaFactorService直接写入`control_database`，
-AlphaFactorService不再配置或回调AlphaBlocks API。
+AlphaFactorService不通过AlphaBlocks API回写模型状态或元数据。只有当因子公式引用的字段尚未
+物化到本地因子源视图时，计算器才通过AlphaBlocks只读统一数据SDK查询股票实体资产的日频复合
+视图；字段授权、实体关系和财务PIT对齐仍由AlphaBlocks统一数据层负责。
 
 ### Walk-Forward滚动评估
 
@@ -214,7 +216,8 @@ clickhouse:
 
 其中`factor_database`是因子服务自己的库，默认`ab_factor`。
 
-因子计算的数据源单独配置，默认读取 `baostock.stock_daily_real`：
+因子计算的数据源单独配置，默认优先读取本地物化视图
+`ab_factor.stock_daily_factor_source`：
 
 ```yaml
 sources:
@@ -227,6 +230,9 @@ sources:
     stock_basic_table: stock_basic_factor_source
     stock_basic_type_column: type
     stock_basic_stock_type_value: "1"
+    entity_asset_api_base_url: http://127.0.0.1:8001/api/data-sdk
+    entity_asset_query_timeout_seconds: 120
+    entity_asset_query_concurrency: 4
 ```
 
 当前股票日频因子需要从多张实体资产表组合字段：行情来自 `starlight.ad_market_kline_daily`，
@@ -242,6 +248,12 @@ for statement in [item.strip() for item in Path("scripts/create_factor_source_vi
     client().command(statement)
 PY
 ```
+
+公式只引用上述物化视图已有字段时继续走ClickHouse快路径。若公式还引用了股票实体资产中已授权、
+但尚未物化的字段，worker会按交易日向统一数据SDK读取复合日频视图，并把本次公式所需列暂存到
+任务级ClickHouse表后复用同一套公式编译、去极值和标准化流程；任务结束后自动删除暂存表。
+该回退路径优先保证PIT和实体关系正确，长历史区间会比物化视图慢。公式计算目前只接受数值或布尔
+字段；文本字段即使可在字段目录中查看，也会在计算时返回明确错误。
 
 然后将计算源指向视图：
 
