@@ -24,6 +24,41 @@ def test_job_validation_accepts_frozen_contract() -> None:
     assert job["dataset_spec"]["universe_id"] == "csi500"
 
 
+def test_job_validation_accepts_classification_target_with_binary_loss() -> None:
+    source = valid_job()
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["target_mode"] = "classification"
+        target["label"] = {
+            "kind": "future_5d_direction",
+            "mode": "classification",
+            "horizon_trading_days": 5,
+            "range": [0.0, 1.0],
+            "classes": [0, 1],
+        }
+    source["config_json"]["model"]["params"]["loss"] = "binary"
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    job = validate_job(source)
+
+    assert job["dataset_spec"]["target_mode"] == "classification"
+    assert job["config_json"]["model"]["params"]["loss"] == "binary"
+
+
+def test_job_validation_rejects_classification_target_with_regression_loss() -> None:
+    source = valid_job()
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["target_mode"] = "classification"
+        target["label"]["mode"] = "classification"
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(PermanentJobError, match="binary"):
+        validate_job(source)
+
+
 def test_job_validation_accepts_all_a_universe() -> None:
     source = valid_job()
     for target in (source["dataset_spec"], source["config_json"]["dataset"]):

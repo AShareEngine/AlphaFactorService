@@ -79,6 +79,12 @@ class QlibTrainer:
         )
         prepared = snapshot.prepared
         config = dict(job.get("config_json") or {})
+        dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
+        label_spec = dict(dataset_spec.get("label") or {})
+        target_mode = str(
+            dataset_spec.get("target_mode") or label_spec.get("mode") or "return"
+        ).strip().lower()
+        classification = target_mode == "classification"
         walk_forward_config = dict(config.get("walk_forward") or {})
         incremental_config = dict(config.get("incremental_training") or {})
         source_model: Any | None = None
@@ -164,8 +170,12 @@ class QlibTrainer:
             )
             _checkpoint(cancellation)
             _progress(progress, "predicting", 82, {})
-            valid_prediction = model.predict(dataset, segment="valid")
-            test_prediction = model.predict(dataset, segment="test")
+            valid_prediction = _predict_dataset(
+                model, model_kind, dataset, "valid", classification=classification,
+            )
+            test_prediction = _predict_dataset(
+                model, model_kind, dataset, "test", classification=classification,
+            )
             if hasattr(model, "to_cpu"):
                 model.to_cpu()
             _prepare_model_for_serialization(model_kind, model)
@@ -181,10 +191,12 @@ class QlibTrainer:
         standard_metrics = _metrics(
             test_prediction, training_prepared.frame,
             training_prepared.segments["test"],
+            classification=classification,
         )
         raw_validation_metrics = _metrics(
             valid_prediction, training_prepared.frame,
             training_prepared.segments["valid"],
+            classification=classification,
         )
         validation_metrics = {
             "rows": raw_validation_metrics["test_rows"],
@@ -193,6 +205,11 @@ class QlibTrainer:
             "ic": raw_validation_metrics["ic"],
             "rank_ic": raw_validation_metrics["rank_ic"],
             "ic_ir": raw_validation_metrics["ic_ir"],
+            **{
+                key: raw_validation_metrics[key]
+                for key in ("auc", "log_loss", "accuracy", "precision", "recall", "f1")
+                if key in raw_validation_metrics
+            },
         }
         if walk_forward_report is not None:
             metrics: dict[str, Any] = {
@@ -214,7 +231,6 @@ class QlibTrainer:
         training_diagnostics = build_training_diagnostics(
             model_kind, evals_result, model_params,
         )
-        dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
         research_target = str(
             dataset_spec.get("research_target") or "stock_selection"
         )
@@ -229,6 +245,7 @@ class QlibTrainer:
             "model_kind": model_kind,
             "research_target": research_target,
             "prediction_scope": prediction_scope,
+            "target_mode": target_mode,
             "execution": dict(config.get("execution") or {"node_id": "local", "mode": "local"}),
             "model_version": int((job.get("config_json") or {}).get("planned_model_version") or 1),
             "qlib_recorder_id": recorder_id,
@@ -445,6 +462,7 @@ def _run_walk_forward(
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
 ) -> tuple[pd.Series, dict[str, Any]]:
+    classification = str(raw_params.get("loss") or "mse") == "binary"
     raw_frame = prepared.raw_frame
     if raw_frame is None:
         raise ValueError("Walk-Forward缺少未填充的冻结数据集")
@@ -490,8 +508,13 @@ def _run_walk_forward(
             progress_details=details,
             metric_prefix=f"walk_forward.window_{index}.",
         )
-        prediction = model.predict(dataset, segment="test")
-        window_metrics = _metrics(prediction, raw_frame, segments["test"])
+        prediction = _predict_dataset(
+            model, model_kind, dataset, "test", classification=classification,
+        )
+        window_metrics = _metrics(
+            prediction, raw_frame, segments["test"],
+            classification=classification,
+        )
         predictions.append(prediction)
         reports.append({
             "window": index,
@@ -507,6 +530,7 @@ def _run_walk_forward(
         stitched,
         raw_frame,
         (windows[0]["test"][0], windows[-1]["test"][1]),
+        classification=classification,
     )
     window_ics = np.asarray([float(item["metrics"]["ic"]) for item in reports], dtype=float)
     aggregate.update({
@@ -833,7 +857,7 @@ def _progress(
 
 def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
     return {
-        "loss": "mse",
+        "loss": str(source.get("loss") or "mse"),
         "learning_rate": float(source.get("learning_rate", 0.05)),
         "num_leaves": int(source.get("num_leaves", 31)),
         "max_depth": int(source.get("max_depth", -1)),
@@ -856,6 +880,8 @@ def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
 
 
 def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tuple[Any, dict[str, Any]]:
+    loss = str(source.get("loss") or "mse").strip().lower()
+    classification = loss == "binary"
     if kind == "lightgbm":
         from qlib.contrib.model.gbdt import LGBModel
 
@@ -867,8 +893,8 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         except ImportError as exc:
             raise RuntimeError("XGBoost尚未安装，请执行uv sync") from exc
         params = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
+            "objective": "binary:logistic" if classification else "reg:squarederror",
+            "eval_metric": "logloss" if classification else "rmse",
             "eta": float(source.get("learning_rate", 0.05)),
             "max_depth": int(source.get("max_depth", 6)),
             "subsample": float(source.get("subsample", 0.9)),
@@ -885,8 +911,12 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         model = XGBModel(**params)
         model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
-        return model, {**params, "num_boost_round": model._alphablocks_num_boost_round,
-                       "early_stopping_rounds": model._alphablocks_early_stopping_rounds}
+        return model, {
+            **params,
+            "loss": loss,
+            "num_boost_round": model._alphablocks_num_boost_round,
+            "early_stopping_rounds": model._alphablocks_early_stopping_rounds,
+        }
     if kind == "catboost":
         try:
             from qlib.contrib.model.catboost_model import CatBoostModel
@@ -903,11 +933,16 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         }
         if str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu") == "cuda":
             params.update({"task_type": "GPU", "devices": "0"})
-        model = CatBoostModel(loss="RMSE", **params)
+        model = CatBoostModel(loss="Logloss" if classification else "RMSE", **params)
+        model._alphablocks_loss = loss
         model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
-        return model, {**params, "num_boost_round": model._alphablocks_num_boost_round,
-                       "early_stopping_rounds": model._alphablocks_early_stopping_rounds}
+        return model, {
+            **params,
+            "loss": loss,
+            "num_boost_round": model._alphablocks_num_boost_round,
+            "early_stopping_rounds": model._alphablocks_early_stopping_rounds,
+        }
     if kind == "mlp":
         try:
             import torch
@@ -923,6 +958,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
                 source.get("layer_count", 2)
             )
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "max_steps": int(source.get("max_steps", 300)),
             "batch_size": int(source.get("batch_size", 2048)),
@@ -943,6 +979,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibTorchLSTMModel
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "hidden_size": int(source.get("hidden_size", 128)),
@@ -966,6 +1003,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibTorchTransformerLSTMModel
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "d_model": int(source.get("d_model", 64)),
@@ -996,6 +1034,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             from factor_service.research.models import QlibTorchALSTMModel as ModelClass
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "hidden_size": int(source.get("hidden_size", 128)),
@@ -1019,6 +1058,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibTorchTransformerModel
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "d_model": int(source.get("d_model", 64)),
@@ -1044,6 +1084,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibTorchTCNModel
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "hidden_size": int(source.get("hidden_size", 128)),
@@ -1068,6 +1109,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibTorchNativeTFTModel
 
         params = {
+            "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
             "lookback_window": int(source.get("lookback_window", 60)),
             "d_model": int(source.get("d_model", 64)),
@@ -1094,6 +1136,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibNativeTabNetAdapter
 
         params = {
+            "loss": loss,
             "lr": float(source.get("learning_rate", 0.01)),
             "n_d": int(source.get("n_d", 64)),
             "n_a": int(source.get("n_a", 64)),
@@ -1111,6 +1154,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibSklearnRidgeModel
 
         params = {
+            "loss": loss,
             "alpha": float(source.get("alpha", 1.0)),
             "fit_intercept": bool(source.get("fit_intercept", False)),
             "solver": str(source.get("solver", "auto")),
@@ -1124,6 +1168,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         from factor_service.research.models import QlibSklearnRandomForestModel
 
         params = {
+            "loss": loss,
             "n_estimators": int(source.get("n_estimators", 500)),
             "max_depth": int(source.get("max_depth", 0)),
             "min_samples_split": int(source.get("min_samples_split", 2)),
@@ -1164,6 +1209,27 @@ def _dataset_for_model(
     )
 
 
+def _predict_dataset(
+    model: Any,
+    model_kind: str,
+    dataset: Any,
+    segment: str,
+    *,
+    classification: bool,
+) -> pd.Series:
+    if model_kind == "catboost" and classification:
+        from qlib.data.dataset import DataHandlerLP
+
+        features = dataset.prepare(
+            segment, col_set="feature", data_key=DataHandlerLP.DK_I,
+        )
+        probabilities = np.asarray(
+            model.model.predict_proba(features.values), dtype=float,
+        )
+        return pd.Series(probabilities[:, 1], index=features.index)
+    return model.predict(dataset, segment=segment)
+
+
 def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -> np.ndarray:
     """Predict an already preprocessed feature frame from a serialized Qlib model."""
     if model_kind == "xgboost":
@@ -1178,6 +1244,12 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
     if predictor is None or not hasattr(predictor, "predict"):
         raise ValueError(f"{model_kind}模型产物不包含可用预测器")
     values = features.values if model_kind in {"lightgbm", "catboost"} else features
+    if (
+        (model_kind == "catboost" and getattr(model, "_alphablocks_loss", "mse") == "binary")
+        or getattr(model, "classification", False)
+    ) and hasattr(predictor, "predict_proba"):
+        probabilities = np.asarray(predictor.predict_proba(values), dtype=float)
+        return probabilities[:, 1]
     return np.asarray(predictor.predict(values), dtype=float).reshape(-1)
 
 
@@ -1235,7 +1307,13 @@ def _prediction_frame(prediction: pd.Series, prepared: PreparedDataset, job: dic
     return frame
 
 
-def _metrics(prediction: pd.Series, qlib_frame: pd.DataFrame, test_segment: tuple[str, str]) -> dict[str, float | int]:
+def _metrics(
+    prediction: pd.Series,
+    qlib_frame: pd.DataFrame,
+    test_segment: tuple[str, str],
+    *,
+    classification: bool = False,
+) -> dict[str, float | int]:
     label = qlib_frame[("label", "LABEL0")]
     start, end = test_segment
     label = label.loc[pd.IndexSlice[start:end, :]]
@@ -1248,7 +1326,7 @@ def _metrics(prediction: pd.Series, qlib_frame: pd.DataFrame, test_segment: tupl
     rmse = float(np.sqrt(np.mean(np.square(aligned["prediction"] - aligned["label"]))))
     ic_mean = float(daily_ic.mean()) if not daily_ic.empty else 0.0
     ic_std = float(daily_ic.std(ddof=1)) if len(daily_ic) > 1 else 0.0
-    return {
+    result: dict[str, float | int] = {
         "test_rows": int(len(aligned)),
         "test_days": int(aligned.index.get_level_values("datetime").nunique()),
         "rmse": rmse,
@@ -1256,6 +1334,34 @@ def _metrics(prediction: pd.Series, qlib_frame: pd.DataFrame, test_segment: tupl
         "rank_ic": ic_mean,
         "ic_ir": ic_mean / ic_std if ic_std else 0.0,
     }
+    if classification and not aligned.empty:
+        from sklearn.metrics import (
+            accuracy_score,
+            f1_score,
+            log_loss,
+            precision_score,
+            recall_score,
+            roc_auc_score,
+        )
+
+        labels = aligned["label"].astype(int).to_numpy()
+        probabilities = np.clip(
+            aligned["prediction"].astype(float).to_numpy(), 1e-7, 1.0 - 1e-7,
+        )
+        predicted = (probabilities >= 0.5).astype(int)
+        result.update({
+            "auc": (
+                float(roc_auc_score(labels, probabilities))
+                if np.unique(labels).size == 2 else 0.5
+            ),
+            "log_loss": float(log_loss(labels, probabilities, labels=[0, 1])),
+            "accuracy": float(accuracy_score(labels, predicted)),
+            "precision": float(precision_score(labels, predicted, zero_division=0)),
+            "recall": float(recall_score(labels, predicted, zero_division=0)),
+            "f1": float(f1_score(labels, predicted, zero_division=0)),
+            "positive_rate": float(np.mean(labels)),
+        })
+    return result
 
 
 def _feature_importance(model: Any, feature_names: list[str]) -> list[dict[str, float | str | int]]:

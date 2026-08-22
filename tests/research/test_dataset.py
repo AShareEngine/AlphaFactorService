@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from factor_service.research import dataset as dataset_module
 from factor_service.research.dataset import (
     DatasetBuilder,
+    _future_direction_label,
     _future_rank_label,
     _industry_features,
     _industry_rank_label,
@@ -35,6 +36,24 @@ def test_future_five_day_label_is_cross_sectional_and_centered() -> None:
 
     assert first["A"] == pytest.approx(1.0)
     assert first["B"] == pytest.approx(0.0)
+
+
+def test_future_direction_label_matches_quantmind_binary_definition() -> None:
+    dates = pd.date_range("2024-01-02", periods=3, freq="B")
+    prices = pd.DataFrame([
+        {"trade_date": day, "instrument": code, "adjusted_close": value}
+        for day, rows in (
+            (dates[0], (("UP", 10.0), ("DOWN", 10.0), ("FLAT", 10.0))),
+            (dates[1], (("UP", 11.0), ("DOWN", 9.0), ("FLAT", 10.0))),
+            (dates[2], (("UP", 12.0), ("DOWN", 8.0), ("FLAT", 10.0))),
+        )
+        for code, value in rows
+    ])
+
+    labels = _future_direction_label(prices, horizon=1)
+    first = labels[labels["trade_date"] == dates[0]].set_index("instrument")["LABEL0"]
+
+    assert first.to_dict() == {"DOWN": 0.0, "FLAT": 0.0, "UP": 1.0}
 
 
 def test_market_style_features_use_daily_pit_market_cap_halves() -> None:

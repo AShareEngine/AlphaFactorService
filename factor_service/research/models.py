@@ -17,6 +17,7 @@ class QlibTorchMLPModel:
         learning_rate: float = 0.001, max_steps: int = 300, batch_size: int = 2048,
         early_stopping_rounds: int = 10, eval_steps: int = 10,
         weight_decay: float = 0.0001, seed: int = 42, num_threads: int = 4,
+        loss: str = "mse",
     ) -> None:
         import torch
         from torch import nn
@@ -40,6 +41,8 @@ class QlibTorchMLPModel:
         self.weight_decay = float(weight_decay)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
+        self.loss = str(loss)
+        self.classification = self.loss == "binary"
         self.model_name = "MLP"
         # The scheduler executes jobs in a background Python thread. Reconfiguring
         # PyTorch's global CPU pool from that thread can deadlock on Apple Silicon;
@@ -78,7 +81,10 @@ class QlibTorchMLPModel:
         optimizer = torch.optim.AdamW(
             self.network.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
         )
-        loss_fn = torch.nn.MSELoss()
+        loss_fn = (
+            torch.nn.BCEWithLogitsLoss()
+            if self.classification else torch.nn.MSELoss()
+        )
         generator = torch.Generator().manual_seed(self.seed)
         best_loss = float("inf")
         best_state = deepcopy(self.network.state_dict())
@@ -144,7 +150,10 @@ class QlibTorchMLPModel:
         self.network.eval()
         with torch.no_grad():
             values = torch.as_tensor(features.values, dtype=torch.float32, device=self.device)
-            return self.network(values).reshape(-1).cpu().numpy().astype(float)
+            output = self.network(values).reshape(-1)
+            if self.classification:
+                output = torch.sigmoid(output)
+            return output.cpu().numpy().astype(float)
 
     def get_feature_importance(self) -> list[float]:
         first = next(layer for layer in self.network if layer.__class__.__name__ == "Linear")
@@ -167,6 +176,7 @@ class QlibTorchLSTMModel:
         batch_size: int = 512, early_stopping_rounds: int = 10,
         eval_steps: int = 10, weight_decay: float = 0.0001,
         seed: int = 42, num_threads: int = 4,
+        loss: str = "mse",
     ) -> None:
         import torch
         from torch import nn
@@ -184,6 +194,8 @@ class QlibTorchLSTMModel:
         self.weight_decay = float(weight_decay)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
+        self.loss = str(loss)
+        self.classification = self.loss == "binary"
         self.model_name = "LSTM"
         if self.lookback_window < 2:
             raise ValueError("lookback_window必须至少为2")
@@ -224,7 +236,10 @@ class QlibTorchLSTMModel:
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        loss_fn = torch.nn.MSELoss()
+        loss_fn = (
+            torch.nn.BCEWithLogitsLoss()
+            if self.classification else torch.nn.MSELoss()
+        )
         generator = torch.Generator().manual_seed(self.seed)
         best_loss = float("inf")
         best_encoder = deepcopy(self.encoder.state_dict())
@@ -352,7 +367,10 @@ class QlibTorchLSTMModel:
                     continue
                 output = self._forward(
                     torch.as_tensor(features, dtype=torch.float32, device=self.device),
-                ).cpu().numpy().astype(float)
+                )
+                if self.classification:
+                    output = torch.sigmoid(output)
+                output = output.cpu().numpy().astype(float)
                 predictions.append(output)
                 positions.extend(valid_positions)
         if not predictions:
@@ -383,6 +401,7 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
         batch_size: int = 256, early_stopping_rounds: int = 10,
         eval_steps: int = 10, weight_decay: float = 0.0001,
         seed: int = 42, num_threads: int = 4,
+        loss: str = "mse",
     ) -> None:
         import torch
         from torch import nn
@@ -403,6 +422,7 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
             weight_decay=weight_decay,
             seed=seed,
             num_threads=num_threads,
+            loss=loss,
         )
         self.model_name = "Transformer+LSTM"
         self.d_model = int(d_model)
@@ -462,7 +482,7 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
 _SEQUENCE_BASE_PARAMS = frozenset({
     "input_dim", "lookback_window", "hidden_size", "num_layers", "dropout",
     "learning_rate", "max_steps", "batch_size", "early_stopping_rounds",
-    "eval_steps", "weight_decay", "seed", "num_threads",
+    "eval_steps", "weight_decay", "seed", "num_threads", "loss",
 })
 
 
@@ -773,7 +793,13 @@ class QlibTorchNativeTFTModel(QlibTorchLSTMModel):
 
 
 class _QlibSklearnMixin:
-    """sklearn回归器的Qlib数据集适配：fit/predict遵循Qlib Model接口。"""
+    """sklearn估计器的Qlib数据集适配：fit/predict遵循Qlib Model接口。"""
+
+    def _predict_values(self, features: Any) -> np.ndarray:
+        if getattr(self, "classification", False) and hasattr(self.model, "predict_proba"):
+            probabilities = np.asarray(self.model.predict_proba(features), dtype=float)
+            return probabilities[:, 1]
+        return np.asarray(self.model.predict(features), dtype=float).reshape(-1)
 
     def fit(
         self, dataset: Any, *, evals_result: dict[str, Any] | None = None,
@@ -797,7 +823,7 @@ class _QlibSklearnMixin:
         x_valid = np.asarray(valid["feature"].values, dtype=float)
         y_valid = np.asarray(valid["label"].values, dtype=float).reshape(-1)
         self.model.fit(x_train, y_train)
-        prediction = np.asarray(self.model.predict(x_valid), dtype=float).reshape(-1)
+        prediction = self._predict_values(x_valid)
         loss = float(np.sqrt(np.mean(np.square(prediction - y_valid))))
         evaluations.update({"train": [loss], "valid": [loss], "steps": [1]})
         self.fitted = True
@@ -817,7 +843,7 @@ class _QlibSklearnMixin:
             segment, col_set="feature", data_key=DataHandlerLP.DK_I,
         )
         values = np.asarray(frame.values, dtype=float)
-        predictions = np.asarray(self.model.predict(values), dtype=float).reshape(-1)
+        predictions = self._predict_values(values)
         return pd.Series(predictions, index=frame.index).sort_index()
 
     def to_cpu(self) -> None:
@@ -825,26 +851,40 @@ class _QlibSklearnMixin:
 
 
 class QlibSklearnRidgeModel(_QlibSklearnMixin):
-    """Ridge线性回归基线，sanity check用。"""
+    """Ridge回归或Logistic分类基线，sanity check用。"""
 
     def __init__(
         self, *, input_dim: int, alpha: float = 1.0,
         fit_intercept: bool = False, solver: str = "auto",
         max_iter: int = 1000, seed: int = 42, num_threads: int = 4,
+        loss: str = "mse",
     ) -> None:
-        from sklearn.linear_model import Ridge
+        from sklearn.linear_model import LogisticRegression, Ridge
 
         self.input_dim = int(input_dim)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
-        self.model = Ridge(
-            alpha=float(alpha),
-            fit_intercept=bool(fit_intercept),
-            solver=str(solver),
-            max_iter=int(max_iter),
-            random_state=int(seed),
-        )
-        self.model_name = "Ridge"
+        self.loss = str(loss)
+        self.classification = self.loss == "binary"
+        if self.classification:
+            regularization = max(float(alpha), 1e-12)
+            self.model = LogisticRegression(
+                C=1.0 / regularization,
+                fit_intercept=bool(fit_intercept),
+                solver="lbfgs",
+                max_iter=int(max_iter),
+                random_state=int(seed),
+            )
+            self.model_name = "LogisticRegression"
+        else:
+            self.model = Ridge(
+                alpha=float(alpha),
+                fit_intercept=bool(fit_intercept),
+                solver=str(solver),
+                max_iter=int(max_iter),
+                random_state=int(seed),
+            )
+            self.model_name = "Ridge"
         self.fitted = False
 
     def get_feature_importance(self) -> list[float]:
@@ -853,21 +893,25 @@ class QlibSklearnRidgeModel(_QlibSklearnMixin):
 
 
 class QlibSklearnRandomForestModel(_QlibSklearnMixin):
-    """随机森林回归基线，用于与Boosting模型对比。"""
+    """随机森林回归/分类基线，用于与Boosting模型对比。"""
 
     def __init__(
         self, *, input_dim: int, n_estimators: int = 500,
         max_depth: int = 0, min_samples_split: int = 2,
         min_samples_leaf: int = 1, max_features: float = 1.0,
         seed: int = 42, num_threads: int = 4,
+        loss: str = "mse",
     ) -> None:
-        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
         self.input_dim = int(input_dim)
         self.seed = int(seed)
         self.num_threads = int(num_threads)
+        self.loss = str(loss)
+        self.classification = self.loss == "binary"
         depth = int(max_depth)
-        self.model = RandomForestRegressor(
+        estimator_class = RandomForestClassifier if self.classification else RandomForestRegressor
+        self.model = estimator_class(
             n_estimators=int(n_estimators),
             max_depth=None if depth <= 0 else depth,
             min_samples_split=int(min_samples_split),
@@ -877,7 +921,7 @@ class QlibSklearnRandomForestModel(_QlibSklearnMixin):
             random_state=int(seed),
             verbose=0,
         )
-        self.model_name = "RandomForest"
+        self.model_name = "RandomForestClassifier" if self.classification else "RandomForest"
         self.fitted = False
 
     def get_feature_importance(self) -> list[float]:
@@ -892,6 +936,8 @@ class QlibNativeTabNetAdapter:
 
         self.input_dim = int(input_dim)
         self.kwargs = dict(kwargs)
+        self.loss = str(self.kwargs.pop("loss", "mse"))
+        self.classification = self.loss == "binary"
         self.seed = int(self.kwargs.get("seed", 42))
         self.device = _torch_device(torch)
         self.model = None
@@ -922,7 +968,7 @@ class QlibNativeTabNetAdapter:
         torch.manual_seed(self.seed)
         self.model = TabnetModel(
             d_feat=self.input_dim,
-            **{**self.kwargs, "batch_size": batch_size, "GPU": -1},
+            **{**self.kwargs, "loss": "mse", "batch_size": batch_size, "GPU": -1},
         )
         self.model.fit(dataset, evals_result=evaluations)
         self.fitted = True
@@ -942,7 +988,10 @@ class QlibNativeTabNetAdapter:
     def predict(self, dataset: Any, segment: str = "test") -> pd.Series:
         if self.model is None or not self.fitted:
             raise ValueError("TabNet模型尚未训练")
-        return self.model.predict(dataset, segment)
+        prediction = self.model.predict(dataset, segment)
+        if self.classification:
+            return prediction.clip(lower=0.0, upper=1.0)
+        return prediction
 
     def to_cpu(self) -> None:
         return None

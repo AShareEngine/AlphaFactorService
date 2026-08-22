@@ -110,7 +110,9 @@ class ModelResearchRepository:
 
     def create_training_job(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         spec = _dataset_spec(payload.get("dataset") or {})
-        model = _model_spec(payload.get("model") or {})
+        model = _model_spec(
+            payload.get("model") or {}, target_mode=spec["target_mode"],
+        )
         walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
         execution = _execution_spec(
             payload.get("execution") or {
@@ -238,7 +240,9 @@ class ModelResearchRepository:
         self, model_id: str, version: int, payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         dataset = _dataset_spec(payload.get("dataset") or {})
-        model = _model_spec(payload.get("model") or {})
+        model = _model_spec(
+            payload.get("model") or {}, target_mode=dataset["target_mode"],
+        )
         walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
         source_model = self.get_model(model_id, version)
         bundle = next((
@@ -4087,28 +4091,53 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         raise ModelResearchError("单周期标签必须是T+1至T+30交易日") from exc
     if horizon < 1 or horizon > 30:
         raise ModelResearchError("单周期标签必须是T+1至T+30交易日")
-    label = (
-        {
-            "kind": f"future_{horizon}d_market_style_rank",
+    target_mode = str(
+        source.get("target_mode")
+        or dict(source.get("label") or {}).get("mode")
+        or "return"
+    ).strip().lower()
+    if target_mode not in {"return", "classification"}:
+        raise ModelResearchError("目标类型只支持return或classification")
+    if target_mode == "classification":
+        label = {
+            "kind": f"future_{horizon}d_direction",
+            "mode": "classification",
             "horizon_trading_days": horizon,
-            "range": [-1.0, 1.0],
-            "entities": ["STYLE_SMALL", "STYLE_LARGE"],
+            "range": [0.0, 1.0],
+            "classes": [0, 1],
+            "positive_class": "future_return_gt_zero",
+            "formula": f"1[future_return(T,T+{horizon}) > 0]",
         }
-        if research_target == "market_style"
-        else {
-            "kind": f"future_{horizon}d_industry_rank",
-            "horizon_trading_days": horizon,
-            "range": [-1.0, 1.0],
-            "classification": "sw2021_l1",
-            "safe_start": SW2021_INDUSTRY_SAFE_START,
-        }
-        if research_target == "industry_rotation"
-        else {
-            "kind": f"future_{horizon}d_cross_sectional_rank",
-            "horizon_trading_days": horizon,
-            "range": [-1.0, 1.0],
-        }
-    )
+        if research_target == "market_style":
+            label["entities"] = ["STYLE_SMALL", "STYLE_LARGE"]
+        elif research_target == "industry_rotation":
+            label.update({
+                "classification": "sw2021_l1",
+                "safe_start": SW2021_INDUSTRY_SAFE_START,
+            })
+    else:
+        label = (
+            {
+                "kind": f"future_{horizon}d_market_style_rank",
+                "horizon_trading_days": horizon,
+                "range": [-1.0, 1.0],
+                "entities": ["STYLE_SMALL", "STYLE_LARGE"],
+            }
+            if research_target == "market_style"
+            else {
+                "kind": f"future_{horizon}d_industry_rank",
+                "horizon_trading_days": horizon,
+                "range": [-1.0, 1.0],
+                "classification": "sw2021_l1",
+                "safe_start": SW2021_INDUSTRY_SAFE_START,
+            }
+            if research_target == "industry_rotation"
+            else {
+                "kind": f"future_{horizon}d_cross_sectional_rank",
+                "horizon_trading_days": horizon,
+                "range": [-1.0, 1.0],
+            }
+        )
     availability = {
         "event_available_at_lte_signal_close": True,
         "source_available_at_lte_data_cutoff": True,
@@ -4152,6 +4181,7 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "date_end": date_end,
         "data_cutoff": data_cutoff,
         "research_target": research_target,
+        "target_mode": target_mode,
         "prediction_scope": (
             "market_style" if research_target == "market_style"
             else "industry" if research_target == "industry_rotation"
@@ -4176,7 +4206,9 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+def _model_spec(
+    source: Mapping[str, Any], *, target_mode: str | None = None,
+) -> dict[str, Any]:
     kind = str(source.get("kind") or "lightgbm").strip().lower()
     definitions: dict[str, dict[str, Any]] = {
         "lightgbm": {
@@ -4396,7 +4428,7 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "nativetft或transformer_lstm"
         )
     definition = definitions[kind]
-    allowed = definition["allowed"]
+    allowed = {*definition["allowed"], "loss"}
     params = {key: value for key, value in dict(source.get("params") or {}).items() if key in allowed}
     if kind == "mlp" and "hidden_layers" in params:
         layers = params["hidden_layers"]
@@ -4423,6 +4455,12 @@ def _model_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "data_random_seed": 42,
         })
     defaults.update(params)
+    requested_loss = str(defaults.get("loss") or "mse").strip().lower()
+    if target_mode is not None:
+        requested_loss = "binary" if target_mode == "classification" else "mse"
+    if requested_loss not in {"mse", "binary"}:
+        raise ModelResearchError("model.params.loss只支持mse或binary")
+    defaults["loss"] = requested_loss
     if kind in {"transformer", "nativetft", "transformer_lstm"}:
         try:
             d_model = int(defaults["d_model"])

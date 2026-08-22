@@ -83,6 +83,26 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     }
 
 
+def test_classification_target_freezes_binary_label_and_model_loss() -> None:
+    dataset = _dataset_spec({**_source(), "target_mode": "classification"})
+    model = _model_spec(
+        {"kind": "lightgbm", "params": {"loss": "mse"}},
+        target_mode=dataset["target_mode"],
+    )
+
+    assert dataset["target_mode"] == "classification"
+    assert dataset["label"] == {
+        "kind": "future_5d_direction",
+        "mode": "classification",
+        "horizon_trading_days": 5,
+        "range": [0.0, 1.0],
+        "classes": [0, 1],
+        "positive_class": "future_return_gt_zero",
+        "formula": "1[future_return(T,T+5) > 0]",
+    }
+    assert model["params"]["loss"] == "binary"
+
+
 def test_dataset_contract_freezes_stock_entity_asset_fields_without_factor_definition() -> None:
     spec = _dataset_spec({
         **_source(),

@@ -127,6 +127,14 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     coverage = float(spec.get("minimum_factor_coverage", 0.8))
     if not 0.5 <= coverage <= 1.0:
         raise PermanentJobError("minimum_factor_coverage必须在0.5到1之间")
+    label_spec = spec.get("label") or {}
+    if not isinstance(label_spec, dict):
+        raise PermanentJobError("dataset_spec.label必须是对象")
+    target_mode = str(
+        spec.get("target_mode") or label_spec.get("mode") or "return"
+    ).strip().lower()
+    if target_mode not in {"return", "classification"}:
+        raise PermanentJobError("目标类型只允许return或classification")
     version = _integer(config.get("planned_model_version"), "planned_model_version", 1, 1_000_000)
     if kind == "infer":
         _validate_inference_config(config, model_id=model_id, version=version)
@@ -161,8 +169,11 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     if execution_mode != expected_mode:
         raise PermanentJobError("execution.mode与node_id不一致")
     _integer(params.get("num_threads", 4), "num_threads", 1, 32)
-    if str(params.get("loss", "mse")) != "mse":
-        raise PermanentJobError("模型训练只允许MSE损失")
+    expected_loss = "binary" if target_mode == "classification" else "mse"
+    if str(params.get("loss", "mse")).strip().lower() != expected_loss:
+        raise PermanentJobError(
+            f"{target_mode}目标必须使用{expected_loss}损失"
+        )
     for field in ("seed", "feature_fraction_seed", "bagging_seed", "data_random_seed"):
         if field not in params and field != "seed":
             continue

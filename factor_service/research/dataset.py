@@ -111,7 +111,7 @@ class DatasetBuilder:
                 "label": "个股选股",
                 "ready": True,
                 "prediction_scope": "stock",
-                "reason": "支持冻结T+1至T+30个股收益截面排名标签。",
+                "reason": "支持冻结T+1至T+30个股收益截面排名或涨跌方向标签。",
                 "missing_fields": [],
             },
             {
@@ -235,7 +235,12 @@ class DatasetBuilder:
         _checkpoint(cancellation)
         _progress(progress, "building_labels", 46, {})
         research_target = str(spec.get("research_target") or "stock_selection")
-        horizon = int((spec.get("label") or {}).get("horizon_trading_days") or 5)
+        label_spec = dict(spec.get("label") or {})
+        horizon = int(label_spec.get("horizon_trading_days") or 5)
+        target_mode = str(
+            spec.get("target_mode") or label_spec.get("mode") or "return"
+        ).strip().lower()
+        classification = target_mode == "classification"
         target_contract: dict[str, Any]
         if research_target == "market_style":
             market_caps = self._historical_market_cap(
@@ -246,6 +251,7 @@ class DatasetBuilder:
             )
             labels = _market_style_rank_label(
                 prices, style_membership, horizon=horizon,
+                classification=classification,
             )
             panel = features.merge(
                 labels, on=["trade_date", "instrument"], how="inner",
@@ -256,7 +262,12 @@ class DatasetBuilder:
                 "entities": ["STYLE_SMALL", "STYLE_LARGE"],
                 "feature_aggregation": "daily_group_mean",
                 "membership": "daily_pit_market_cap_halves",
-                "label": "future_group_return_cross_sectional_rank",
+                "target_mode": target_mode,
+                "label": (
+                    "future_group_return_direction"
+                    if classification
+                    else "future_group_return_cross_sectional_rank"
+                ),
             }
         elif research_target == "industry_rotation":
             industry_membership = self._industry_membership(
@@ -267,6 +278,7 @@ class DatasetBuilder:
             )
             labels = _industry_rank_label(
                 prices, industry_membership, horizon=horizon,
+                classification=classification,
             )
             panel = features.merge(
                 labels, on=["trade_date", "instrument"], how="inner",
@@ -277,10 +289,19 @@ class DatasetBuilder:
                 "feature_aggregation": "daily_industry_weighted_mean",
                 "membership": "sw2021_daily_weight_snapshot",
                 "safe_start": SW2021_INDUSTRY_SAFE_START,
-                "label": "future_industry_return_cross_sectional_rank",
+                "target_mode": target_mode,
+                "label": (
+                    "future_industry_return_direction"
+                    if classification
+                    else "future_industry_return_cross_sectional_rank"
+                ),
             }
         elif research_target == "stock_selection":
-            labels = _future_rank_label(prices, horizon=horizon)
+            labels = (
+                _future_direction_label(prices, horizon=horizon)
+                if classification
+                else _future_rank_label(prices, horizon=horizon)
+            )
             panel = features.merge(
                 labels, on=["trade_date", "instrument"], how="inner",
             )
@@ -288,7 +309,12 @@ class DatasetBuilder:
                 "research_target": "stock_selection",
                 "prediction_scope": "stock",
                 "feature_aggregation": "none",
-                "label": "future_stock_return_cross_sectional_rank",
+                "target_mode": target_mode,
+                "label": (
+                    "future_stock_return_direction"
+                    if classification
+                    else "future_stock_return_cross_sectional_rank"
+                ),
             }
         else:
             raise ValueError(f"训练目标{research_target}尚不可用")
@@ -304,6 +330,16 @@ class DatasetBuilder:
         _progress(progress, "splitting_dataset", 52, {"segments": segments})
         train_start, train_end = segments["train"]
         train_mask = panel["trade_date"].between(pd.Timestamp(train_start), pd.Timestamp(train_end))
+        if classification:
+            train_classes = set(
+                pd.to_numeric(panel.loc[train_mask, "LABEL0"], errors="coerce")
+                .dropna()
+                .astype(int)
+                .unique()
+                .tolist()
+            )
+            if train_classes != {0, 1}:
+                raise ValueError("分类目标训练段必须同时包含上涨和下跌样本")
         medians = {
             name: float(pd.to_numeric(panel.loc[train_mask, name], errors="coerce").median())
             for name in feature_names
@@ -753,6 +789,19 @@ def _future_rank_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return labels
 
 
+def _future_direction_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    if prices.empty:
+        raise ValueError("后复权收盘价为空")
+    pivot = prices.drop_duplicates(["trade_date", "instrument"], keep="last").pivot(
+        index="trade_date", columns="instrument", values="adjusted_close",
+    ).sort_index()
+    future_return = pivot.shift(-int(horizon)).div(pivot).sub(1.0)
+    labels = future_return.gt(0.0).where(future_return.notna()).stack(
+        future_stack=True,
+    ).astype(float).rename("LABEL0").reset_index()
+    return labels
+
+
 def _market_style_features(
     features: pd.DataFrame,
     market_caps: pd.DataFrame,
@@ -795,6 +844,7 @@ def _market_style_rank_label(
     membership: pd.DataFrame,
     *,
     horizon: int,
+    classification: bool = False,
 ) -> pd.DataFrame:
     if prices.empty or membership.empty:
         raise ValueError("大小盘风格标签缺少价格或市值分组")
@@ -819,9 +869,11 @@ def _market_style_rank_label(
         "size",
     )
     grouped = grouped[grouped["_count"] == 2].copy()
-    grouped["LABEL0"] = 2.0 * (grouped["_rank"] - 1.0) / (
-        grouped["_count"] - 1.0
-    ) - 1.0
+    grouped["LABEL0"] = (
+        grouped["future_return"].gt(0.0).astype(float)
+        if classification
+        else 2.0 * (grouped["_rank"] - 1.0) / (grouped["_count"] - 1.0) - 1.0
+    )
     grouped.rename(columns={"style_entity": "instrument"}, inplace=True)
     return grouped[["trade_date", "instrument", "LABEL0"]]
 
@@ -864,6 +916,7 @@ def _industry_rank_label(
     membership: pd.DataFrame,
     *,
     horizon: int,
+    classification: bool = False,
 ) -> pd.DataFrame:
     if prices.empty or membership.empty:
         raise ValueError("行业轮动标签缺少价格或行业映射")
@@ -892,9 +945,11 @@ def _industry_rank_label(
         "industry_entity"
     ].transform("size")
     grouped = grouped[grouped["_count"] >= 2].copy()
-    grouped["LABEL0"] = 2.0 * (grouped["_rank"] - 1.0) / (
-        grouped["_count"] - 1.0
-    ) - 1.0
+    grouped["LABEL0"] = (
+        grouped["future_return"].gt(0.0).astype(float)
+        if classification
+        else 2.0 * (grouped["_rank"] - 1.0) / (grouped["_count"] - 1.0) - 1.0
+    )
     grouped.rename(columns={"industry_entity": "instrument"}, inplace=True)
     return grouped[["trade_date", "instrument", "LABEL0"]]
 

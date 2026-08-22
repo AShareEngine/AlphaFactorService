@@ -14,6 +14,7 @@ from factor_service.research.trainer import (
     _feature_importance,
     _fit_model,
     _incremental_prepared_dataset,
+    _metrics,
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
@@ -88,6 +89,29 @@ def test_lightgbm_parameters_are_deterministic() -> None:
     assert params["seed"] == 42
     assert params["deterministic"] is True
     assert params["num_threads"] == 2
+
+
+def test_classification_metrics_use_probability_outputs() -> None:
+    index = pd.MultiIndex.from_tuples([
+        (pd.Timestamp("2024-01-02"), "A"),
+        (pd.Timestamp("2024-01-02"), "B"),
+        (pd.Timestamp("2024-01-03"), "A"),
+        (pd.Timestamp("2024-01-03"), "B"),
+    ], names=["datetime", "instrument"])
+    frame = pd.DataFrame(
+        [0.0, 1.0, 0.0, 1.0], index=index,
+        columns=pd.MultiIndex.from_tuples([("label", "LABEL0")]),
+    )
+    prediction = pd.Series([0.1, 0.9, 0.2, 0.8], index=index)
+
+    metrics = _metrics(
+        prediction, frame, ("2024-01-02", "2024-01-03"), classification=True,
+    )
+
+    assert metrics["auc"] == 1.0
+    assert metrics["accuracy"] == 1.0
+    assert metrics["f1"] == 1.0
+    assert 0.0 < metrics["log_loss"] < 1.0
 
 
 def test_incremental_dataset_uses_only_new_dates_and_source_medians() -> None:
