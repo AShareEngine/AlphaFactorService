@@ -170,6 +170,9 @@ class QlibTrainer:
             )
             _checkpoint(cancellation)
             _progress(progress, "predicting", 82, {})
+            train_prediction = _predict_dataset(
+                model, model_kind, dataset, "train", classification=classification,
+            )
             valid_prediction = _predict_dataset(
                 model, model_kind, dataset, "valid", classification=classification,
             )
@@ -193,6 +196,12 @@ class QlibTrainer:
             training_prepared.segments["test"],
             classification=classification,
         )
+        train_metrics = _metrics(
+            train_prediction, training_prepared.frame,
+            training_prepared.segments["train"],
+            classification=classification,
+        )
+        del train_prediction
         raw_validation_metrics = _metrics(
             valid_prediction, training_prepared.frame,
             training_prepared.segments["valid"],
@@ -205,10 +214,23 @@ class QlibTrainer:
             "ic": raw_validation_metrics["ic"],
             "rank_ic": raw_validation_metrics["rank_ic"],
             "ic_ir": raw_validation_metrics["ic_ir"],
+            "rank_icir": raw_validation_metrics["rank_icir"],
             **{
                 key: raw_validation_metrics[key]
-                for key in ("auc", "log_loss", "accuracy", "precision", "recall", "f1")
+                for key in (
+                    "mse", "l2", "mae", "auc", "log_loss",
+                    "accuracy", "precision", "recall", "f1",
+                )
                 if key in raw_validation_metrics
+            },
+        }
+        normalized_train_metrics = {
+            "rows": train_metrics["test_rows"],
+            "days": train_metrics["test_days"],
+            **{
+                key: value
+                for key, value in train_metrics.items()
+                if key not in {"test_rows", "test_days"}
             },
         }
         if walk_forward_report is not None:
@@ -216,6 +238,7 @@ class QlibTrainer:
                 **walk_forward_report["aggregate"],
                 "evaluation_mode": "walk_forward",
                 "walk_forward_windows": walk_forward_report["window_count"],
+                "train": normalized_train_metrics,
                 "standard_test": standard_metrics,
                 "validation": validation_metrics,
             }
@@ -223,6 +246,7 @@ class QlibTrainer:
             metrics = {
                 **standard_metrics,
                 "evaluation_mode": "single_split",
+                "train": normalized_train_metrics,
                 "validation": validation_metrics,
             }
         feature_importance = _feature_importance(
@@ -858,6 +882,9 @@ def _progress(
 def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
     return {
         "loss": str(source.get("loss") or "mse"),
+        "metric": str(source.get("metric") or (
+            "auc" if source.get("loss") == "binary" else "rmse"
+        )),
         "learning_rate": float(source.get("learning_rate", 0.05)),
         "num_leaves": int(source.get("num_leaves", 31)),
         "max_depth": int(source.get("max_depth", -1)),
@@ -882,6 +909,7 @@ def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
 def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tuple[Any, dict[str, Any]]:
     loss = str(source.get("loss") or "mse").strip().lower()
     classification = loss == "binary"
+    metric = str(source.get("metric") or ("auc" if classification else "rmse")).strip().lower()
     if kind == "lightgbm":
         from qlib.contrib.model.gbdt import LGBModel
 
@@ -894,7 +922,10 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             raise RuntimeError("XGBoost尚未安装，请执行uv sync") from exc
         params = {
             "objective": "binary:logistic" if classification else "reg:squarederror",
-            "eval_metric": "logloss" if classification else "rmse",
+            "eval_metric": {
+                "l2": "rmse", "rmse": "rmse", "mae": "mae",
+                "auc": "auc", "binary_logloss": "logloss",
+            }[metric],
             "eta": float(source.get("learning_rate", 0.05)),
             "max_depth": int(source.get("max_depth", 6)),
             "subsample": float(source.get("subsample", 0.9)),
@@ -923,6 +954,10 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         except ImportError as exc:
             raise RuntimeError("CatBoost尚未安装，请执行uv sync") from exc
         params = {
+            "eval_metric": {
+                "l2": "RMSE", "rmse": "RMSE", "mae": "MAE",
+                "auc": "AUC", "binary_logloss": "Logloss",
+            }[metric],
             "learning_rate": float(source.get("learning_rate", 0.05)),
             "depth": int(source.get("depth", 6)),
             "l2_leaf_reg": float(source.get("l2_leaf_reg", 3.0)),
@@ -1223,11 +1258,33 @@ def _predict_dataset(
         features = dataset.prepare(
             segment, col_set="feature", data_key=DataHandlerLP.DK_I,
         )
-        probabilities = np.asarray(
-            model.model.predict_proba(features.values), dtype=float,
+        probabilities = _catboost_positive_probability(
+            model.model, features.values,
         )
-        return pd.Series(probabilities[:, 1], index=features.index)
+        return pd.Series(probabilities, index=features.index)
     return model.predict(dataset, segment=segment)
+
+
+def _catboost_positive_probability(predictor: Any, values: Any) -> np.ndarray:
+    """Return class-one probabilities for sklearn and Qlib CatBoost wrappers."""
+    if hasattr(predictor, "predict_proba"):
+        probabilities = np.asarray(predictor.predict_proba(values), dtype=float)
+    else:
+        # Qlib's CatBoostModel stores catboost.CatBoost rather than
+        # CatBoostClassifier, so predict_proba is not available even when the
+        # fitted loss is Logloss. CatBoost exposes the same probabilities via
+        # predict(..., prediction_type="Probability").
+        probabilities = np.asarray(
+            predictor.predict(values, prediction_type="Probability"),
+            dtype=float,
+        )
+    if probabilities.ndim == 1:
+        return probabilities.reshape(-1)
+    if probabilities.ndim == 2 and probabilities.shape[1] >= 2:
+        return probabilities[:, 1]
+    if probabilities.ndim == 2 and probabilities.shape[1] == 1:
+        return probabilities[:, 0]
+    raise ValueError("CatBoost分类预测未返回有效概率")
 
 
 def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -> np.ndarray:
@@ -1245,9 +1302,11 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
         raise ValueError(f"{model_kind}模型产物不包含可用预测器")
     values = features.values if model_kind in {"lightgbm", "catboost"} else features
     if (
-        (model_kind == "catboost" and getattr(model, "_alphablocks_loss", "mse") == "binary")
-        or getattr(model, "classification", False)
-    ) and hasattr(predictor, "predict_proba"):
+        model_kind == "catboost"
+        and getattr(model, "_alphablocks_loss", "mse") == "binary"
+    ):
+        return _catboost_positive_probability(predictor, values)
+    if getattr(model, "classification", False) and hasattr(predictor, "predict_proba"):
         probabilities = np.asarray(predictor.predict_proba(values), dtype=float)
         return probabilities[:, 1]
     return np.asarray(predictor.predict(values), dtype=float).reshape(-1)
@@ -1323,16 +1382,23 @@ def _metrics(
         if group["prediction"].nunique() > 1 and group["label"].nunique() > 1 else np.nan,
         include_groups=False,
     ).dropna()
-    rmse = float(np.sqrt(np.mean(np.square(aligned["prediction"] - aligned["label"]))))
+    errors = aligned["prediction"] - aligned["label"]
+    mse = float(np.mean(np.square(errors)))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(errors)))
     ic_mean = float(daily_ic.mean()) if not daily_ic.empty else 0.0
     ic_std = float(daily_ic.std(ddof=1)) if len(daily_ic) > 1 else 0.0
     result: dict[str, float | int] = {
         "test_rows": int(len(aligned)),
         "test_days": int(aligned.index.get_level_values("datetime").nunique()),
         "rmse": rmse,
+        "mse": mse,
+        "l2": mse,
+        "mae": mae,
         "ic": ic_mean,
         "rank_ic": ic_mean,
         "ic_ir": ic_mean / ic_std if ic_std else 0.0,
+        "rank_icir": ic_mean / ic_std if ic_std else 0.0,
     }
     if classification and not aligned.empty:
         from sklearn.metrics import (

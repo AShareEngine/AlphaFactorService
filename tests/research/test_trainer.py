@@ -15,6 +15,7 @@ from factor_service.research.trainer import (
     _fit_model,
     _incremental_prepared_dataset,
     _metrics,
+    _predict_dataset,
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
@@ -68,6 +69,39 @@ def test_catboost_fit_copies_framework_history_into_shared_evaluations() -> None
     }
 
 
+def test_catboost_binary_prediction_supports_qlib_base_model() -> None:
+    index = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2026-01-02"), "SH600000"),
+         (pd.Timestamp("2026-01-02"), "SZ000001")],
+        names=["datetime", "instrument"],
+    )
+    features = pd.DataFrame({"factor": [0.1, 0.2]}, index=index)
+
+    class _Predictor:
+        @staticmethod
+        def predict(values, *, prediction_type=None):
+            assert values.shape == (2, 1)
+            assert prediction_type == "Probability"
+            return np.asarray([[0.8, 0.2], [0.3, 0.7]])
+
+    class _Model:
+        model = _Predictor()
+        _alphablocks_loss = "binary"
+
+    class _Dataset:
+        @staticmethod
+        def prepare(*_args, **_kwargs):
+            return features
+
+    prediction = _predict_dataset(
+        _Model(), "catboost", _Dataset(), "test", classification=True,
+    )
+
+    assert prediction.index.equals(index)
+    assert prediction.tolist() == [0.2, 0.7]
+    assert predict_feature_frame(_Model(), "catboost", features).tolist() == [0.2, 0.7]
+
+
 def test_recorder_experiment_uses_job_local_artifact_root(tmp_path: Path) -> None:
     from mlflow.tracking import MlflowClient
 
@@ -89,6 +123,11 @@ def test_lightgbm_parameters_are_deterministic() -> None:
     assert params["seed"] == 42
     assert params["deterministic"] is True
     assert params["num_threads"] == 2
+    assert params["metric"] == "rmse"
+
+    binary = _qlib_lgb_params({"loss": "binary", "metric": "binary_logloss"})
+    assert binary["loss"] == "binary"
+    assert binary["metric"] == "binary_logloss"
 
 
 def test_classification_metrics_use_probability_outputs() -> None:
@@ -111,6 +150,9 @@ def test_classification_metrics_use_probability_outputs() -> None:
     assert metrics["auc"] == 1.0
     assert metrics["accuracy"] == 1.0
     assert metrics["f1"] == 1.0
+    assert np.isclose(metrics["mae"], 0.15)
+    assert np.isclose(metrics["mse"], 0.025)
+    assert metrics["rank_icir"] == metrics["ic_ir"]
     assert 0.0 < metrics["log_loss"] < 1.0
 
 

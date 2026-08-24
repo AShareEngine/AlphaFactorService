@@ -798,7 +798,7 @@ def _future_direction_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
     future_return = pivot.shift(-int(horizon)).div(pivot).sub(1.0)
     labels = future_return.gt(0.0).where(future_return.notna()).stack(
         future_stack=True,
-    ).astype(float).rename("LABEL0").reset_index()
+    ).dropna().astype(float).rename("LABEL0").reset_index()
     return labels
 
 

@@ -1464,41 +1464,112 @@ class ModelResearchRepository:
                 version = int(config.get("planned_model_version") or 0)
                 if version <= 0:
                     raise ModelResearchConflict("任务缺少预留模型版本")
-                metrics = dict(result.get("metrics") or {})
-                importance = list(result.get("feature_importance") or [])
-                predictions = dict(result.get("predictions") or {})
-                manifest = dict(result.get("manifest") or {})
-                conn.execute(
-                    """
-                    INSERT INTO model_versions(
-                        model_id, version, job_id, dataset_id, name, model_kind,
-                        state, metrics_json, feature_importance_json,
-                        prediction_json, manifest_json, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, 'candidate', %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        model_id, version, job_id, row["dataset_id"], row["title"],
-                        row["model_kind"], Jsonb(metrics), Jsonb(importance),
-                        Jsonb(predictions), Jsonb(manifest), now, now,
-                    ),
-                )
                 conn.execute(
                     """
                     UPDATE model_jobs
-                    SET status = 'succeeded', result_json = %s, model_version = %s,
+                    SET status = 'succeeded', result_json = %s, model_version = NULL,
                         lease_expires_at = NULL, finished_at = %s, updated_at = %s
                     WHERE job_id = %s
                     """,
-                    (Jsonb(dict(result)), version, now, now, job_id),
+                    (Jsonb(dict(result)), now, now, job_id),
+                )
+                self._event(
+                    conn, job_id, "job.succeeded", stage="succeeded",
+                    message="训练完成，等待用户确认入库",
+                    payload={
+                        "model_id": model_id,
+                        "planned_model_version": version,
+                        "registration_status": "pending_confirmation",
+                    },
+                )
+        return self.get_job(job_id)
+
+    def register_training_result(self, job_id: str) -> dict[str, Any]:
+        """Register one completed training result only after explicit user confirmation."""
+        current = self.get_job(job_id)
+        if str(current.get("kind") or "train") != "train":
+            raise ModelResearchConflict("只有训练任务结果可以确认入库")
+        experiment = dict(
+            (current.get("config_json") or {}).get("experiment") or {}
+        )
+        if experiment:
+            experiment_id = str(experiment.get("experiment_id") or "")
+            summary = self.get_training_experiment(experiment_id)
+            selection = dict(summary.get("selection") or {})
+            if str(selection.get("status") or "") != "selected":
+                raise ModelResearchConflict("参数实验尚未选出可入库版本")
+            if str(selection.get("selected_job_id") or "") != job_id:
+                raise ModelResearchConflict("参数实验只允许验证集入选版本确认入库")
+
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型任务不存在")
+                if str(row["kind"] or "train") != "train":
+                    raise ModelResearchConflict("只有训练任务结果可以确认入库")
+                if str(row["status"] or "") != "succeeded":
+                    raise ModelResearchConflict("只有训练完成的任务可以确认入库")
+                model_id = str(row["model_id"])
+                config = dict(row["config_json"] or {})
+                version = int(config.get("planned_model_version") or 0)
+                if version <= 0:
+                    raise ModelResearchConflict("任务缺少预留模型版本")
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"model:{model_id}",),
+                )
+                existing = conn.execute(
+                    """
+                    SELECT job_id FROM model_versions
+                    WHERE model_id = %s AND version = %s
+                    """,
+                    (model_id, version),
+                ).fetchone()
+                if existing and str(existing["job_id"]) != job_id:
+                    raise ModelResearchConflict("预留模型版本已被其他任务占用")
+                result = dict(row["result_json"] or {})
+                if not result:
+                    raise ModelResearchConflict("训练结果尚未写入，不能确认入库")
+                if not existing:
+                    conn.execute(
+                        """
+                        INSERT INTO model_versions(
+                            model_id, version, job_id, dataset_id, name, model_kind,
+                            state, metrics_json, feature_importance_json,
+                            prediction_json, manifest_json, created_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, 'candidate', %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            model_id, version, job_id, row["dataset_id"], row["title"],
+                            row["model_kind"], Jsonb(dict(result.get("metrics") or {})),
+                            Jsonb(list(result.get("feature_importance") or [])),
+                            Jsonb(dict(result.get("predictions") or {})),
+                            Jsonb(dict(result.get("manifest") or {})), now, now,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET model_version = %s, updated_at = %s
+                    WHERE job_id = %s
+                    """,
+                    (version, now, job_id),
                 )
                 conn.execute(
                     "UPDATE model_artifacts SET model_version = %s WHERE job_id = %s",
                     (version, job_id),
                 )
-                self._event(
-                    conn, job_id, "job.succeeded", stage="succeeded",
-                    payload={"model_id": model_id, "model_version": version},
-                )
+                if not existing:
+                    self._event(
+                        conn, job_id, "job.registered", stage="registered",
+                        message="用户已确认训练结果入库",
+                        payload={"model_id": model_id, "model_version": version},
+                    )
         return self.get_job(job_id)
 
     def _complete_inference_job(
@@ -4173,6 +4244,10 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     index_code = UNIVERSES[universe_id]["index_code"]
     benchmark_code = UNIVERSES[universe_id]["benchmark"]
     return {
+        # Part of the immutable dataset identity. Bump this whenever label or
+        # feature materialization semantics change so an older canonical
+        # snapshot can never be silently reused by a newly created job.
+        "pipeline_version": "alphablocks.dataset-pipeline.v2",
         "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
         "universe_id": universe_id,
         "index_code": index_code,
@@ -4428,7 +4503,7 @@ def _model_spec(
             "nativetft或transformer_lstm"
         )
     definition = definitions[kind]
-    allowed = {*definition["allowed"], "loss"}
+    allowed = {*definition["allowed"], "loss", "objective", "metric"}
     params = {key: value for key, value in dict(source.get("params") or {}).items() if key in allowed}
     if kind == "mlp" and "hidden_layers" in params:
         layers = params["hidden_layers"]
@@ -4461,6 +4536,26 @@ def _model_spec(
     if requested_loss not in {"mse", "binary"}:
         raise ModelResearchError("model.params.loss只支持mse或binary")
     defaults["loss"] = requested_loss
+    expected_objective = "binary" if requested_loss == "binary" else "regression"
+    requested_objective = str(
+        defaults.get("objective") or expected_objective
+    ).strip().lower()
+    if target_mode is not None and "objective" in params and requested_objective != expected_objective:
+        raise ModelResearchError("Objective必须与目标类型一致")
+    if requested_objective not in {"regression", "binary"}:
+        raise ModelResearchError("model.params.objective只支持regression或binary")
+    defaults["objective"] = expected_objective
+    requested_metric = str(
+        defaults.get("metric") or ("auc" if requested_loss == "binary" else "rmse")
+    ).strip().lower()
+    supported_metrics = (
+        {"auc", "binary_logloss"}
+        if requested_loss == "binary"
+        else {"l2", "rmse", "mae"}
+    )
+    if requested_metric not in supported_metrics:
+        raise ModelResearchError("Metric必须与Objective一致")
+    defaults["metric"] = requested_metric
     if kind in {"transformer", "nativetft", "transformer_lstm"}:
         try:
             d_model = int(defaults["d_model"])
@@ -4533,6 +4628,19 @@ def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in tuple(result.items()):
         if isinstance(value, datetime):
             result[key] = value.isoformat()
+    if (
+        str(result.get("kind") or "train") == "train"
+        and str(result.get("status") or "") == "succeeded"
+    ):
+        config = dict(result.get("config_json") or {})
+        result["planned_model_version"] = int(
+            config.get("planned_model_version") or 0
+        )
+        result["registration_status"] = (
+            "registered"
+            if int(result.get("model_version") or 0) > 0
+            else "pending_confirmation"
+        )
     return result
 
 

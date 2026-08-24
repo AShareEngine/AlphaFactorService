@@ -37,6 +37,14 @@ MODEL_PARAM_FIELDS = {
         "early_stopping_rounds", "num_threads", "loss", "seed", "deterministic",
         "verbosity",
     },
+    "random_forest": {
+        "n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
+        "max_features", "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "linear": {
+        "alpha", "fit_intercept", "solver", "max_iter", "num_threads", "loss",
+        "seed", "deterministic", "verbosity",
+    },
     "mlp": {
         "learning_rate", "hidden_layers", "hidden_size", "layer_count",
         "max_steps", "batch_size",
@@ -48,6 +56,39 @@ MODEL_PARAM_FIELDS = {
         "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
         "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
     },
+    "gru": {
+        "learning_rate", "lookback_window", "hidden_size", "num_layers", "dropout",
+        "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
+        "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "alstm": {
+        "learning_rate", "lookback_window", "hidden_size", "num_layers", "dropout",
+        "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
+        "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "transformer": {
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "transformer_layers", "dim_feedforward", "dropout", "max_steps",
+        "batch_size", "early_stopping_rounds", "eval_steps", "weight_decay",
+        "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "tabnet": {
+        "learning_rate", "n_d", "n_a", "n_steps", "n_shared", "n_ind",
+        "batch_size", "max_steps", "early_stopping_rounds", "pretrain",
+        "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
+    "tcn": {
+        "learning_rate", "lookback_window", "hidden_size", "kernel_size",
+        "num_layers", "dropout", "max_steps", "batch_size",
+        "early_stopping_rounds", "eval_steps", "weight_decay", "num_threads",
+        "loss", "seed", "deterministic", "verbosity",
+    },
+    "nativetft": {
+        "learning_rate", "lookback_window", "d_model", "nhead",
+        "gru_hidden_size", "num_layers", "dim_feedforward", "dropout",
+        "max_steps", "batch_size", "early_stopping_rounds", "eval_steps",
+        "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
+    },
     "transformer_lstm": {
         "learning_rate", "lookback_window", "d_model", "nhead",
         "transformer_layers", "dim_feedforward", "lstm_hidden_size", "lstm_layers",
@@ -55,6 +96,8 @@ MODEL_PARAM_FIELDS = {
         "weight_decay", "num_threads", "loss", "seed", "deterministic", "verbosity",
     },
 }
+for _fields in MODEL_PARAM_FIELDS.values():
+    _fields.update({"objective", "metric"})
 
 
 def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -150,11 +193,17 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     model_kind = str(model.get("kind") or "") if isinstance(model, dict) else ""
     if model_kind not in MODEL_PARAM_FIELDS:
         raise PermanentJobError(
-            "模型只允许lightgbm、xgboost、catboost、mlp、lstm或transformer_lstm"
+            "模型只允许lightgbm、xgboost、catboost、random_forest、linear、"
+            "mlp、gru、lstm、alstm、transformer、tabnet、tcn、nativetft或transformer_lstm"
         )
     params = model.get("params") or {}
-    if not isinstance(params, dict) or set(params) - MODEL_PARAM_FIELDS[model_kind]:
-        raise PermanentJobError(f"{model_kind}参数包含未允许字段")
+    if not isinstance(params, dict):
+        raise PermanentJobError(f"{model_kind}参数必须是对象")
+    unknown_params = sorted(set(params) - MODEL_PARAM_FIELDS[model_kind])
+    if unknown_params:
+        raise PermanentJobError(
+            f"{model_kind}参数包含未允许字段: {', '.join(unknown_params)}"
+        )
     _validate_model_params(model_kind, params)
     execution = config.get("execution") or {"node_id": "local"}
     if not isinstance(execution, dict):
@@ -174,6 +223,19 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         raise PermanentJobError(
             f"{target_mode}目标必须使用{expected_loss}损失"
         )
+    expected_objective = "binary" if target_mode == "classification" else "regression"
+    if str(params.get("objective", expected_objective)).strip().lower() != expected_objective:
+        raise PermanentJobError("Objective必须与目标类型一致")
+    metric = str(
+        params.get("metric") or ("auc" if expected_objective == "binary" else "rmse")
+    ).strip().lower()
+    supported_metrics = (
+        {"auc", "binary_logloss"}
+        if expected_objective == "binary"
+        else {"l2", "rmse", "mae"}
+    )
+    if metric not in supported_metrics:
+        raise PermanentJobError("Metric必须与Objective一致")
     for field in ("seed", "feature_fraction_seed", "bagging_seed", "data_random_seed"):
         if field not in params and field != "seed":
             continue
@@ -202,7 +264,11 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
-    default_lr = 0.001 if kind in {"mlp", "lstm", "transformer_lstm"} else 0.05
+    deep_kinds = {
+        "mlp", "gru", "lstm", "alstm", "transformer", "tabnet", "tcn",
+        "nativetft", "transformer_lstm",
+    }
+    default_lr = 0.001 if kind in deep_kinds else 0.05
     _number(params.get("learning_rate", default_lr), "learning_rate", 0.000001, 1.0)
     if kind == "lightgbm":
         _integer(params.get("num_leaves", 31), "num_leaves", 2, 65536)
@@ -215,6 +281,23 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("depth", 6), "depth", 1, 16)
         _number(params.get("l2_leaf_reg", 3.0), "l2_leaf_reg", 0.0, 1_000_000.0)
         _number(params.get("random_strength", 1.0), "random_strength", 0.0, 1_000_000.0)
+    elif kind == "random_forest":
+        _integer(params.get("n_estimators", 500), "n_estimators", 1, 100_000)
+        _integer(params.get("max_depth", 0), "max_depth", 0, 128)
+        _integer(params.get("min_samples_split", 2), "min_samples_split", 2, 1_000_000)
+        _integer(params.get("min_samples_leaf", 1), "min_samples_leaf", 1, 1_000_000)
+        _number(params.get("max_features", 1.0), "max_features", 0.000001, 1.0)
+        return
+    elif kind == "linear":
+        _number(params.get("alpha", 1.0), "alpha", 0.0, 1_000_000.0)
+        _integer(params.get("max_iter", 1000), "max_iter", 1, 1_000_000)
+        if not isinstance(params.get("fit_intercept", False), bool):
+            raise PermanentJobError("fit_intercept必须是布尔值")
+        if str(params.get("solver") or "auto") not in {
+            "auto", "svd", "cholesky", "lsqr", "sparse_cg", "sag", "saga", "lbfgs",
+        }:
+            raise PermanentJobError("linear.solver无效")
+        return
     elif kind == "mlp":
         layers = params.get("hidden_layers")
         if layers is None:
@@ -231,7 +314,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
         _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
         return
-    elif kind == "lstm":
+    elif kind in {"gru", "lstm", "alstm"}:
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
         _integer(params.get("hidden_size", 128), "hidden_size", 4, 4096)
         _integer(params.get("num_layers", 2), "num_layers", 1, 8)
@@ -241,6 +324,41 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
         _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        return
+    elif kind in {"transformer", "nativetft"}:
+        _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
+        d_model = _integer(params.get("d_model", 64), "d_model", 8, 1024)
+        nhead = _integer(params.get("nhead", 4), "nhead", 1, 32)
+        if d_model % nhead != 0:
+            raise PermanentJobError("d_model必须能被nhead整除")
+        if kind == "transformer":
+            _integer(params.get("transformer_layers", 2), "transformer_layers", 1, 8)
+        else:
+            _integer(params.get("gru_hidden_size", 64), "gru_hidden_size", 4, 4096)
+            _integer(params.get("num_layers", 1), "num_layers", 1, 8)
+        _integer(params.get("dim_feedforward", 256), "dim_feedforward", 16, 16_384)
+        _number(params.get("dropout", 0.2), "dropout", 0.0, 0.9)
+        _validate_deep_training_loop(params, default_batch_size=256)
+        return
+    elif kind == "tcn":
+        _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
+        _integer(params.get("hidden_size", 128), "hidden_size", 4, 4096)
+        _integer(params.get("kernel_size", 5), "kernel_size", 2, 64)
+        _integer(params.get("num_layers", 5), "num_layers", 1, 16)
+        _number(params.get("dropout", 0.5), "dropout", 0.0, 0.9)
+        _validate_deep_training_loop(params, default_batch_size=256)
+        return
+    elif kind == "tabnet":
+        _integer(params.get("n_d", 64), "n_d", 4, 4096)
+        _integer(params.get("n_a", 64), "n_a", 4, 4096)
+        _integer(params.get("n_steps", 5), "n_steps", 1, 64)
+        _integer(params.get("n_shared", 2), "n_shared", 0, 16)
+        _integer(params.get("n_ind", 2), "n_ind", 0, 16)
+        _integer(params.get("max_steps", 100), "max_steps", 1, 100_000)
+        _integer(params.get("batch_size", 4096), "batch_size", 16, 1_000_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+        if not isinstance(params.get("pretrain", False), bool):
+            raise PermanentJobError("tabnet.pretrain必须是布尔值")
         return
     elif kind == "transformer_lstm":
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -266,6 +384,16 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _number(params.get("colsample_bytree", 0.9), "colsample_bytree", 0.01, 1.0)
         _number(params.get("reg_alpha", 0.0), "reg_alpha", 0.0, 1_000_000.0)
         _number(params.get("reg_lambda", 1.0 if kind == "xgboost" else 0.0), "reg_lambda", 0.0, 1_000_000.0)
+
+
+def _validate_deep_training_loop(
+    params: dict[str, Any], *, default_batch_size: int,
+) -> None:
+    _integer(params.get("max_steps", 300), "max_steps", 1, 100_000)
+    _integer(params.get("batch_size", default_batch_size), "batch_size", 16, 1_000_000)
+    _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
+    _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
+    _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
 
 
 def _validate_walk_forward(source: Any) -> None:

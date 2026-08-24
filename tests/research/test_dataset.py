@@ -54,6 +54,8 @@ def test_future_direction_label_matches_quantmind_binary_definition() -> None:
     first = labels[labels["trade_date"] == dates[0]].set_index("instrument")["LABEL0"]
 
     assert first.to_dict() == {"DOWN": 0.0, "FLAT": 0.0, "UP": 1.0}
+    assert labels["LABEL0"].notna().all()
+    assert dates[-1] not in set(labels["trade_date"])
 
 
 def test_market_style_features_use_daily_pit_market_cap_halves() -> None:

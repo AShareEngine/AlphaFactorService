@@ -102,3 +102,63 @@ def test_remote_node_settings_rejects_invalid_or_duplicate_nodes(
         assert "host无效" in str(exc)
     else:
         raise AssertionError("unsafe host must be rejected")
+
+
+def test_remote_node_settings_persists_autodl_lifecycle_without_token(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config_path = tmp_path / "runtime.local.yaml"
+    _runtime(config_path)
+    monkeypatch.setenv("ALPHA_FACTOR_RUNTIME_CONFIG", str(config_path))
+    monkeypatch.setenv("TEST_AUTODL_PASSWORD", "ssh-secret")
+    monkeypatch.setenv("TEST_AUTODL_API_TOKEN", "api-secret")
+
+    created = create_remote_node_setting(_node(
+        lifecycle_provider="autodl_pro",
+        instance_uuid="pro-76576c61fdf1",
+        api_token_env="TEST_AUTODL_API_TOKEN",
+        auto_start=True,
+        auto_stop=True,
+        boot_timeout_minutes=20,
+    ))
+
+    assert created["lifecycle_provider"] == "autodl_pro"
+    assert created["api_token_env"] == "TEST_AUTODL_API_TOKEN"
+    assert created["api_token_environment_configured"] is True
+    assert created["auto_start"] is True
+    assert created["auto_stop"] is True
+    assert created["boot_timeout_minutes"] == 20
+    assert "api-secret" not in repr(created)
+    stored = config_path.read_text(encoding="utf-8")
+    assert "api_token_env: TEST_AUTODL_API_TOKEN" in stored
+    assert "api-secret" not in stored
+
+
+def test_remote_node_settings_saves_api_token_outside_runtime(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config_path = tmp_path / "runtime.local.yaml"
+    token_path = tmp_path / "secrets" / "autodl_api_token"
+    _runtime(config_path)
+    monkeypatch.setenv("ALPHA_FACTOR_RUNTIME_CONFIG", str(config_path))
+    monkeypatch.setenv("ALPHA_AUTODL_API_TOKEN_FILE", str(token_path))
+    monkeypatch.setenv("TEST_AUTODL_PASSWORD", "ssh-secret")
+    monkeypatch.delenv("ALPHA_AUTODL_API_TOKEN", raising=False)
+
+    created = create_remote_node_setting(_node(
+        lifecycle_provider="autodl_pro",
+        instance_uuid="pro-76576c61fdf1",
+        api_token_env="ALPHA_AUTODL_API_TOKEN",
+        api_token="saved-api-token",
+        auto_start=True,
+        auto_stop=True,
+    ))
+
+    assert created["api_token_configured"] is True
+    assert created["api_token_source"] == "secure_file"
+    assert "saved-api-token" not in repr(created)
+    assert token_path.read_text(encoding="utf-8").strip() == "saved-api-token"
+    assert os.stat(token_path).st_mode & 0o777 == 0o600
+    stored = config_path.read_text(encoding="utf-8")
+    assert "saved-api-token" not in stored
+    assert "api_token:" not in stored

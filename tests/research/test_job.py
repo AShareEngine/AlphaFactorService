@@ -35,7 +35,9 @@ def test_job_validation_accepts_classification_target_with_binary_loss() -> None
             "range": [0.0, 1.0],
             "classes": [0, 1],
         }
-    source["config_json"]["model"]["params"]["loss"] = "binary"
+    source["config_json"]["model"]["params"].update({
+        "loss": "binary", "objective": "binary", "metric": "auc",
+    })
     source["dataset_hash"] = sha256(
         _canonical_json(source["dataset_spec"]).encode("utf-8")
     ).hexdigest()
@@ -44,6 +46,15 @@ def test_job_validation_accepts_classification_target_with_binary_loss() -> None
 
     assert job["dataset_spec"]["target_mode"] == "classification"
     assert job["config_json"]["model"]["params"]["loss"] == "binary"
+    assert job["config_json"]["model"]["params"]["metric"] == "auc"
+
+
+def test_job_validation_names_unknown_model_parameters() -> None:
+    source = valid_job()
+    source["config_json"]["model"]["params"]["foreign_parameter"] = 1
+
+    with pytest.raises(PermanentJobError, match="foreign_parameter"):
+        validate_job(source)
 
 
 def test_job_validation_rejects_classification_target_with_regression_loss() -> None:
@@ -98,9 +109,38 @@ def test_job_validation_accepts_all_phase2_model_kinds() -> None:
     cases = {
         "xgboost": {"max_depth": 4, "n_estimators": 20},
         "catboost": {"depth": 4, "n_estimators": 20},
+        "random_forest": {"max_depth": 4, "n_estimators": 20},
+        "linear": {"alpha": 1.0, "max_iter": 100},
         "mlp": {"hidden_layers": [16, 32, 64], "max_steps": 20, "batch_size": 32},
+        "gru": {
+            "lookback_window": 20, "hidden_size": 32, "num_layers": 2,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
         "lstm": {
             "lookback_window": 20, "hidden_size": 32, "num_layers": 2,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
+        "alstm": {
+            "lookback_window": 20, "hidden_size": 32, "num_layers": 2,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
+        "transformer": {
+            "lookback_window": 20, "d_model": 32, "nhead": 4,
+            "transformer_layers": 1, "dim_feedforward": 64,
+            "dropout": 0.1, "max_steps": 20, "batch_size": 32,
+        },
+        "tabnet": {
+            "n_d": 16, "n_a": 16, "n_steps": 3,
+            "max_steps": 20, "batch_size": 32,
+        },
+        "tcn": {
+            "lookback_window": 20, "hidden_size": 32, "kernel_size": 3,
+            "num_layers": 2, "dropout": 0.1,
+            "max_steps": 20, "batch_size": 32,
+        },
+        "nativetft": {
+            "lookback_window": 20, "d_model": 32, "nhead": 4,
+            "gru_hidden_size": 32, "num_layers": 1, "dim_feedforward": 64,
             "dropout": 0.1, "max_steps": 20, "batch_size": 32,
         },
         "transformer_lstm": {

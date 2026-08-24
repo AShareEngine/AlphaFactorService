@@ -69,10 +69,26 @@ research:
     #     known_hosts: /absolute/server/path/known_hosts
     #     # Or use password_env: ALPHA_AUTODL_01_PASSWORD
     #     work_dir: /root/alphablocks-research
+    #     # AutoDL container instances normally use direct_python. Use docker only
+    #     # for SSH targets that expose a Docker daemon and NVIDIA Container Toolkit.
+    #     runner: direct_python
+    #     python_executable: /root/miniconda3/bin/python
     #     docker_image: alphafactor-research:latest
     #     gpus: all
     #     max_runtime_minutes: 240
     #     cleanup_success: true
+    #     # Mode 1 (API managed): AutoDL Pro lifecycle is controlled automatically.
+    #     # Enter the Token in System Settings; it is stored separately at
+    #     # .secrets/autodl_api_token (0600), never in this YAML file.
+    #     lifecycle_provider: autodl_pro
+    #     instance_uuid: pro-76576c61fdf1
+    #     api_token_env: ALPHA_AUTODL_API_TOKEN
+    #     auto_start: true
+    #     auto_stop: true
+    #     boot_timeout_minutes: 15
+    #     # Mode 2 (manual): set lifecycle_provider to manual (or omit the four
+    #     # lifecycle fields above), start/stop AutoDL yourself, and maintain the
+    #     # current SSH host/port in System Settings.
   storage:
     # Relative paths are resolved from the AlphaFactorService project root.
     # This root contains job datasets, trained models, predictions, MLflow files,

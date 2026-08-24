@@ -20,7 +20,12 @@ from factor_service.research.control import ResearchControl, ResearchControlErro
 from factor_service.research.config import Settings
 from factor_service.research.errors import classify_exception, error_payload
 from factor_service.research.inference import DailyInferenceRunner
-from factor_service.research.job import CancellationToken, safe_job_dir, validate_job
+from factor_service.research.job import (
+    MODEL_PARAM_FIELDS,
+    CancellationToken,
+    safe_job_dir,
+    validate_job,
+)
 from factor_service.research.state import JobStateStore
 from factor_service.research.trainer import QlibTrainer, TrainingResult
 
@@ -80,9 +85,7 @@ class ResearchWorker:
             "python": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
-            "models": [
-                "lightgbm", "xgboost", "catboost", "mlp", "lstm", "transformer_lstm",
-            ],
+            "models": list(MODEL_PARAM_FIELDS),
             "max_concurrency": 1,
             "packages": versions,
             "dispatch_mode": "local_and_remote_ssh",
@@ -280,6 +283,11 @@ class ResearchWorker:
         lease_token = str(job["lease_token"])
         attempt = max(1, int(job.get("attempt_count") or 1))
         work_dir = safe_job_dir(self.settings.work_root, job_id) / f"attempt-{attempt:03d}"
+        # Every lease attempt owns an independent directory. Remote execution
+        # writes its descriptor before launching the isolated runner, so retries
+        # must recreate the attempt directory even when a previous failed
+        # attempt was already cleaned up.
+        work_dir.mkdir(parents=True, exist_ok=True)
         monitor_stop = threading.Event()
         cancellation = CancellationToken(self._shutdown_event)
         monitor_thread = threading.Thread(

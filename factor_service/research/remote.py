@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -12,6 +12,12 @@ import time
 from typing import Any, Callable
 
 from factor_service.research.config import Settings
+from factor_service.research.autodl import (
+    AutoDLProClient,
+    api_token_status,
+    validate_instance_uuid,
+    validate_token_environment,
+)
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.research.errors import RetryableJobError
 from factor_service.research.job import CancellationToken
@@ -26,6 +32,8 @@ _USER = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,63}$")
 _IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$")
 _GPU_SPEC = re.compile(r"^[A-Za-z0-9=,._-]{0,128}$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+_REMOTE_RUNNERS = {"docker", "direct_python"}
+_LIFECYCLE_PROVIDERS = {"", "autodl_pro"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,8 @@ class RemoteNode:
     port: int
     user: str
     work_dir: str
+    runner: str
+    python_executable: str
     docker_image: str
     gpus: str
     ssh_key: Path | None
@@ -44,6 +54,12 @@ class RemoteNode:
     enabled: bool
     cleanup_success: bool
     max_runtime_minutes: int
+    lifecycle_provider: str
+    instance_uuid: str
+    api_token_env: str
+    auto_start: bool
+    auto_stop: bool
+    boot_timeout_minutes: int
 
     def public(self) -> dict[str, Any]:
         credential = (
@@ -58,19 +74,46 @@ class RemoteNode:
             "port": self.port,
             "user": self.user,
             "work_dir": self.work_dir,
+            "runner": self.runner,
+            "python_executable": self.python_executable,
             "docker_image": self.docker_image,
             "gpus": self.gpus,
             "enabled": self.enabled,
-            "available": self.enabled and self.credentials_available(),
+            "available": (
+                self.enabled
+                and self.credentials_available()
+                and (not self.lifecycle_provider or self.lifecycle_available())
+            ),
             "credential_type": credential,
             "known_hosts_configured": self.known_hosts is not None,
             "max_runtime_minutes": self.max_runtime_minutes,
+            "lifecycle_provider": self.lifecycle_provider or "manual",
+            "instance_uuid": self.instance_uuid,
+            "api_token_configured": bool(
+                self.api_token_env
+                and api_token_status(self.api_token_env)["configured"]
+            ),
+            "api_token_environment_configured": bool(
+                self.api_token_env
+                and api_token_status(self.api_token_env)["configured"]
+            ),
+            "auto_start": self.auto_start,
+            "auto_stop": self.auto_stop,
+            "boot_timeout_minutes": self.boot_timeout_minutes,
         }
 
     def credentials_available(self) -> bool:
         if self.ssh_key is not None:
             return self.ssh_key.is_file()
         return bool(self.password_env and os.environ.get(self.password_env))
+
+    def lifecycle_available(self) -> bool:
+        return bool(
+            self.lifecycle_provider == "autodl_pro"
+            and self.instance_uuid
+            and self.api_token_env
+            and api_token_status(self.api_token_env)["configured"]
+        )
 
 
 def load_remote_nodes(runtime: dict[str, Any] | None = None) -> list[RemoteNode]:
@@ -120,15 +163,30 @@ class RemoteTransport:
         self._ensure_client_tools()
 
     def test_connection(self) -> dict[str, Any]:
-        command = (
-            "set -e; printf 'ssh=ok\\n'; command -v docker >/dev/null; "
-            "docker version --format 'docker={{.Server.Version}}'; "
-            f"docker image inspect {shlex.quote(self.node.docker_image)} "
-            "--format 'image=ok' >/dev/null; "
-            "if command -v nvidia-smi >/dev/null 2>&1; then "
-            "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; "
-            "else printf 'gpu=unavailable\\n'; fi"
-        )
+        if self.node.runner == "direct_python":
+            python = shlex.quote(self.node.python_executable)
+            dependency_check = shlex.quote(
+                "import catboost, lightgbm, pandas, pyarrow, qlib, sklearn, torch, xgboost; "
+                "print('python=ok'); print('torch=' + torch.__version__); "
+                "print('cuda=' + str(torch.cuda.is_available()).lower())"
+            )
+            command = (
+                "set -e; printf 'ssh=ok\\nrunner=direct_python\\n'; "
+                f"test -x {python}; {python} -c {dependency_check}; "
+                "if command -v nvidia-smi >/dev/null 2>&1; then "
+                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; "
+                "else printf 'gpu=unavailable\\n'; fi"
+            )
+        else:
+            command = (
+                "set -e; printf 'ssh=ok\\nrunner=docker\\n'; command -v docker >/dev/null; "
+                "docker version --format 'docker={{.Server.Version}}'; "
+                f"docker image inspect {shlex.quote(self.node.docker_image)} "
+                "--format 'image=ok' >/dev/null; "
+                "if command -v nvidia-smi >/dev/null 2>&1; then "
+                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits; "
+                "else printf 'gpu=unavailable\\n'; fi"
+            )
         completed = self.ssh(command, timeout=30)
         return {
             "success": completed.returncode == 0,
@@ -138,6 +196,13 @@ class RemoteTransport:
         }
 
     def collect_status(self) -> dict[str, Any]:
+        runner_status = (
+            "printf '\\ncontainers='; pgrep -af '[f]actor_service.research.remote_runner' "
+            "2>/dev/null | tr '\\n' ';'"
+            if self.node.runner == "direct_python"
+            else "printf '\\ncontainers='; docker ps --filter label=alphablocks.research=1 "
+            "--format '{{.Names}}|{{.Status}}' 2>/dev/null | tr '\\n' ';'"
+        )
         command = (
             "printf 'cpu_cores='; nproc 2>/dev/null || printf 0; "
             "printf '\\nload='; awk '{print $1}' /proc/loadavg 2>/dev/null || printf 0; "
@@ -146,8 +211,7 @@ class RemoteTransport:
             "printf '\\ngpu='; if command -v nvidia-smi >/dev/null 2>&1; then "
             "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu "
             "--format=csv,noheader,nounits | tr '\\n' ';'; else printf unavailable; fi; "
-            "printf '\\ncontainers='; docker ps --filter label=alphablocks.research=1 "
-            "--format '{{.Names}}|{{.Status}}' 2>/dev/null | tr '\\n' ';'"
+            + runner_status
         )
         try:
             completed = self.ssh(command, timeout=30)
@@ -171,7 +235,9 @@ class RemoteTransport:
                     })
         containers = []
         for line in str(parsed.get("containers") or "").split(";"):
-            if "|" in line:
+            if self.node.runner == "direct_python" and line.strip():
+                containers.append({"name": line.strip(), "status": "running"})
+            elif "|" in line:
                 name, status = line.split("|", 1)
                 containers.append({"name": name, "status": status})
         mem = [_int(item) for item in str(parsed.get("mem") or "").split(",")]
@@ -184,7 +250,7 @@ class RemoteTransport:
             "mem_used_mb": mem[1] if len(mem) > 1 else 0,
             "disk_total_kb": disk[0] if disk else 0,
             "disk_used_kb": disk[1] if len(disk) > 1 else 0,
-            "gpus": gpus, "containers": containers,
+            "gpus": gpus, "containers": containers, "runner": self.node.runner,
             "training_active": bool(containers),
         }
 
@@ -196,7 +262,7 @@ class RemoteTransport:
         cancellation: CancellationToken | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return self._run(
-            [*self._auth_prefix(), *self._ssh_base(), self._target(), command],
+            [*self._auth_prefix(), *self._ssh_base(), command],
             timeout=timeout, cancellation=cancellation,
         )
 
@@ -209,7 +275,11 @@ class RemoteTransport:
         delete: bool = False,
         cancellation: CancellationToken | None = None,
     ) -> None:
-        args = [*self._auth_prefix(), "rsync", "-az", "--partial", "--protect-args"]
+        # macOS ships openrsync 2.6.9, which does not support the newer
+        # --protect-args flag. Node configuration is validated before it reaches
+        # this transport and subprocess receives an argv list, so no shell
+        # interpolation is involved here.
+        args = [*self._auth_prefix(), "rsync", "-az", "--partial"]
         if delete:
             args.append("--delete")
         if directory:
@@ -231,7 +301,7 @@ class RemoteTransport:
     ) -> None:
         destination.mkdir(parents=True, exist_ok=True) if directory else destination.parent.mkdir(parents=True, exist_ok=True)
         args = [
-            *self._auth_prefix(), "rsync", "-az", "--partial", "--protect-args",
+            *self._auth_prefix(), "rsync", "-az", "--partial",
             "-e", shlex.join(self._ssh_base(include_target=False)),
         ]
         remote = f"{self._target()}:{remote_path}" + ("/" if directory else "")
@@ -317,6 +387,7 @@ class RemoteResearchExecutor:
         self.settings = settings
         self.node = node
         self.transport = RemoteTransport(node)
+        self.lifecycle = autodl_client(node) if node.lifecycle_provider else None
         self.snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
 
     def train(
@@ -331,7 +402,10 @@ class RemoteResearchExecutor:
         attempt = max(1, int(job.get("attempt_count") or 1))
         remote_root = f"{self.node.work_dir}/runs/{job_id}/attempt-{attempt:03d}"
         container = f"ab-research-{job_id[-32:]}-{attempt:03d}"
+        remote_ready = False
         try:
+            self._prepare_lifecycle(cancellation=cancellation, progress=progress)
+            remote_ready = True
             progress("remote_materializing_dataset", 4, {"node_id": self.node.node_id})
             builder = DatasetBuilder(self.settings)
             snapshot = self.snapshot_store.get_or_create(
@@ -394,41 +468,53 @@ class RemoteResearchExecutor:
             thread_count = max(1, int(
                 ((job.get("config_json") or {}).get("model") or {}).get("params", {}).get("num_threads") or 4
             ))
-            docker = [
-                "docker", "run", "-d", "--name", container,
-                "--label", "alphablocks.research=1",
-                "--label", f"alphablocks.job_id={job_id}",
-            ]
-            if self.node.gpus and self.node.gpus != "0":
-                docker.extend(["--gpus", self.node.gpus])
-            docker.extend([
-                "-e", "PYTHONPATH=/opt/alphafactor",
-                "-e", f"OMP_NUM_THREADS={thread_count}",
-                "-e", f"MKL_NUM_THREADS={thread_count}",
-                "-e", f"ALPHA_TORCH_DEVICE={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
-                "-e", f"ALPHA_MODEL_ACCELERATOR={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
-                "-v", f"{remote_root}:/workspace",
-                "-v", f"{remote_root}/source:/opt/alphafactor:ro",
-                self.node.docker_image,
-                "python", "-m", "factor_service.research.remote_runner",
-                "/workspace/job.json", "/workspace/work",
-                "/workspace/remote_result.json", "/workspace/artifacts",
-                "/workspace/progress.jsonl",
-            ])
-            command = "docker rm -f {name} >/dev/null 2>&1 || true; {run}".format(
-                name=shlex.quote(container), run=shlex.join(docker),
-            )
+            if self.node.runner == "direct_python":
+                command = self._direct_python_command(remote_root, thread_count)
+            else:
+                docker = [
+                    "docker", "run", "-d", "--name", container,
+                    "--label", "alphablocks.research=1",
+                    "--label", f"alphablocks.job_id={job_id}",
+                ]
+                if self.node.gpus and self.node.gpus != "0":
+                    docker.extend(["--gpus", self.node.gpus])
+                docker.extend([
+                    "-e", "PYTHONPATH=/opt/alphafactor",
+                    "-e", f"OMP_NUM_THREADS={thread_count}",
+                    "-e", f"MKL_NUM_THREADS={thread_count}",
+                    "-e", f"ALPHA_TORCH_DEVICE={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
+                    "-e", f"ALPHA_MODEL_ACCELERATOR={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
+                    "-v", f"{remote_root}:/workspace",
+                    "-v", f"{remote_root}/source:/opt/alphafactor:ro",
+                    self.node.docker_image,
+                    "python", "-m", "factor_service.research.remote_runner",
+                    "/workspace/job.json", "/workspace/work",
+                    "/workspace/remote_result.json", "/workspace/artifacts",
+                    "/workspace/progress.jsonl",
+                ])
+                command = "docker rm -f {name} >/dev/null 2>&1 || true; {run}".format(
+                    name=shlex.quote(container), run=shlex.join(docker),
+                )
             launched = self.transport.ssh(
                 command, timeout=120, cancellation=cancellation,
             )
             if launched.returncode != 0:
-                raise RetryableJobError(f"远程Docker启动失败: {launched.stderr.strip()[-1000:]}")
+                raise RetryableJobError(
+                    f"远程{self.node.runner}启动失败: {launched.stderr.strip()[-1000:]}"
+                )
             progress("remote_training", 62, {
-                "node_id": self.node.node_id, "container": container,
+                "node_id": self.node.node_id,
+                "runner": self.node.runner,
+                **({"container": container} if self.node.runner == "docker" else {}),
             })
-            self._wait_for_container(
-                container, remote_root, cancellation=cancellation, progress=progress,
-            )
+            if self.node.runner == "direct_python":
+                self._wait_for_process(
+                    remote_root, cancellation=cancellation, progress=progress,
+                )
+            else:
+                self._wait_for_container(
+                    container, remote_root, cancellation=cancellation, progress=progress,
+                )
             progress("remote_downloading", 88, {"node_id": self.node.node_id})
             self.transport.pull(
                 f"{remote_root}/work", work_dir,
@@ -448,23 +534,189 @@ class RemoteResearchExecutor:
                     timeout=120, cancellation=cancellation,
                 )
             return result
-        except BaseException:
-            try:
-                self.transport.ssh(
-                    f"docker rm -f {shlex.quote(container)} >/dev/null 2>&1 || true",
-                    timeout=30,
-                )
-            except Exception:
-                pass
-            raise
         finally:
-            try:
-                self.transport.ssh(
-                    f"docker rm -f {shlex.quote(container)} >/dev/null 2>&1 || true",
-                    timeout=30,
+            if remote_ready:
+                self._stop_remote_runner(container, remote_root)
+            self._power_off_after_job(progress)
+
+    def _prepare_lifecycle(
+        self,
+        *,
+        cancellation: CancellationToken,
+        progress: Callable[[str, int, dict[str, Any]], None],
+    ) -> None:
+        if self.lifecycle is None:
+            return
+        progress("remote_checking_power", 1, {
+            "node_id": self.node.node_id,
+            "provider": self.node.lifecycle_provider,
+        })
+        cancellation.checkpoint()
+        state = self.lifecycle.status()
+        if state != "running":
+            if not self.node.auto_start:
+                raise RetryableJobError(
+                    f"AutoDL实例未开机（当前状态: {state}），请先开机或启用自动开机",
                 )
+            progress("remote_powering_on", 2, {
+                "node_id": self.node.node_id, "power_state": state,
+            })
+            self.lifecycle.power_on()
+            state = self.lifecycle.wait_for_running(
+                timeout_seconds=self.node.boot_timeout_minutes * 60,
+                checkpoint=cancellation.checkpoint,
+                on_status=lambda current: progress("remote_powering_on", 2, {
+                    "node_id": self.node.node_id, "power_state": current,
+                }),
+            )
+        snapshot = self.lifecycle.snapshot()
+        self.node = node_with_autodl_endpoint(self.node, snapshot)
+        self.transport = RemoteTransport(self.node)
+        progress("remote_waiting_for_ssh", 3, {
+            "node_id": self.node.node_id,
+            "power_state": state,
+            "host": self.node.host,
+            "port": self.node.port,
+        })
+        deadline = time.monotonic() + self.node.boot_timeout_minutes * 60
+        last_error = ""
+        while time.monotonic() < deadline:
+            cancellation.checkpoint()
+            try:
+                completed = self.transport.ssh(
+                    "true", timeout=20, cancellation=cancellation,
+                )
+                if completed.returncode == 0:
+                    return
+                last_error = completed.stderr.strip()[-500:]
+            except Exception as exc:
+                last_error = str(exc)[-500:]
+            time.sleep(3)
+        raise TimeoutError(
+            f"AutoDL实例已开机但SSH未就绪: {last_error or '连接超时'}",
+        )
+
+    def _power_off_after_job(
+        self,
+        progress: Callable[[str, int, dict[str, Any]], None],
+    ) -> None:
+        if self.lifecycle is None or not self.node.auto_stop:
+            return
+        try:
+            progress("remote_powering_off", 89, {
+                "node_id": self.node.node_id,
+            })
+        except Exception:
+            pass
+        try:
+            self.lifecycle.power_off()
+        except Exception as exc:
+            # A shutdown failure must be visible without retrying an already
+            # completed and potentially expensive training run.
+            try:
+                progress("remote_power_off_failed", 89, {
+                    "node_id": self.node.node_id,
+                    "error": str(exc)[:500],
+                })
             except Exception:
                 pass
+
+    def _direct_python_command(self, remote_root: str, thread_count: int) -> str:
+        gpu_enabled = bool(self.node.gpus and self.node.gpus != "0")
+        paths = {
+            "job": f"{remote_root}/job.json",
+            "work": f"{remote_root}/work",
+            "result": f"{remote_root}/remote_result.json",
+            "artifacts": f"{remote_root}/artifacts",
+            "progress": f"{remote_root}/progress.jsonl",
+            "log": f"{remote_root}/runner.log",
+            "pid": f"{remote_root}/runner.pid",
+            "exit": f"{remote_root}/runner.exit",
+        }
+        runner = [
+            "env",
+            f"PYTHONPATH={remote_root}/source",
+            f"OMP_NUM_THREADS={thread_count}",
+            f"MKL_NUM_THREADS={thread_count}",
+            f"ALPHA_TORCH_DEVICE={'cuda' if gpu_enabled else 'cpu'}",
+            f"ALPHA_MODEL_ACCELERATOR={'cuda' if gpu_enabled else 'cpu'}",
+            self.node.python_executable,
+            "-m", "factor_service.research.remote_runner",
+            paths["job"], paths["work"], paths["result"], paths["artifacts"],
+            paths["progress"],
+        ]
+        inner = (
+            f"{shlex.join(runner)}; code=$?; "
+            f"printf '%s\\n' \"$code\" > {shlex.quote(paths['exit'])}; exit \"$code\""
+        )
+        return (
+            f"rm -f {shlex.quote(paths['exit'])} {shlex.quote(paths['pid'])}; "
+            f"nohup setsid sh -c {shlex.quote(inner)} > {shlex.quote(paths['log'])} 2>&1 < /dev/null & "
+            f"printf '%s\\n' \"$!\" > {shlex.quote(paths['pid'])}"
+        )
+
+    def _stop_remote_runner(self, container: str, remote_root: str) -> None:
+        try:
+            if self.node.runner == "direct_python":
+                pid_path = shlex.quote(f"{remote_root}/runner.pid")
+                command = (
+                    f"if test -f {pid_path}; then pid=$(cat {pid_path}); "
+                    "kill -- \"-$pid\" >/dev/null 2>&1 || "
+                    "kill \"$pid\" >/dev/null 2>&1 || true; fi"
+                )
+            else:
+                command = (
+                    f"docker rm -f {shlex.quote(container)} >/dev/null 2>&1 || true"
+                )
+            self.transport.ssh(command, timeout=30)
+        except Exception:
+            pass
+
+    def _wait_for_process(
+        self,
+        remote_root: str,
+        *,
+        cancellation: CancellationToken,
+        progress: Callable[[str, int, dict[str, Any]], None],
+    ) -> None:
+        deadline = time.monotonic() + self.node.max_runtime_minutes * 60
+        seen = 0
+        exit_path = shlex.quote(f"{remote_root}/runner.exit")
+        pid_path = shlex.quote(f"{remote_root}/runner.pid")
+        while True:
+            cancellation.checkpoint()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"远程训练超过{self.node.max_runtime_minutes}分钟上限",
+                )
+            seen = self._forward_progress(
+                remote_root, seen, cancellation=cancellation, progress=progress,
+            )
+            state = self.transport.ssh(
+                f"if test -f {exit_path}; then printf 'exited '; cat {exit_path}; "
+                f"elif test -f {pid_path} && kill -0 $(cat {pid_path}) 2>/dev/null; "
+                "then printf 'running -1'; else printf 'missing -1'; fi",
+                timeout=30, cancellation=cancellation,
+            )
+            if state.returncode != 0:
+                raise RetryableJobError(
+                    "远程训练状态检查失败: " + state.stderr.strip()[-1000:],
+                )
+            values = state.stdout.strip().split()
+            process_state = values[0] if values else "missing"
+            exit_code = values[1] if len(values) > 1 else "-1"
+            if process_state == "exited" and exit_code == "0":
+                return
+            if process_state in {"exited", "missing"}:
+                logs = self.transport.ssh(
+                    f"tail -n 200 {shlex.quote(remote_root + '/runner.log')} 2>&1 || true",
+                    timeout=60,
+                )
+                raise RuntimeError(
+                    f"远程训练进程异常结束(status={process_state}, exit={exit_code}):\n"
+                    + logs.stdout[-20_000:]
+                )
+            time.sleep(2)
 
     def _wait_for_container(
         self,
@@ -482,22 +734,9 @@ class RemoteResearchExecutor:
                 raise TimeoutError(
                     f"远程训练超过{self.node.max_runtime_minutes}分钟上限",
                 )
-            progress_result = self.transport.ssh(
-                f"cat {shlex.quote(remote_root + '/progress.jsonl')} 2>/dev/null || true",
-                timeout=30, cancellation=cancellation,
+            seen = self._forward_progress(
+                remote_root, seen, cancellation=cancellation, progress=progress,
             )
-            lines = [line for line in progress_result.stdout.splitlines() if line.strip()]
-            for line in lines[seen:]:
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                progress(
-                    f"remote.{item.get('stage') or 'training'}",
-                    min(88, max(62, int(item.get("percent") or 0))),
-                    {"node_id": self.node.node_id, **dict(item.get("details") or {})},
-                )
-            seen = len(lines)
             inspect = self.transport.ssh(
                 "docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "
                 f"{shlex.quote(container)} 2>/dev/null || printf 'missing -1'",
@@ -523,15 +762,49 @@ class RemoteResearchExecutor:
                 )
             time.sleep(2)
 
+    def _forward_progress(
+        self,
+        remote_root: str,
+        seen: int,
+        *,
+        cancellation: CancellationToken,
+        progress: Callable[[str, int, dict[str, Any]], None],
+    ) -> int:
+        progress_result = self.transport.ssh(
+            f"cat {shlex.quote(remote_root + '/progress.jsonl')} 2>/dev/null || true",
+            timeout=30, cancellation=cancellation,
+        )
+        lines = [line for line in progress_result.stdout.splitlines() if line.strip()]
+        for line in lines[seen:]:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            progress(
+                f"remote.{item.get('stage') or 'training'}",
+                min(88, max(62, int(item.get("percent") or 0))),
+                {"node_id": self.node.node_id, **dict(item.get("details") or {})},
+            )
+        return len(lines)
+
 
 def _normalize_node(source: dict[str, Any]) -> RemoteNode:
     node_id = str(source.get("id") or "").strip()
     host = str(source.get("host") or "").strip()
     user = str(source.get("user") or "root").strip()
     work_dir = str(source.get("work_dir") or "/root/alphablocks-research").strip().rstrip("/")
+    runner = str(source.get("runner") or "docker").strip().lower()
+    python_executable = str(source.get("python_executable") or "python").strip()
     image = str(source.get("docker_image") or "alphafactor-research:latest").strip()
     gpus = str(source.get("gpus") or "all").strip()
     password_env = str(source.get("password_env") or "").strip()
+    lifecycle_provider = str(
+        source.get("lifecycle_provider") or ""
+    ).strip().lower()
+    if lifecycle_provider in {"manual", "none"}:
+        lifecycle_provider = ""
+    instance_uuid = str(source.get("instance_uuid") or "").strip()
+    api_token_env = str(source.get("api_token_env") or "").strip()
     if not _IDENTIFIER.fullmatch(node_id) or node_id == "local":
         raise ValueError(f"远程训练节点ID无效: {node_id}")
     if not _HOST.fullmatch(host):
@@ -540,12 +813,30 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         raise ValueError(f"远程训练节点user无效: {user}")
     if not work_dir.startswith("/") or any(part in {"", ".", ".."} for part in PurePosixPath(work_dir).parts[1:]):
         raise ValueError(f"远程训练work_dir必须是安全绝对路径: {work_dir}")
+    if runner not in _REMOTE_RUNNERS:
+        raise ValueError("远程训练runner只允许docker或direct_python")
+    if runner == "direct_python" and (
+        not python_executable.startswith("/")
+        or any(
+            part in {"", ".", ".."}
+            for part in PurePosixPath(python_executable).parts[1:]
+        )
+    ):
+        raise ValueError("direct_python的python_executable必须是安全绝对路径")
     if not _IMAGE.fullmatch(image):
         raise ValueError(f"远程训练docker_image无效: {image}")
     if not _GPU_SPEC.fullmatch(gpus):
         raise ValueError(f"远程训练gpus配置无效: {gpus}")
     if password_env and not _ENV_NAME.fullmatch(password_env):
         raise ValueError(f"远程训练password_env无效: {password_env}")
+    if lifecycle_provider not in _LIFECYCLE_PROVIDERS:
+        raise ValueError("远程节点生命周期只支持manual或autodl_pro")
+    if lifecycle_provider == "autodl_pro":
+        instance_uuid = validate_instance_uuid(instance_uuid)
+        api_token_env = validate_token_environment(api_token_env)
+    else:
+        instance_uuid = ""
+        api_token_env = ""
     port = int(source.get("port") or 22)
     if not 1 <= port <= 65535:
         raise ValueError("远程训练SSH端口必须在1到65535之间")
@@ -562,6 +853,8 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         port=port,
         user=user,
         work_dir=work_dir,
+        runner=runner,
+        python_executable=python_executable,
         docker_image=image,
         gpus=gpus,
         ssh_key=ssh_key,
@@ -570,7 +863,42 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         enabled=bool(source.get("enabled", True)),
         cleanup_success=bool(source.get("cleanup_success", True)),
         max_runtime_minutes=max(10, min(int(source.get("max_runtime_minutes") or 240), 1440)),
+        lifecycle_provider=lifecycle_provider,
+        instance_uuid=instance_uuid,
+        api_token_env=api_token_env,
+        auto_start=(
+            bool(source.get("auto_start", False))
+            if lifecycle_provider else False
+        ),
+        auto_stop=(
+            bool(source.get("auto_stop", False))
+            if lifecycle_provider else False
+        ),
+        boot_timeout_minutes=max(
+            2, min(int(source.get("boot_timeout_minutes") or 15), 60),
+        ),
     )
+
+
+def autodl_client(node: RemoteNode) -> AutoDLProClient:
+    if node.lifecycle_provider != "autodl_pro":
+        raise ValueError(f"远程节点{node.node_id}未启用AutoDL Pro API")
+    return AutoDLProClient(node.instance_uuid, node.api_token_env)
+
+
+def node_with_autodl_endpoint(
+    node: RemoteNode, snapshot: dict[str, Any],
+) -> RemoteNode:
+    host = str(snapshot.get("proxy_host") or "").strip()
+    try:
+        port = int(snapshot.get("ssh_port") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AutoDL实例详情缺少有效SSH端口") from exc
+    if not _HOST.fullmatch(host):
+        raise ValueError("AutoDL实例详情缺少有效SSH地址")
+    if not 1 <= port <= 65535:
+        raise ValueError("AutoDL实例详情缺少有效SSH端口")
+    return replace(node, host=host, port=port)
 
 
 def _load_remote_result(
@@ -639,5 +967,6 @@ def _float(value: Any) -> float:
 
 __all__ = [
     "RemoteNode", "RemoteResearchExecutor", "RemoteTransport",
-    "execution_nodes", "get_remote_node", "load_remote_nodes",
+    "autodl_client", "execution_nodes", "get_remote_node", "load_remote_nodes",
+    "node_with_autodl_endpoint",
 ]

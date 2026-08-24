@@ -95,6 +95,30 @@ def test_successful_job_publishes_artifact_locally_then_records_metadata(tmp_pat
     assert worker.artifact_store.resolve(registered["relative_path"]).read_bytes() == b"formal model bundle"
 
 
+def test_retry_attempt_creates_fresh_work_directory(tmp_path: Path) -> None:
+    artifact = tmp_path / "qlib_experiment.tar.gz"
+    predictions = tmp_path / "predictions.parquet"
+    artifact.write_bytes(b"formal model bundle")
+    predictions.write_bytes(b"")
+
+    class _WorkDirCheckingTrainer(_SuccessfulTrainer):
+        def train(self, _job, work_dir, **_kwargs):
+            assert work_dir.name == "attempt-002"
+            assert work_dir.is_dir()
+            return super().train()
+
+    worker = ResearchWorker(_settings(tmp_path / "work"))
+    api = _Api()
+    worker.control = api
+    worker.trainer = _WorkDirCheckingTrainer(artifact, predictions)
+    job = valid_job()
+    job["attempt_count"] = 2
+
+    worker._run_job(job)
+
+    assert api.completed == ["model_job_test"]
+
+
 def test_invalid_data_failure_is_not_retried(tmp_path: Path) -> None:
     worker = ResearchWorker(_settings(tmp_path))
     api = _Api()

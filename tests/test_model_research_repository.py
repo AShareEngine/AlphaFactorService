@@ -70,6 +70,47 @@ def _trained_model(
     }
 
 
+class _Cursor:
+    def __init__(self, row=None) -> None:
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+class _RecordingConnection:
+    def __init__(self, job_row: dict, *, existing_version=None) -> None:
+        self.job_row = job_row
+        self.existing_version = existing_version
+        self.queries: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def transaction(self):
+        return self
+
+    def execute(self, query, _params=()):
+        normalized = " ".join(str(query).split())
+        self.queries.append(normalized)
+        if normalized.startswith("SELECT * FROM model_jobs"):
+            return _Cursor(self.job_row)
+        if normalized.startswith("SELECT job_id FROM model_versions"):
+            return _Cursor(self.existing_version)
+        return _Cursor()
+
+
+class _RecordingDatabase:
+    def __init__(self, connection: _RecordingConnection) -> None:
+        self.recording_connection = connection
+
+    def connection(self):
+        return self.recording_connection
+
+
 def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     spec = _dataset_spec(_source())
 
@@ -78,6 +119,7 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v2"
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
     }
@@ -101,6 +143,121 @@ def test_classification_target_freezes_binary_label_and_model_loss() -> None:
         "formula": "1[future_return(T,T+5) > 0]",
     }
     assert model["params"]["loss"] == "binary"
+    assert model["params"]["objective"] == "binary"
+    assert model["params"]["metric"] == "auc"
+
+
+def test_model_spec_accepts_quantmind_objective_metrics() -> None:
+    regression = _model_spec({
+        "kind": "lightgbm",
+        "params": {"objective": "regression", "metric": "mae"},
+    }, target_mode="return")
+    classification = _model_spec({
+        "kind": "lightgbm",
+        "params": {"objective": "binary", "metric": "binary_logloss"},
+    }, target_mode="classification")
+
+    assert regression["params"]["metric"] == "mae"
+    assert classification["params"]["metric"] == "binary_logloss"
+
+    with pytest.raises(ModelResearchError, match="Metric"):
+        _model_spec({
+            "kind": "lightgbm",
+            "params": {"objective": "binary", "metric": "rmse"},
+        }, target_mode="classification")
+
+
+def test_completed_job_row_exposes_pending_and_registered_states() -> None:
+    pending = _job_row({
+        "job_id": "job-pending",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "config_json": {"planned_model_version": 3},
+    })
+    registered = _job_row({**pending, "model_version": 3})
+
+    assert pending["planned_model_version"] == 3
+    assert pending["registration_status"] == "pending_confirmation"
+    assert registered["registration_status"] == "registered"
+
+
+def test_training_completion_does_not_insert_model_version_before_confirmation() -> None:
+    row = {
+        "job_id": "job-pending",
+        "kind": "train",
+        "status": "running",
+        "lease_owner": "alpha-factor-service",
+        "lease_token": "lease-token",
+        "cancel_requested": False,
+        "model_id": "model-pending",
+        "dataset_id": "dataset-pending",
+        "title": "待确认模型",
+        "model_kind": "lightgbm",
+        "config_json": {"planned_model_version": 3},
+    }
+    connection = _RecordingConnection(row)
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: {"kind": "train", "status": "running"}
+
+    repository.complete_job(
+        "job-pending", lease_token="lease-token",
+        result={"metrics": {"ic": 0.03}},
+    )
+
+    sql = "\n".join(connection.queries)
+    assert "INSERT INTO model_versions" not in sql
+    assert "model_version = NULL" in sql
+    assert "INSERT INTO model_job_events" in sql
+
+
+def test_explicit_registration_inserts_model_version_and_links_artifacts() -> None:
+    row = {
+        "job_id": "job-pending",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "model_id": "model-pending",
+        "dataset_id": "dataset-pending",
+        "title": "待确认模型",
+        "model_kind": "lightgbm",
+        "config_json": {"planned_model_version": 3},
+        "result_json": {
+            "metrics": {"ic": 0.03},
+            "feature_importance": [],
+            "predictions": {"row_count": 100},
+            "manifest": {"schema_version": "test"},
+        },
+    }
+    connection = _RecordingConnection(row)
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: dict(row)
+
+    repository.register_training_result("job-pending")
+
+    sql = "\n".join(connection.queries)
+    assert "INSERT INTO model_versions" in sql
+    assert "UPDATE model_jobs SET model_version" in sql
+    assert "UPDATE model_artifacts SET model_version" in sql
+
+
+def test_parameter_experiment_only_registers_validation_selected_job() -> None:
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.get_job = lambda _job_id: {
+        "job_id": "job-runner-up",
+        "kind": "train",
+        "status": "succeeded",
+        "config_json": {"experiment": {"experiment_id": "experiment-1"}},
+    }
+    repository.get_training_experiment = lambda _experiment_id: {
+        "selection": {
+            "status": "selected",
+            "selected_job_id": "job-winner",
+        },
+    }
+
+    with pytest.raises(ModelResearchConflict, match="只允许验证集入选版本"):
+        repository.register_training_result("job-runner-up")
 
 
 def test_dataset_contract_freezes_stock_entity_asset_fields_without_factor_definition() -> None:

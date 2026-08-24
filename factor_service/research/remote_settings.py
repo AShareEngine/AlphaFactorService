@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from factor_service.research.autodl import api_token_status, save_api_token
 from factor_service.research.remote import RemoteNode, load_remote_nodes
 from factor_service.runtime_config import load_runtime_config, runtime_config_path
 
@@ -35,6 +36,7 @@ def create_remote_node_setting(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"远程训练节点已存在: {node_id}")
         nodes.append(_submitted_node(node_id, payload))
         saved = _validate_and_write(runtime, nodes)
+        _save_submitted_api_token(payload)
     return _settings_view(saved[node_id])
 
 
@@ -56,7 +58,16 @@ def update_remote_node_setting(
             raise ValueError("远程训练节点ID创建后不可修改")
         nodes[index] = _submitted_node(clean_id, payload)
         saved = _validate_and_write(runtime, nodes)
+        _save_submitted_api_token(payload)
     return _settings_view(saved[clean_id])
+
+
+def _save_submitted_api_token(payload: dict[str, Any]) -> None:
+    if str(payload.get("lifecycle_provider") or "").strip() != "autodl_pro":
+        return
+    token = str(payload.get("api_token") or "").strip()
+    if token:
+        save_api_token(token)
 
 
 def delete_remote_node_setting(node_id: str) -> dict[str, Any]:
@@ -103,12 +114,26 @@ def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "work_dir": str(
             payload.get("work_dir") or "/root/alphablocks-research"
         ).strip(),
+        "runner": str(payload.get("runner") or "docker").strip(),
+        "python_executable": str(
+            payload.get("python_executable") or "python"
+        ).strip(),
         "docker_image": str(
             payload.get("docker_image") or "alphafactor-research:latest"
         ).strip(),
         "gpus": str(payload.get("gpus") or "all").strip(),
         "max_runtime_minutes": int(payload.get("max_runtime_minutes") or 240),
         "cleanup_success": _boolean(payload.get("cleanup_success"), True),
+        "lifecycle_provider": str(
+            payload.get("lifecycle_provider") or ""
+        ).strip().lower(),
+        "instance_uuid": str(payload.get("instance_uuid") or "").strip(),
+        "api_token_env": str(payload.get("api_token_env") or "").strip(),
+        "auto_start": _boolean(payload.get("auto_start"), False),
+        "auto_stop": _boolean(payload.get("auto_stop"), False),
+        "boot_timeout_minutes": int(
+            payload.get("boot_timeout_minutes") or 15
+        ),
     }
 
 
@@ -146,6 +171,10 @@ def _atomic_write_runtime(runtime: dict[str, Any]) -> None:
 
 
 def _settings_view(node: RemoteNode) -> dict[str, Any]:
+    token_status = (
+        api_token_status(node.api_token_env)
+        if node.api_token_env else {"configured": False, "source": "none"}
+    )
     return {
         **node.public(),
         "ssh_key": str(node.ssh_key or ""),
@@ -156,6 +185,15 @@ def _settings_view(node: RemoteNode) -> dict[str, Any]:
         "known_hosts": str(node.known_hosts or ""),
         "cleanup_success": node.cleanup_success,
         "max_runtime_minutes": node.max_runtime_minutes,
+        "api_token_env": node.api_token_env,
+        "api_token_configured": bool(token_status["configured"]),
+        "api_token_environment_configured": bool(token_status["configured"]),
+        "api_token_source": token_status["source"],
+        "lifecycle_provider": node.lifecycle_provider or "manual",
+        "instance_uuid": node.instance_uuid,
+        "auto_start": node.auto_start,
+        "auto_stop": node.auto_stop,
+        "boot_timeout_minutes": node.boot_timeout_minutes,
         "configuration_valid": True,
         "authentication_hint": (
             "SSH私钥" if node.ssh_key is not None

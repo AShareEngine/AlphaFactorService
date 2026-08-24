@@ -357,6 +357,8 @@ def get_execution_node_settings() -> dict[str, Any]:
                 "password_storage": "environment_variable",
                 "password_values_returned": False,
                 "ssh_key_recommended": True,
+                "api_token_storage": "secure_file_or_environment",
+                "api_token_values_returned": False,
             },
         }
     except Exception as exc:
@@ -415,12 +417,38 @@ def get_execution_node_status(node_id: str, request: Request) -> dict[str, Any]:
                     "progress": status.get("progress") or {},
                 },
             }
-        from factor_service.research.remote import RemoteTransport, get_remote_node
+        from factor_service.research.autodl import sanitize_snapshot
+        from factor_service.research.remote import (
+            RemoteTransport,
+            autodl_client,
+            get_remote_node,
+            node_with_autodl_endpoint,
+        )
 
-        return {
-            "ok": True,
-            "status": RemoteTransport(get_remote_node(node_id)).collect_status(),
-        }
+        node = get_remote_node(node_id)
+        if node.lifecycle_provider != "autodl_pro":
+            return {
+                "ok": True,
+                "status": RemoteTransport(node).collect_status(),
+            }
+        client = autodl_client(node)
+        power_state = client.status()
+        if power_state != "running":
+            return {
+                "ok": True,
+                "status": {
+                    **node.public(), "online": False,
+                    "training_active": False, "power_state": power_state,
+                },
+            }
+        snapshot = client.snapshot()
+        active_node = node_with_autodl_endpoint(node, snapshot)
+        status = RemoteTransport(active_node).collect_status()
+        status.update({
+            "power_state": power_state,
+            "autodl": sanitize_snapshot(snapshot),
+        })
+        return {"ok": True, "status": status}
     except Exception as exc:
         _raise(exc)
 
@@ -434,14 +462,187 @@ def test_execution_node(node_id: str, request: Request) -> dict[str, Any]:
                 "ok": True, "success": bool(status.get("ready")),
                 "node_id": "local", "detail": "AlphaFactorService研究调度器可用",
             }
-        from factor_service.research.remote import RemoteTransport, get_remote_node
+        from factor_service.research.remote import (
+            RemoteTransport,
+            autodl_client,
+            get_remote_node,
+            node_with_autodl_endpoint,
+        )
 
+        node = get_remote_node(node_id)
+        if node.lifecycle_provider == "autodl_pro":
+            client = autodl_client(node)
+            power_state = client.status()
+            if power_state != "running":
+                return {
+                    "ok": True, "success": False, "node_id": node_id,
+                    "power_state": power_state,
+                    "detail": f"AutoDL实例当前状态: {power_state}",
+                }
+            node = node_with_autodl_endpoint(node, client.snapshot())
         return {
             "ok": True,
-            **RemoteTransport(get_remote_node(node_id)).test_connection(),
+            **RemoteTransport(node).test_connection(),
         }
     except Exception as exc:
         _raise(exc)
+
+
+@router.get("/execution-nodes/{node_id}/lifecycle")
+def get_execution_node_lifecycle(node_id: str) -> dict[str, Any]:
+    try:
+        from factor_service.research.autodl import sanitize_snapshot
+        from factor_service.research.remote import autodl_client, get_remote_node
+
+        node = get_remote_node(node_id)
+        client = autodl_client(node)
+        power_state = client.status()
+        snapshot = (
+            sanitize_snapshot(client.snapshot())
+            if power_state == "running" else None
+        )
+        return {
+            "ok": True,
+            "lifecycle": {
+                "provider": "autodl_pro",
+                "instance_uuid": node.instance_uuid,
+                "configured": client.configured(),
+                "power_state": power_state,
+                "snapshot": snapshot,
+                "capabilities": {
+                    "power_on": True,
+                    "power_off": True,
+                    "save_image": True,
+                    "list_images": True,
+                    "create_instance_from_image": True,
+                },
+            },
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/execution-nodes/{node_id}/power-on")
+def power_on_execution_node(node_id: str) -> dict[str, Any]:
+    try:
+        from factor_service.research.remote import autodl_client, get_remote_node
+
+        node = get_remote_node(node_id)
+        client = autodl_client(node)
+        before = client.status()
+        if before != "running":
+            client.power_on()
+        return {
+            "ok": True,
+            "lifecycle": {
+                "provider": "autodl_pro", "instance_uuid": node.instance_uuid,
+                "previous_state": before,
+                "power_state": "running" if before == "running" else "starting",
+            },
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/execution-nodes/{node_id}/power-off")
+def power_off_execution_node(node_id: str, request: Request) -> dict[str, Any]:
+    try:
+        _assert_execution_node_idle(request, node_id)
+        from factor_service.research.remote import autodl_client, get_remote_node
+
+        node = get_remote_node(node_id)
+        client = autodl_client(node)
+        before = client.status()
+        if before not in {"stopped", "shutdown", "closed"}:
+            client.power_off()
+        return {
+            "ok": True,
+            "lifecycle": {
+                "provider": "autodl_pro", "instance_uuid": node.instance_uuid,
+                "previous_state": before,
+                "power_state": (
+                    before if before in {"stopped", "shutdown", "closed"}
+                    else "stopping"
+                ),
+            },
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/execution-nodes/{node_id}/images")
+def list_execution_node_images(
+    node_id: str,
+    page_index: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=100),
+) -> dict[str, Any]:
+    try:
+        from factor_service.research.remote import autodl_client, get_remote_node
+
+        data = autodl_client(get_remote_node(node_id)).list_images(
+            page_index=page_index, page_size=page_size,
+        )
+        images = [{
+            key: item.get(key)
+            for key in ("image_uuid", "name", "status", "image_size", "create_at")
+            if item.get(key) is not None
+        } for item in (data.get("list") or []) if isinstance(item, dict)]
+        return {
+            "ok": True, "images": images,
+            "pagination": {
+                key: data.get(key)
+                for key in (
+                    "page_index", "page_size", "max_page", "result_total",
+                )
+            },
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/execution-nodes/{node_id}/images", status_code=HTTPStatus.ACCEPTED)
+def save_execution_node_image(
+    node_id: str, request: Request, payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        _assert_execution_node_idle(request, node_id)
+        from factor_service.research.remote import autodl_client, get_remote_node
+
+        node = get_remote_node(node_id)
+        client = autodl_client(node)
+        power_state = client.status()
+        if power_state not in {"stopped", "shutdown", "closed"}:
+            raise ModelResearchConflict("保存镜像前必须先关闭AutoDL实例")
+        image = client.save_image(str(payload.get("image_name") or ""))
+        return {
+            "ok": True,
+            "image": {"image_uuid": str(image.get("image_uuid") or "")},
+            "status": "saving",
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+def _assert_execution_node_idle(request: Request, node_id: str) -> None:
+    worker_status = _worker(request).status()
+    active_job_id = str(worker_status.get("active_job_id") or "")
+    if not active_job_id:
+        return
+    try:
+        active_job = repository.get_job(active_job_id)
+    except Exception:
+        raise ModelResearchConflict(
+            f"研究调度器正在执行任务 {active_job_id}，不能关闭或保存节点",
+        )
+    active_node_id = str(
+        ((active_job.get("config_json") or {}).get("execution") or {}).get(
+            "node_id"
+        ) or "local"
+    )
+    if active_node_id == node_id:
+        raise ModelResearchConflict(
+            f"节点正在执行训练任务 {active_job_id}，请等待完成或先取消任务",
+        )
 
 
 @router.post("/jobs", status_code=HTTPStatus.CREATED)
@@ -501,6 +702,14 @@ def get_job(job_id: str) -> dict[str, Any]:
 def cancel_job(job_id: str) -> dict[str, Any]:
     try:
         return {"ok": True, "job": repository.cancel_job(job_id)}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/jobs/{job_id}/register")
+def register_training_result(job_id: str) -> dict[str, Any]:
+    try:
+        return {"ok": True, "job": repository.register_training_result(job_id)}
     except Exception as exc:
         _raise(exc)
 

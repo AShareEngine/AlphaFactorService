@@ -184,6 +184,16 @@ class _Repository:
     def get_job(self, job_id):
         return dict(self.jobs[job_id])
 
+    def register_training_result(self, job_id):
+        job = {
+            **self.jobs[job_id],
+            "status": "succeeded",
+            "model_version": 1,
+            "registration_status": "registered",
+        }
+        self.jobs[job_id] = job
+        return dict(job)
+
     def claim_specific_job(self, job_id, *, lease_seconds):
         job = {
             **self.jobs[job_id],
@@ -352,6 +362,17 @@ def test_training_job_is_created_and_dispatched_locally(monkeypatch) -> None:
     assert dispatched.status_code == 202
     assert dispatched.json()["service"]["accepted"] is True
     assert scheduler.submitted[0]["lease_owner"] == "alpha-factor-service"
+
+
+def test_completed_training_requires_explicit_registration(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    response = client.post("/model-research/jobs/job-done/register", json={})
+
+    assert response.status_code == 200
+    assert response.json()["job"]["registration_status"] == "registered"
+    assert response.json()["job"]["model_version"] == 1
 
 
 def test_training_targets_expose_real_availability(monkeypatch) -> None:
