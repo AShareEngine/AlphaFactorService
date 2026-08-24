@@ -1134,36 +1134,6 @@ class ModelResearchRepository:
             raise ModelResearchNotFound("参数实验不存在")
         return _experiment_summary(experiment_id, jobs)
 
-    def list_training_experiments(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 200))
-        with self.database.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT config_json -> 'experiment' ->> 'experiment_id' AS experiment_id,
-                       max(requested_at) AS last_requested_at
-                FROM model_jobs
-                WHERE kind = 'train'
-                  AND config_json -> 'experiment' ->> 'experiment_id' IS NOT NULL
-                GROUP BY config_json -> 'experiment' ->> 'experiment_id'
-                ORDER BY max(requested_at) DESC
-                LIMIT %s
-                """,
-                (safe_limit,),
-            ).fetchall()
-        experiments = []
-        for row in rows:
-            summary = self.get_training_experiment(str(row["experiment_id"]))
-            # 历史列表只返回卡片/表格所需的摘要。完整任务结果、产物清单和
-            # trial_assessments 留在实验详情接口，避免实验增多后列表响应膨胀。
-            summary.pop("jobs", None)
-            summary.pop("comparison", None)
-            selection = dict(summary.get("selection") or {})
-            selection.pop("trial_assessments", None)
-            summary["selection"] = selection
-            summary["last_requested_at"] = _job_row(row)["last_requested_at"]
-            experiments.append(summary)
-        return experiments
-
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.database.connection() as conn:
             row = conn.execute(
@@ -1489,6 +1459,11 @@ class ModelResearchRepository:
         current = self.get_job(job_id)
         if str(current.get("kind") or "train") != "train":
             raise ModelResearchConflict("只有训练任务结果可以确认入库")
+        registration = dict(
+            (current.get("result_json") or {}).get("registration") or {}
+        )
+        if str(registration.get("status") or "") == "declined":
+            raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
         experiment = dict(
             (current.get("config_json") or {}).get("experiment") or {}
         )
@@ -1535,6 +1510,9 @@ class ModelResearchRepository:
                 result = dict(row["result_json"] or {})
                 if not result:
                     raise ModelResearchConflict("训练结果尚未写入，不能确认入库")
+                registration = dict(result.get("registration") or {})
+                if str(registration.get("status") or "") == "declined":
+                    raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
                 if not existing:
                     conn.execute(
                         """
@@ -1570,6 +1548,49 @@ class ModelResearchRepository:
                         message="用户已确认训练结果入库",
                         payload={"model_id": model_id, "model_version": version},
                     )
+        return self.get_job(job_id)
+
+    def decline_training_result(self, job_id: str) -> dict[str, Any]:
+        """Persist the user's decision to keep a completed result out of the registry."""
+        now = _utcnow()
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型任务不存在")
+                if str(row["kind"] or "train") != "train":
+                    raise ModelResearchConflict("只有训练任务结果可以选择不入库")
+                if str(row["status"] or "") != "succeeded":
+                    raise ModelResearchConflict("只有训练完成的任务可以选择不入库")
+                if int(row.get("model_version") or 0) > 0:
+                    raise ModelResearchConflict("该训练结果已经入库")
+                result = dict(row["result_json"] or {})
+                if not result:
+                    raise ModelResearchConflict("训练结果尚未写入，不能选择不入库")
+                registration = dict(result.get("registration") or {})
+                if str(registration.get("status") or "") == "declined":
+                    return self.get_job(job_id)
+                result["registration"] = {
+                    "status": "declined",
+                    "decided_at": now.isoformat(),
+                }
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET result_json = %s, updated_at = %s
+                    WHERE job_id = %s
+                    """,
+                    (Jsonb(result), now, job_id),
+                )
+                self._event(
+                    conn, job_id, "job.registration_declined",
+                    stage="registration_declined",
+                    message="用户已选择训练结果不入库",
+                    payload={"registration_status": "declined"},
+                )
         return self.get_job(job_id)
 
     def _complete_inference_job(
@@ -4639,6 +4660,11 @@ def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
         result["registration_status"] = (
             "registered"
             if int(result.get("model_version") or 0) > 0
+            else "declined"
+            if str(
+                ((result.get("result_json") or {}).get("registration") or {}).get("status")
+                or ""
+            ) == "declined"
             else "pending_confirmation"
         )
     return result

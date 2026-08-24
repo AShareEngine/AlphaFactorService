@@ -171,16 +171,6 @@ class _Repository:
             "jobs": jobs,
         }
 
-    def list_training_experiments(self, *, limit):
-        experiment_ids = []
-        for job in self.jobs.values():
-            experiment_id = str(
-                job.get("config_json", {}).get("experiment", {}).get("experiment_id") or ""
-            )
-            if experiment_id and experiment_id not in experiment_ids:
-                experiment_ids.append(experiment_id)
-        return [self.get_training_experiment(item) for item in experiment_ids[:limit]]
-
     def get_job(self, job_id):
         return dict(self.jobs[job_id])
 
@@ -190,6 +180,16 @@ class _Repository:
             "status": "succeeded",
             "model_version": 1,
             "registration_status": "registered",
+        }
+        self.jobs[job_id] = job
+        return dict(job)
+
+    def decline_training_result(self, job_id):
+        job = {
+            **self.jobs[job_id],
+            "status": "succeeded",
+            "model_version": None,
+            "registration_status": "declined",
         }
         self.jobs[job_id] = job
         return dict(job)
@@ -375,6 +375,17 @@ def test_completed_training_requires_explicit_registration(monkeypatch) -> None:
     assert response.json()["job"]["model_version"] == 1
 
 
+def test_completed_training_can_be_kept_out_of_registry(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    response = client.post("/model-research/jobs/job-done/decline-registration", json={})
+
+    assert response.status_code == 200
+    assert response.json()["job"]["registration_status"] == "declined"
+    assert response.json()["job"]["model_version"] is None
+
+
 def test_training_targets_expose_real_availability(monkeypatch) -> None:
     class _DatasetBuilder:
         def __init__(self, _settings):
@@ -525,13 +536,12 @@ def test_model_registry_action_uses_validation_gate_and_returns_pool_state(monke
     assert response.json()["model"]["registry"]["is_default"] is True
 
 
-def test_model_leaderboard_and_research_report_routes(monkeypatch) -> None:
+def test_model_research_report_routes(monkeypatch) -> None:
     client = _client(monkeypatch, _Repository(), _Scheduler())
     monkeypatch.setattr(
         model_research.model_repository, "latest_model_backtests", lambda _keys: {},
     )
 
-    leaderboard = client.get("/model-research/leaderboard")
     report = client.get(
         "/model-research/models/model-1/versions/1/research-report",
     )
@@ -539,9 +549,6 @@ def test_model_leaderboard_and_research_report_routes(monkeypatch) -> None:
         "/model-research/models/model-1/versions/1/research-report.md",
     )
 
-    assert leaderboard.status_code == 200
-    assert leaderboard.json()["leaderboard"]["selection_split"] == "validation"
-    assert leaderboard.json()["leaderboard"]["models"][0]["cohort_rank"] == 1
     assert report.status_code == 200
     assert report.json()["report"]["identity"]["model_id"] == "model-1"
     assert "Dataset Hash" in report.json()["markdown"]
@@ -587,20 +594,6 @@ def test_experiment_lineage_conflict_is_returned_as_http_409(monkeypatch) -> Non
 
     assert response.status_code == 409
     assert "冻结因子" in response.json()["detail"]
-
-
-def test_grid_experiments_have_a_history_endpoint(monkeypatch) -> None:
-    repository = _Repository()
-    client = _client(monkeypatch, repository, _Scheduler())
-    client.post(
-        "/model-research/experiments",
-        json={"title": "LGBM参数实验", "search": {"parameters": {}}},
-    )
-
-    response = client.get("/model-research/experiments")
-
-    assert response.status_code == 200
-    assert response.json()["experiments"][0]["experiment_id"] == "model_experiment_created"
 
 
 def test_research_template_crud_routes(monkeypatch) -> None:

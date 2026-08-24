@@ -30,7 +30,6 @@ from factor_service.model_validation import (
     assess_walk_forward_stability,
 )
 from factor_service.model_registry import (
-    build_model_leaderboard,
     build_model_research_report,
     render_model_research_report_markdown,
 )
@@ -50,7 +49,6 @@ from factor_service.model_research_repository import (
 )
 from factor_service.research.worker import ResearchWorker
 from factor_service.research.schedule import dispatch_job as dispatch_model_job
-from factor_service.research.schedule import run_inference_schedule_tick
 from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
 from factor_service.schemas import ModelBacktestJobCreate
 
@@ -666,19 +664,6 @@ def create_experiment(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         _raise(exc)
 
 
-@router.get("/experiments")
-def list_experiments(
-    limit: int = Query(default=100, ge=1, le=200),
-) -> dict[str, Any]:
-    try:
-        return {
-            "ok": True,
-            "experiments": repository.list_training_experiments(limit=limit),
-        }
-    except Exception as exc:
-        _raise(exc)
-
-
 @router.get("/experiments/{experiment_id}")
 def get_experiment(experiment_id: str) -> dict[str, Any]:
     try:
@@ -710,6 +695,14 @@ def cancel_job(job_id: str) -> dict[str, Any]:
 def register_training_result(job_id: str) -> dict[str, Any]:
     try:
         return {"ok": True, "job": repository.register_training_result(job_id)}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/jobs/{job_id}/decline-registration")
+def decline_training_result(job_id: str) -> dict[str, Any]:
+    try:
+        return {"ok": True, "job": repository.decline_training_result(job_id)}
     except Exception as exc:
         _raise(exc)
 
@@ -777,35 +770,6 @@ def list_models(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]
                 summaries.get(experiment_id),
             ))
         return {"ok": True, "models": responses}
-    except Exception as exc:
-        _raise(exc)
-
-
-@router.get("/leaderboard")
-def get_model_leaderboard(
-    limit: int = Query(default=500, ge=1, le=500),
-) -> dict[str, Any]:
-    try:
-        models = repository.list_models(limit=limit)
-        backtests = model_repository.latest_model_backtests([
-            (str(model["model_id"]), int(model["version"])) for model in models
-        ])
-        summaries: dict[str, dict[str, Any]] = {}
-        responses = []
-        for model in models:
-            experiment_id = str(
-                ((model.get("job_config_json") or {}).get("experiment") or {}).get(
-                    "experiment_id"
-                ) or ""
-            )
-            if experiment_id and experiment_id not in summaries:
-                summaries[experiment_id] = repository.get_training_experiment(experiment_id)
-            responses.append(_model_response(
-                model,
-                backtests.get((str(model["model_id"]), int(model["version"]))),
-                summaries.get(experiment_id),
-            ))
-        return {"ok": True, "leaderboard": build_model_leaderboard(responses)}
     except Exception as exc:
         _raise(exc)
 
@@ -2887,23 +2851,6 @@ def update_inference_schedule(
         return {
             "ok": True,
             "schedule": repository.update_inference_schedule(model_id, version, payload),
-        }
-    except Exception as exc:
-        _raise(exc)
-
-
-@router.post("/inference-scheduler/tick")
-def inference_scheduler_tick(
-    request: Request, payload: dict[str, Any] = Body(default={}),
-) -> dict[str, Any]:
-    try:
-        return {
-            "ok": True,
-            **run_inference_schedule_tick(
-                repository,
-                _worker(request),
-                force=bool(payload.get("force", False)),
-            ),
         }
     except Exception as exc:
         _raise(exc)

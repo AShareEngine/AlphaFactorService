@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from factor_service.model_registry import (
-    build_model_leaderboard,
     build_model_research_report,
     render_model_research_report_markdown,
 )
@@ -88,37 +87,6 @@ def _model(
             "trading_days": 500,
         },
     }
-
-
-def test_leaderboard_ranks_only_within_exact_research_cohort():
-    t5_better = _model("t5_better", 1, validation_rank_ic=0.05, validation_ic_ir=0.4)
-    t5_weaker = _model("t5_weaker", 1, validation_rank_ic=0.03, validation_ic_ir=0.35)
-    t1 = _model("t1", 1, validation_rank_ic=0.08, validation_ic_ir=0.7, horizon=1)
-    archived = _model(
-        "archived", 1, validation_rank_ic=0.9, validation_ic_ir=2.0,
-        stage="archived",
-    )
-    unmeasured = _model("unmeasured", 1, validation_rank_ic=0.0, validation_ic_ir=0.0)
-    unmeasured["metrics_json"]["validation"] = {}
-
-    result = build_model_leaderboard([t5_weaker, t1, archived, unmeasured, t5_better])
-
-    assert result["selection_split"] == "validation"
-    assert result["test_metrics_role"] == "report_only"
-    assert result["summary"]["active_count"] == 4
-    assert result["summary"]["archived_count"] == 1
-    assert result["summary"]["cohort_count"] == 2
-    t5_rows = [item for item in result["models"] if item["model_id"].startswith("t5_")]
-    assert [(item["model_id"], item["cohort_rank"]) for item in t5_rows] == [
-        ("t5_better", 1), ("t5_weaker", 2),
-    ]
-    assert all(item["validation_gate_passed"] for item in t5_rows)
-    assert next(item for item in result["models"] if item["model_id"] == "t1")["cohort_rank"] == 1
-    unmeasured_row = next(
-        item for item in result["models"] if item["model_id"] == "unmeasured"
-    )
-    assert unmeasured_row["cohort_rank"] is None
-    assert unmeasured_row["cohort_size"] == 2
 
 
 def test_research_report_contains_reproducibility_and_does_not_promote_candidate():

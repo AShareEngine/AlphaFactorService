@@ -176,10 +176,18 @@ def test_completed_job_row_exposes_pending_and_registered_states() -> None:
         "config_json": {"planned_model_version": 3},
     })
     registered = _job_row({**pending, "model_version": 3})
+    declined = _job_row({
+        **pending,
+        "result_json": {
+            "metrics": {"ic": 0.03},
+            "registration": {"status": "declined"},
+        },
+    })
 
     assert pending["planned_model_version"] == 3
     assert pending["registration_status"] == "pending_confirmation"
     assert registered["registration_status"] == "registered"
+    assert declined["registration_status"] == "declined"
 
 
 def test_training_completion_does_not_insert_model_version_before_confirmation() -> None:
@@ -239,6 +247,43 @@ def test_explicit_registration_inserts_model_version_and_links_artifacts() -> No
     assert "INSERT INTO model_versions" in sql
     assert "UPDATE model_jobs SET model_version" in sql
     assert "UPDATE model_artifacts SET model_version" in sql
+
+
+def test_declining_registration_preserves_result_without_creating_version() -> None:
+    row = {
+        "job_id": "job-pending",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "result_json": {"metrics": {"ic": 0.03}},
+    }
+    connection = _RecordingConnection(row)
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: {
+        **row,
+        "registration_status": "declined",
+    }
+
+    repository.decline_training_result("job-pending")
+
+    sql = "\n".join(connection.queries)
+    assert "UPDATE model_jobs SET result_json" in sql
+    assert "INSERT INTO model_versions" not in sql
+    assert "job.registration_declined" not in sql
+    assert "INSERT INTO model_job_events" in sql
+
+
+def test_declined_training_result_cannot_be_registered() -> None:
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.get_job = lambda _job_id: {
+        "job_id": "job-declined",
+        "kind": "train",
+        "status": "succeeded",
+        "result_json": {"registration": {"status": "declined"}},
+    }
+
+    with pytest.raises(ModelResearchConflict, match="已选择不入库"):
+        repository.register_training_result("job-declined")
 
 
 def test_parameter_experiment_only_registers_validation_selected_job() -> None:
