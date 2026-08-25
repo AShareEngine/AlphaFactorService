@@ -1,28 +1,25 @@
 from __future__ import annotations
 
 import os
-import stat
 import threading
 from typing import Any
 
-import yaml
-
 from factor_service.research.autodl import api_token_status, save_api_token
-from factor_service.research.remote import RemoteNode, load_remote_nodes
-from factor_service.runtime_config import load_runtime_config, runtime_config_path
+from factor_service.research.remote import (
+    RemoteNode,
+    load_remote_nodes,
+    remote_node_storage_payload,
+)
+from factor_service.research.remote_node_repository import (
+    get_remote_node_repository,
+)
 
 
 _CONFIG_LOCK = threading.RLock()
 
 
 def list_remote_node_settings() -> list[dict[str, Any]]:
-    runtime = load_runtime_config()
-    raw_nodes = _raw_remote_nodes(runtime)
-    normalized = {node.node_id: node for node in load_remote_nodes(runtime)}
-    return [
-        _settings_view(normalized[str(raw.get("id") or "").strip()])
-        for raw in raw_nodes
-    ]
+    return [_settings_view(node) for node in load_remote_nodes()]
 
 
 def create_remote_node_setting(payload: dict[str, Any]) -> dict[str, Any]:
@@ -30,14 +27,13 @@ def create_remote_node_setting(payload: dict[str, Any]) -> dict[str, Any]:
     if not node_id:
         raise ValueError("远程训练节点ID不能为空")
     with _CONFIG_LOCK:
-        runtime = load_runtime_config()
-        nodes = _raw_remote_nodes(runtime)
-        if any(str(item.get("id") or "").strip() == node_id for item in nodes):
-            raise ValueError(f"远程训练节点已存在: {node_id}")
-        nodes.append(_submitted_node(node_id, payload))
-        saved = _validate_and_write(runtime, nodes)
+        load_remote_nodes()
+        node = _validated_submitted_node(node_id, payload)
+        stored = get_remote_node_repository().create_node(
+            remote_node_storage_payload(node),
+        )
         _save_submitted_api_token(payload)
-    return _settings_view(saved[node_id])
+    return _settings_view(_validated_stored_node(stored))
 
 
 def update_remote_node_setting(
@@ -45,21 +41,16 @@ def update_remote_node_setting(
 ) -> dict[str, Any]:
     clean_id = str(node_id or "").strip()
     with _CONFIG_LOCK:
-        runtime = load_runtime_config()
-        nodes = _raw_remote_nodes(runtime)
-        index = next((
-            index for index, item in enumerate(nodes)
-            if str(item.get("id") or "").strip() == clean_id
-        ), None)
-        if index is None:
-            raise ValueError(f"远程训练节点未配置: {clean_id}")
         submitted_id = str(payload.get("id") or clean_id).strip()
         if submitted_id != clean_id:
             raise ValueError("远程训练节点ID创建后不可修改")
-        nodes[index] = _submitted_node(clean_id, payload)
-        saved = _validate_and_write(runtime, nodes)
+        load_remote_nodes()
+        node = _validated_submitted_node(clean_id, payload)
+        stored = get_remote_node_repository().update_node(
+            clean_id, remote_node_storage_payload(node),
+        )
         _save_submitted_api_token(payload)
-    return _settings_view(saved[clean_id])
+    return _settings_view(_validated_stored_node(stored))
 
 
 def _save_submitted_api_token(payload: dict[str, Any]) -> None:
@@ -73,31 +64,21 @@ def _save_submitted_api_token(payload: dict[str, Any]) -> None:
 def delete_remote_node_setting(node_id: str) -> dict[str, Any]:
     clean_id = str(node_id or "").strip()
     with _CONFIG_LOCK:
-        runtime = load_runtime_config()
-        nodes = _raw_remote_nodes(runtime)
-        remaining = [
-            item for item in nodes
-            if str(item.get("id") or "").strip() != clean_id
-        ]
-        if len(remaining) == len(nodes):
+        load_remote_nodes()
+        if not get_remote_node_repository().delete_node(clean_id):
             raise ValueError(f"远程训练节点未配置: {clean_id}")
-        _validate_and_write(runtime, remaining)
     return {"id": clean_id, "deleted": True}
 
 
-def _raw_remote_nodes(runtime: dict[str, Any]) -> list[dict[str, Any]]:
-    research = runtime.get("research") or {}
-    if not isinstance(research, dict):
-        raise ValueError("research配置必须是对象")
-    execution = research.get("execution") or {}
-    if not isinstance(execution, dict):
-        raise ValueError("research.execution配置必须是对象")
-    nodes = execution.get("remote_nodes") or []
-    if not isinstance(nodes, list):
-        raise ValueError("research.execution.remote_nodes必须是数组")
-    if any(not isinstance(item, dict) for item in nodes):
-        raise ValueError("远程训练节点配置必须是对象")
-    return [dict(item) for item in nodes]
+def _validated_submitted_node(
+    node_id: str, payload: dict[str, Any],
+) -> RemoteNode:
+    return _validated_stored_node(_submitted_node(node_id, payload))
+
+
+def _validated_stored_node(payload: dict[str, Any]) -> RemoteNode:
+    runtime = {"research": {"execution": {"remote_nodes": [payload]}}}
+    return load_remote_nodes(runtime)[0]
 
 
 def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -135,39 +116,6 @@ def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             payload.get("boot_timeout_minutes") or 15
         ),
     }
-
-
-def _validate_and_write(
-    runtime: dict[str, Any], nodes: list[dict[str, Any]],
-) -> dict[str, RemoteNode]:
-    updated = dict(runtime)
-    research = dict(updated.get("research") or {})
-    execution = dict(research.get("execution") or {})
-    execution["remote_nodes"] = nodes
-    research["execution"] = execution
-    updated["research"] = research
-    normalized = load_remote_nodes(updated)
-    _atomic_write_runtime(updated)
-    return {node.node_id: node for node in normalized}
-
-
-def _atomic_write_runtime(runtime: dict[str, Any]) -> None:
-    target = runtime_config_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    original_mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    try:
-        serialized = yaml.safe_dump(
-            runtime, allow_unicode=True, sort_keys=False, default_flow_style=False,
-        )
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(original_mode)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _settings_view(node: RemoteNode) -> dict[str, Any]:

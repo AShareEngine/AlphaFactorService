@@ -22,6 +22,9 @@ from factor_service.research.autodl import (
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.research.errors import RetryableJobError
 from factor_service.research.job import CancellationToken
+from factor_service.research.remote_node_repository import (
+    get_remote_node_repository,
+)
 from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.trainer import TrainingResult
 from factor_service.runtime_config import load_runtime_config, section
@@ -121,11 +124,22 @@ class RemoteNode:
 
 
 def load_remote_nodes(runtime: dict[str, Any] | None = None) -> list[RemoteNode]:
-    payload = runtime if runtime is not None else load_runtime_config()
-    execution = section(payload, "research", "execution")
-    raw_nodes = execution.get("remote_nodes") or []
+    if runtime is not None:
+        raw_nodes = _runtime_remote_node_payloads(runtime)
+    else:
+        repository = get_remote_node_repository()
+        if repository.legacy_import_required():
+            runtime_payload = load_runtime_config()
+            legacy_nodes = [
+                _normalize_node(raw)
+                for raw in _runtime_remote_node_payloads(runtime_payload)
+            ]
+            repository.import_legacy_once([
+                remote_node_storage_payload(node) for node in legacy_nodes
+            ])
+        raw_nodes = repository.list_nodes()
     if not isinstance(raw_nodes, list):
-        raise ValueError("research.execution.remote_nodes必须是数组")
+        raise ValueError("PostgreSQL远程训练节点配置必须是数组")
     nodes: list[RemoteNode] = []
     seen: set[str] = set()
     for raw in raw_nodes:
@@ -137,6 +151,43 @@ def load_remote_nodes(runtime: dict[str, Any] | None = None) -> list[RemoteNode]
         seen.add(node.node_id)
         nodes.append(node)
     return nodes
+
+
+def _runtime_remote_node_payloads(runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    execution = section(runtime, "research", "execution")
+    raw_nodes = execution.get("remote_nodes") or []
+    if not isinstance(raw_nodes, list):
+        raise ValueError("research.execution.remote_nodes必须是数组")
+    if any(not isinstance(raw, dict) for raw in raw_nodes):
+        raise ValueError("远程训练节点配置必须是对象")
+    return [dict(raw) for raw in raw_nodes]
+
+
+def remote_node_storage_payload(node: RemoteNode) -> dict[str, Any]:
+    return {
+        "id": node.node_id,
+        "name": node.name,
+        "enabled": node.enabled,
+        "host": node.host,
+        "port": node.port,
+        "user": node.user,
+        "ssh_key": str(node.ssh_key or ""),
+        "password_env": node.password_env,
+        "known_hosts": str(node.known_hosts or ""),
+        "work_dir": node.work_dir,
+        "runner": node.runner,
+        "python_executable": node.python_executable,
+        "docker_image": node.docker_image,
+        "gpus": node.gpus,
+        "max_runtime_minutes": node.max_runtime_minutes,
+        "cleanup_success": node.cleanup_success,
+        "lifecycle_provider": node.lifecycle_provider,
+        "instance_uuid": node.instance_uuid,
+        "api_token_env": node.api_token_env,
+        "auto_start": node.auto_start,
+        "auto_stop": node.auto_stop,
+        "boot_timeout_minutes": node.boot_timeout_minutes,
+    }
 
 
 def execution_nodes() -> list[dict[str, Any]]:
@@ -1139,5 +1190,5 @@ def _float(value: Any) -> float:
 __all__ = [
     "RemoteNode", "RemoteResearchExecutor", "RemoteTransport",
     "autodl_client", "execution_nodes", "get_remote_node", "load_remote_nodes",
-    "node_with_autodl_endpoint",
+    "node_with_autodl_endpoint", "remote_node_storage_payload",
 ]

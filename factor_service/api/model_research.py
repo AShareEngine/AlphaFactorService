@@ -338,7 +338,7 @@ def get_execution_nodes() -> dict[str, Any]:
     try:
         from factor_service.research.remote import execution_nodes
 
-        return {"ok": True, "nodes": execution_nodes()}
+        return {"ok": True, "storage": "postgresql", "nodes": execution_nodes()}
     except Exception as exc:
         _raise(exc)
 
@@ -350,6 +350,7 @@ def get_execution_node_settings() -> dict[str, Any]:
 
         return {
             "ok": True,
+            "storage": "postgresql",
             "nodes": list_remote_node_settings(),
             "security": {
                 "password_storage": "environment_variable",

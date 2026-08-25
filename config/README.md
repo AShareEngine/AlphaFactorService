@@ -1,6 +1,7 @@
 # Runtime configuration
 
-AlphaFactorService只使用一份部署配置：`runtime.local.yaml`。
+AlphaFactorService的本机部署配置使用`runtime.local.yaml`；远程GPU节点元数据由PostgreSQL
+`model_execution_nodes`统一保存，并通过系统设置管理。
 
 首次部署：
 
@@ -16,6 +17,9 @@ cp config/runtime.example.yaml config/runtime.local.yaml
 - `sources.factor`：因子计算源表。
 - `sources.research`：模型训练行情源库。
 - `research`：训练调度器的工作目录与正式模型产物目录。
+
+AutoDL Token、SSH密码和私钥内容不写入PostgreSQL。数据库只保存环境变量名、密钥路径等引用，
+实际密钥继续使用受保护文件或进程环境变量。
 
 训练工作文件和正式模型产物分别由`research.storage.work_root`和
 `research.storage.model_artifacts_root`管理。推荐在服务器或旧Mac上设置为容量充足的绝对路径：

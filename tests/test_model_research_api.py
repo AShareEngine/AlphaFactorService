@@ -441,6 +441,7 @@ def test_execution_nodes_and_local_status_are_exposed_without_secrets(monkeypatc
     status = client.get("/model-research/execution-nodes/local/status")
 
     assert nodes.status_code == 200
+    assert nodes.json()["storage"] == "postgresql"
     assert nodes.json()["nodes"][1]["id"] == "autodl-gpu-01"
     assert "private-value" not in nodes.text
     assert "ssh_password" not in nodes.text
@@ -485,6 +486,7 @@ def test_execution_node_settings_crud_api_never_returns_password_values(monkeypa
     )
 
     assert listed.status_code == 200
+    assert listed.json()["storage"] == "postgresql"
     assert listed.json()["security"]["password_values_returned"] is False
     assert created.status_code == 201
     assert updated.json()["node"]["name"] == "AutoDL A100"
