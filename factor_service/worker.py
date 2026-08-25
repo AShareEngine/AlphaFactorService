@@ -151,7 +151,10 @@ def factor_query_source(
     )
     available_fields = _source_columns(source_db, source_table)
     missing_fields = sorted(set(compiled.fields) - available_fields)
-    if not missing_fields:
+    force_entity_asset_source = (
+        factor.params.get("_force_entity_asset_source") is True
+    )
+    if not missing_fields and not force_entity_asset_source:
         yield FactorSourceBinding(
             database=source_db,
             table=source_table,
@@ -177,7 +180,7 @@ def factor_query_source(
     logger.info(
         "factor %s uses composite entity asset fields %s across %s trading dates",
         factor.factor_id,
-        ", ".join(missing_fields),
+        ", ".join(compiled.fields),
         len(trading_dates),
     )
     with staged_entity_asset_source(

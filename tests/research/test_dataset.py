@@ -379,6 +379,124 @@ def test_sample_filters_apply_listing_age_and_daily_stock_status() -> None:
     }]
 
 
+def test_sample_filters_apply_safe_custom_formula_with_historical_window() -> None:
+    class _Client:
+        query_text = ""
+        query_params = {}
+
+        def query(self, query, parameters):
+            self.query_text = query
+            self.query_params = parameters
+            assert "FROM ab_factor.stock_daily_factor_source" in query
+            assert "ROWS BETWEEN 19 PRECEDING AND CURRENT ROW" in query
+            assert "formula_0 = 1" in query
+            return SimpleNamespace(result_rows=[
+                (pd.Timestamp("2024-01-04"), "A"),
+            ])
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace(
+        source_database="starlight",
+        factor_database="ab_factor",
+        stock_daily_table="stock_daily_factor_source",
+    )
+    builder.client = _Client()
+    membership = pd.DataFrame([
+        {"trade_date": pd.Timestamp("2024-01-04"), "instrument": code}
+        for code in ("A", "B")
+    ])
+
+    filtered = builder._apply_sample_filters(
+        membership,
+        date_start="2024-01-04",
+        date_end="2024-01-04",
+        sample_filters={
+            "minimum_listing_trading_days": 0,
+            "exclude_st": False,
+            "exclude_delisting": False,
+            "custom_formulas": [{
+                "name": "站上20日均线",
+                "expression": "$close > Mean($close, 20) && $amount > 0",
+            }],
+        },
+    )
+
+    assert filtered.to_dict("records") == [{
+        "trade_date": pd.Timestamp("2024-01-04"), "instrument": "A",
+    }]
+    assert builder.client.query_params["source_start"] < "2024-01-04"
+
+
+def test_sample_filters_read_frozen_fields_from_stock_entity_asset(monkeypatch) -> None:
+    captured = {}
+
+    def fake_source(factor, **kwargs):
+        captured["factor"] = factor
+        captured["source_kwargs"] = kwargs
+        return nullcontext(SimpleNamespace())
+
+    def fake_plan(factor, **kwargs):
+        captured["plan_factor"] = factor
+        captured["plan_kwargs"] = kwargs
+        return SimpleNamespace(
+            sql="SELECT toDate('2024-01-04') AS trade_date, 'A' AS entity_code, 1 AS score",
+            params={"date_start": pd.Timestamp("2024-01-04").date()},
+        )
+
+    monkeypatch.setattr(dataset_module, "factor_query_source", fake_source)
+    monkeypatch.setattr(dataset_module, "build_factor_query_plan", fake_plan)
+
+    class _Client:
+        query_text = ""
+        query_params = {}
+
+        def query(self, query, parameters):
+            self.query_text = query
+            self.query_params = parameters
+            return SimpleNamespace(result_rows=[
+                (pd.Timestamp("2024-01-04"), "A"),
+            ])
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace(source_database="starlight")
+    builder.client = _Client()
+    membership = pd.DataFrame([
+        {"trade_date": pd.Timestamp("2024-01-04"), "instrument": code}
+        for code in ("A", "B")
+    ])
+
+    filtered = builder._apply_sample_filters(
+        membership,
+        date_start="2024-01-04",
+        date_end="2024-01-04",
+        sample_filters={
+            "custom_formulas": [{
+                "name": "质量过滤",
+                "expression": "$quality_score >= 80",
+                "available_fields": [{
+                    "field": "quality_score",
+                    "label": "质量分",
+                    "data_type": "float64",
+                    "entity_id": "stock",
+                    "asset_id": "stock_quality_daily",
+                    "asset_name": "股票质量日频",
+                    "asset_updated_at": "2026-08-25T10:00:00Z",
+                    "provider_node": "quality-provider",
+                }],
+            }],
+        },
+    )
+
+    assert filtered.to_dict("records") == [{
+        "trade_date": pd.Timestamp("2024-01-04"), "instrument": "A",
+    }]
+    assert captured["factor"].required_fields == ["quality_score"]
+    assert captured["factor"].params["_force_entity_asset_source"] is True
+    assert captured["source_kwargs"]["date_start"].isoformat() == "2024-01-04"
+    assert "score != 0" in builder.client.query_text
+    assert builder.client.query_params["codes"] == ["A", "B"]
+
+
 def test_factor_query_calculates_on_demand_without_factor_value_persistence(monkeypatch) -> None:
     class _Client:
         query_text = ""

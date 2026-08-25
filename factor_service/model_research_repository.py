@@ -21,6 +21,9 @@ from factor_service.entity_field_feature import (
 )
 from factor_service.model_validation import select_model_trial, select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
+from factor_service.research.sample_filter_formula import (
+    normalize_custom_sample_filters,
+)
 
 
 ACTIVE_STATUSES = frozenset({"leased", "running", "uploading"})
@@ -4572,6 +4575,13 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             raise ModelResearchError(f"sample_filters.{name}必须是布尔值")
         return value
 
+    try:
+        custom_formulas = normalize_custom_sample_filters(
+            raw_sample_filters.get("custom_formulas", []),
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
+
     sample_filters = {
         "minimum_listing_trading_days": minimum_listing_trading_days,
         "exclude_st": sample_filter_switch(
@@ -4580,12 +4590,13 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "exclude_delisting": sample_filter_switch(
             "exclude_delisting", not legacy_without_sample_filters,
         ),
+        "custom_formulas": custom_formulas,
     }
     return {
         # Part of the immutable dataset identity. Bump this whenever label or
         # feature materialization semantics change so an older canonical
         # snapshot can never be silently reused by a newly created job.
-        "pipeline_version": "alphablocks.dataset-pipeline.v3",
+        "pipeline_version": "alphablocks.dataset-pipeline.v5",
         "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
         "universe_id": universe_id,
         "index_code": index_code,
@@ -4988,9 +4999,16 @@ def _execution_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", node_id,
     ):
         raise ModelResearchError("execution.node_id无效")
+    try:
+        max_runtime_minutes = int(source.get("max_runtime_minutes") or 720)
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("execution.max_runtime_minutes必须是整数") from exc
+    if not 60 <= max_runtime_minutes <= 1440:
+        raise ModelResearchError("execution.max_runtime_minutes必须在60到1440之间")
     return {
         "node_id": node_id,
         "mode": "local" if node_id == "local" else "remote_ssh_docker",
+        "max_runtime_minutes": max_runtime_minutes,
     }
 
 

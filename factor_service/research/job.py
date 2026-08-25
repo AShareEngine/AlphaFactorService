@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any, Callable
 
 from factor_service.factor_backtest import UNIVERSES
@@ -13,7 +14,15 @@ from factor_service.entity_field_feature import (
     is_entity_field_feature,
     validate_entity_field_feature_identity,
 )
-from factor_service.research.errors import JobCanceled, PermanentJobError, WorkerShutdown
+from factor_service.research.errors import (
+    JobCanceled,
+    PermanentJobError,
+    TrainingTimeout,
+    WorkerShutdown,
+)
+from factor_service.research.sample_filter_formula import (
+    normalize_custom_sample_filters,
+)
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -149,10 +158,14 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     if sample_filters is not None:
         if not isinstance(sample_filters, dict):
             raise PermanentJobError("dataset_spec.sample_filters必须是对象")
-        expected_filter_fields = {
+        required_filter_fields = {
             "minimum_listing_trading_days", "exclude_st", "exclude_delisting",
         }
-        if set(sample_filters) != expected_filter_fields:
+        allowed_filter_fields = required_filter_fields | {"custom_formulas"}
+        if (
+            not required_filter_fields.issubset(sample_filters)
+            or not set(sample_filters).issubset(allowed_filter_fields)
+        ):
             raise PermanentJobError(
                 "dataset_spec.sample_filters字段不完整或包含未知字段"
             )
@@ -162,6 +175,17 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         for field in ("exclude_st", "exclude_delisting"):
             if type(sample_filters[field]) is not bool:
                 raise PermanentJobError(f"sample_filters.{field}必须是布尔值")
+        if "custom_formulas" in sample_filters:
+            try:
+                normalized_formulas = normalize_custom_sample_filters(
+                    sample_filters["custom_formulas"],
+                )
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
+            if normalized_formulas != sample_filters["custom_formulas"]:
+                raise PermanentJobError(
+                    "sample_filters.custom_formulas不是规范化冻结规格"
+                )
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")
@@ -250,6 +274,12 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     expected_mode = "local" if execution_node_id == "local" else "remote_ssh_docker"
     if execution_mode != expected_mode:
         raise PermanentJobError("execution.mode与node_id不一致")
+    _integer(
+        execution.get("max_runtime_minutes", 720),
+        "execution.max_runtime_minutes",
+        60,
+        1440,
+    )
     _integer(params.get("num_threads", 4), "num_threads", 1, 32)
     expected_loss = "binary" if target_mode == "classification" else "mse"
     if str(params.get("loss", "mse")).strip().lower() != expected_loss:
@@ -590,9 +620,19 @@ def safe_job_dir(work_root: Path, job_id: str) -> Path:
 
 
 class CancellationToken:
-    def __init__(self, shutdown_event: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        shutdown_event: threading.Event | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         self._cancel = threading.Event()
         self._shutdown = shutdown_event or threading.Event()
+        self._deadline = (
+            time.monotonic() + max(0.001, float(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
         self.reason = ""
 
     def cancel(self, reason: str = "任务已请求取消") -> None:
@@ -608,6 +648,8 @@ class CancellationToken:
             raise JobCanceled(self.reason or "任务已请求取消")
         if self._shutdown.is_set():
             raise WorkerShutdown("调度服务正在关闭，任务将重新排队")
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise TrainingTimeout("训练任务已达到最长运行时长")
 
 
 ProgressCallback = Callable[[str, int, dict[str, Any]], None]

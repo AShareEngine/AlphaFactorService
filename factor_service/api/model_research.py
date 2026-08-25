@@ -49,6 +49,11 @@ from factor_service.model_research_repository import (
 )
 from factor_service.research.worker import ResearchWorker
 from factor_service.research.schedule import dispatch_job as dispatch_model_job
+from factor_service.research.sample_filter_formula import (
+    MAX_CUSTOM_SAMPLE_FILTERS,
+    MAX_SAMPLE_FILTER_WINDOW,
+    normalize_custom_sample_filters,
+)
 from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
 from factor_service.schemas import ModelBacktestJobCreate
 
@@ -279,7 +284,19 @@ def _validate_execution_node(payload: dict[str, Any]) -> None:
         return
     from factor_service.research.remote import get_remote_node
 
-    get_remote_node(node_id)
+    node = get_remote_node(node_id)
+    try:
+        requested_minutes = int(
+            execution.get("max_runtime_minutes") or 720
+        ) if isinstance(execution, dict) else 720
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError(
+            "execution.max_runtime_minutes必须是整数"
+        ) from exc
+    if requested_minutes > int(node.max_runtime_minutes):
+        raise ModelResearchConflict(
+            f"训练节点“{node.name}”单次任务最长{node.max_runtime_minutes}分钟"
+        )
 
 
 @router.get("/jobs")
@@ -314,6 +331,51 @@ def get_training_targets() -> dict[str, Any]:
         }
     except Exception as exc:
         _raise(exc)
+
+
+@router.get("/sample-filter-formulas/catalog")
+def get_sample_filter_formula_catalog() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "max_formulas": MAX_CUSTOM_SAMPLE_FILTERS,
+        "max_window": MAX_SAMPLE_FILTER_WINDOW,
+        "examples": [
+            {
+                "name": "价格与流动性",
+                "expression": "$close >= 5 && $amount >= 100000000",
+            },
+            {
+                "name": "剔除停牌和北交所",
+                "expression": "$is_suspended == 0 && $is_bjs == 0",
+            },
+            {
+                "name": "站上20日均线",
+                "expression": "$close > Mean($close, 20)",
+            },
+        ],
+    }
+
+
+@router.post("/sample-filter-formulas/validate")
+def validate_sample_filter_formula(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        formula = normalize_custom_sample_filters([payload])[0]
+    except (TypeError, ValueError) as exc:
+        return {
+            "ok": True,
+            "valid": False,
+            "expression": str(payload.get("expression") or ""),
+            "error_message": str(exc),
+        }
+    return {
+        "ok": True,
+        "valid": True,
+        "formula": formula,
+        "required_fields": formula["required_fields"],
+        "max_window": formula["max_window"],
+    }
 
 
 @router.get("/market-history")

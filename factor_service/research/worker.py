@@ -320,7 +320,13 @@ class ResearchWorker:
         # attempt was already cleaned up.
         work_dir.mkdir(parents=True, exist_ok=True)
         monitor_stop = threading.Event()
-        cancellation = CancellationToken(self._shutdown_event)
+        job_kind = str(job.get("kind") or "train")
+        execution = (job.get("config_json") or {}).get("execution") or {}
+        max_runtime_minutes = int(execution.get("max_runtime_minutes") or 720)
+        cancellation = CancellationToken(
+            self._shutdown_event,
+            timeout_seconds=(max_runtime_minutes * 60 if job_kind == "train" else None),
+        )
         monitor_thread = threading.Thread(
             target=self._monitor_lease,
             args=(job_id, lease_token, cancellation, monitor_stop),
@@ -328,7 +334,6 @@ class ResearchWorker:
             daemon=True,
         )
         report_pending = False
-        job_kind = str(job.get("kind") or "train")
         action_label = "每日推理" if job_kind == "infer" else "训练"
         print(f"开始{action_label} {job_id}", flush=True)
         self._set_state(

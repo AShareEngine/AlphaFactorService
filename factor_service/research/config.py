@@ -25,6 +25,7 @@ class Settings:
     scheduler_refresh_seconds: float = 60.0
     experiment_worker_enabled: bool = True
     factor_query_chunk_days: int = 90
+    stock_daily_table: str = "stock_daily_factor_source"
 
 
 def load_settings() -> Settings:
@@ -35,6 +36,7 @@ def load_settings() -> Settings:
     dataset = section(runtime, "research", "dataset")
     clickhouse = section(runtime, "clickhouse")
     source = section(runtime, "sources", "research")
+    factor_source = section(runtime, "sources", "factor")
     clickhouse_host = str(clickhouse.get("host") or "127.0.0.1").strip()
     result = Settings(
         clickhouse_host=clickhouse_host,
@@ -56,5 +58,9 @@ def load_settings() -> Settings:
         factor_query_chunk_days=max(
             30, min(int(dataset.get("factor_query_chunk_days") or 90), 366),
         ),
+        stock_daily_table=str(
+            factor_source.get("stock_daily_table")
+            or "stock_daily_factor_source"
+        ).strip(),
     )
     return result

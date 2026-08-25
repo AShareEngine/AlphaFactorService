@@ -27,6 +27,10 @@ class JobCanceled(PermanentJobError):
     code = "canceled"
 
 
+class TrainingTimeout(PermanentJobError):
+    code = "training_timeout"
+
+
 class WorkerShutdown(RetryableJobError):
     code = "worker_shutdown"
 
@@ -53,5 +57,5 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
 
 __all__ = [
     "JobCanceled", "JobError", "PermanentJobError", "RetryableJobError",
-    "WorkerShutdown", "classify_exception", "error_payload",
+    "TrainingTimeout", "WorkerShutdown", "classify_exception", "error_payload",
 ]

@@ -150,11 +150,12 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
-    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v3"
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v5"
     assert spec["sample_filters"] == {
         "minimum_listing_trading_days": 60,
         "exclude_st": True,
         "exclude_delisting": True,
+        "custom_formulas": [],
     }
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
@@ -171,6 +172,7 @@ def test_dataset_contract_preserves_legacy_unfiltered_replay() -> None:
         "minimum_listing_trading_days": 0,
         "exclude_st": False,
         "exclude_delisting": False,
+        "custom_formulas": [],
     }
 
 
@@ -191,6 +193,88 @@ def test_dataset_contract_validates_sample_filters() -> None:
                 "minimum_listing_trading_days": 60,
                 "exclude_st": "yes",
                 "exclude_delisting": True,
+            },
+        })
+
+
+def test_dataset_contract_freezes_custom_sample_filter_formula() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "sample_filters": {
+            "minimum_listing_trading_days": 60,
+            "exclude_st": True,
+            "exclude_delisting": True,
+            "custom_formulas": [{
+                "name": "价格与流动性",
+                "expression": "$close >= 5 && $amount >= 100000000",
+            }],
+        },
+    })
+
+    formula = spec["sample_filters"]["custom_formulas"][0]
+    assert formula["formula_id"].startswith("sample_filter_")
+    assert formula["name"] == "价格与流动性"
+    assert formula["required_fields"] == ["amount", "close"]
+    assert formula["max_window"] == 1
+
+
+def test_dataset_contract_freezes_stock_entity_asset_formula_fields() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "sample_filters": {
+            "minimum_listing_trading_days": 60,
+            "exclude_st": True,
+            "exclude_delisting": True,
+            "custom_formulas": [{
+                "name": "实体资产质量过滤",
+                "expression": "$quality_score >= 80 && $close > 5",
+                "available_fields": [
+                    {
+                        "field": "quality_score",
+                        "label": "质量分",
+                        "data_type": "float64",
+                        "entity_id": "stock",
+                        "asset_id": "stock_quality_daily",
+                        "asset_name": "股票质量日频",
+                        "asset_updated_at": "2026-08-25T10:00:00Z",
+                        "provider_node": "quality-provider",
+                    },
+                    {
+                        "field": "close",
+                        "label": "收盘价",
+                        "data_type": "decimal",
+                        "entity_id": "stock",
+                        "asset_id": "stock_market_daily",
+                        "asset_name": "股票日行情",
+                        "asset_updated_at": "2026-08-24T10:00:00Z",
+                        "provider_node": "market-provider",
+                    },
+                ],
+            }],
+        },
+    })
+
+    formula = spec["sample_filters"]["custom_formulas"][0]
+    assert formula["required_fields"] == ["close", "quality_score"]
+    assert [item["field"] for item in formula["field_bindings"]] == [
+        "close", "quality_score",
+    ]
+    assert formula["field_bindings"][1]["asset_id"] == "stock_quality_daily"
+    assert "available_fields" not in formula
+
+
+def test_dataset_contract_rejects_unsafe_custom_sample_filter_field() -> None:
+    with pytest.raises(ModelResearchError, match="不支持的字段"):
+        _dataset_spec({
+            **_source(),
+            "sample_filters": {
+                "minimum_listing_trading_days": 60,
+                "exclude_st": True,
+                "exclude_delisting": True,
+                "custom_formulas": [{
+                    "name": "非法字段",
+                    "expression": "$future_return > 0",
+                }],
             },
         })
 
@@ -587,11 +671,18 @@ def test_training_job_freezes_remote_execution_node() -> None:
     # exported job spec helpers used by repository tests.
     from factor_service.model_research_repository import _execution_spec
 
-    assert _execution_spec({"node_id": "autodl-gpu-01"}) == {
+    assert _execution_spec({
+        "node_id": "autodl-gpu-01", "max_runtime_minutes": 240,
+    }) == {
         "node_id": "autodl-gpu-01",
         "mode": "remote_ssh_docker",
+        "max_runtime_minutes": 240,
     }
-    assert _execution_spec({}) == {"node_id": "local", "mode": "local"}
+    assert _execution_spec({}) == {
+        "node_id": "local", "mode": "local", "max_runtime_minutes": 720,
+    }
+    with pytest.raises(ModelResearchError, match="max_runtime_minutes"):
+        _execution_spec({"max_runtime_minutes": 30})
 
 
 def test_market_style_dataset_contract_freezes_target_and_style_label() -> None:

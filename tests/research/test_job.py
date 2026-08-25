@@ -9,9 +9,17 @@ import threading
 
 import pytest
 
-from factor_service.research.errors import JobCanceled, PermanentJobError, WorkerShutdown
+from factor_service.research.errors import (
+    JobCanceled,
+    PermanentJobError,
+    TrainingTimeout,
+    WorkerShutdown,
+)
 from factor_service.research.job import (
     CancellationToken, _canonical_json, safe_job_dir, validate_job,
+)
+from factor_service.research.sample_filter_formula import (
+    normalize_custom_sample_filters,
 )
 from factor_service.research.state import JobStateStore
 from tests.research.utils import valid_inference_job, valid_job
@@ -22,6 +30,33 @@ def test_job_validation_accepts_frozen_contract() -> None:
 
     assert job["model_id"] == "test_model"
     assert job["dataset_spec"]["universe_id"] == "csi500"
+
+
+def test_job_validation_accepts_bounded_training_runtime() -> None:
+    source = valid_job()
+    source["config_json"]["execution"] = {
+        "node_id": "local", "mode": "local", "max_runtime_minutes": 720,
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["execution"]["max_runtime_minutes"] == 720
+
+    source["config_json"]["execution"]["max_runtime_minutes"] = 30
+    with pytest.raises(PermanentJobError, match="max_runtime_minutes"):
+        validate_job(source)
+
+
+def test_cancellation_token_stops_training_at_deadline(monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr("factor_service.research.job.time.monotonic", lambda: clock[0])
+    token = CancellationToken(timeout_seconds=60)
+
+    token.checkpoint()
+    clock[0] = 160.0
+
+    with pytest.raises(TrainingTimeout, match="最长运行时长"):
+        token.checkpoint()
 
 
 def test_job_validation_accepts_and_validates_sample_filters() -> None:
@@ -48,6 +83,28 @@ def test_job_validation_accepts_and_validates_sample_filters() -> None:
     ).hexdigest()
     with pytest.raises(PermanentJobError, match="exclude_st必须是布尔值"):
         validate_job(source)
+
+
+def test_job_validation_accepts_frozen_custom_sample_filter_formula() -> None:
+    source = valid_job()
+    formulas = normalize_custom_sample_filters([{
+        "name": "站上20日均线",
+        "expression": "$close > Mean($close, 20)",
+    }])
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["sample_filters"] = {
+            "minimum_listing_trading_days": 60,
+            "exclude_st": True,
+            "exclude_delisting": True,
+            "custom_formulas": deepcopy(formulas),
+        }
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    job = validate_job(source)
+
+    assert job["dataset_spec"]["sample_filters"]["custom_formulas"] == formulas
 
 
 def test_job_validation_accepts_classification_target_with_binary_loss() -> None:

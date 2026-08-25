@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 import json
 import math
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,11 @@ from factor_service.entity_field_feature import (
 from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.sample_filter_formula import (
+    compile_sample_filter_formula,
+    normalize_custom_sample_filters,
+)
+from factor_service.schemas import FactorOut
 from factor_service.worker import build_factor_query_plan, factor_query_source
 
 
@@ -30,6 +36,7 @@ FACTOR_EVENT_CUTOFF = (
 SW2021_INDUSTRY_SAFE_START = "2021-12-13"
 DEFAULT_FACTOR_QUERY_CHUNK_DAYS = 90
 LISTING_AGE_CALENDAR_CODE = "000001.SH"
+SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -386,6 +393,10 @@ class DatasetBuilder:
             future_function_guards.append(
                 "daily point-in-time listing age, ST and delisting filters applied before materialization"
             )
+        if sample_filters.get("custom_formulas"):
+            future_function_guards.append(
+                "custom sample formulas use allowlisted point-in-time fields and backward-only windows"
+            )
         if research_target == "market_style":
             future_function_guards.append(
                 "market-style membership uses close-date market cap and shares available by signal date"
@@ -505,7 +516,15 @@ class DatasetBuilder:
         minimum_days = int(filters.get("minimum_listing_trading_days") or 0)
         exclude_st = filters.get("exclude_st") is True
         exclude_delisting = filters.get("exclude_delisting") is True
-        if minimum_days <= 0 and not exclude_st and not exclude_delisting:
+        custom_formulas = normalize_custom_sample_filters(
+            filters.get("custom_formulas", []),
+        )
+        if (
+            minimum_days <= 0
+            and not exclude_st
+            and not exclude_delisting
+            and not custom_formulas
+        ):
             return membership
 
         result = membership.copy()
@@ -601,8 +620,221 @@ class DatasetBuilder:
             if exclude_delisting:
                 result = result[result["is_delisting"] != 1]
 
+        if custom_formulas and not result.empty:
+            result = self._apply_custom_formula_filters(
+                result,
+                date_start=date_start,
+                date_end=date_end,
+                formulas=custom_formulas,
+            )
+
         return result[["trade_date", "instrument"]].drop_duplicates().sort_values(
             ["trade_date", "instrument"], ignore_index=True,
+        )
+
+    def _apply_custom_formula_filters(
+        self,
+        membership: pd.DataFrame,
+        *,
+        date_start: str,
+        date_end: str,
+        formulas: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        entity_asset_formulas = [
+            item for item in formulas if item.get("field_bindings")
+        ]
+        legacy_formulas = [
+            item for item in formulas if not item.get("field_bindings")
+        ]
+        result = membership
+        if legacy_formulas:
+            result = self._apply_legacy_custom_formula_filters(
+                result,
+                date_start=date_start,
+                date_end=date_end,
+                formulas=legacy_formulas,
+            )
+        if entity_asset_formulas and not result.empty:
+            result = self._apply_entity_asset_formula_filters(
+                result,
+                date_start=date_start,
+                date_end=date_end,
+                formulas=entity_asset_formulas,
+            )
+        return result
+
+    def _apply_entity_asset_formula_filters(
+        self,
+        membership: pd.DataFrame,
+        *,
+        date_start: str,
+        date_end: str,
+        formulas: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        combined_expression = " && ".join(
+            f"({str(item['expression'])})" for item in formulas
+        )
+        required_fields = sorted({
+            str(field)
+            for item in formulas
+            for field in item.get("required_fields", [])
+        })
+        identity = sha256(
+            json.dumps(
+                formulas,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        factor = FactorOut(
+            factor_id=f"sample_filter_group_{identity[:20]}",
+            label="训练股票池自定义筛选",
+            description="使用冻结的股票实体资产字段按交易日筛选训练与推理样本。",
+            entity_type="stock",
+            category="sample_filter",
+            group_name="stock_universe",
+            output_type="boolean",
+            frequency="daily",
+            asset_id="stock",
+            required_fields=required_fields,
+            params={
+                "_force_entity_asset_source": True,
+                "data_processing": {
+                    "winsorize": "none",
+                    "standardize": "none",
+                    "neutralize": [],
+                },
+                "weighting": "equal",
+            },
+            availability_policy={
+                "field": "available_at",
+                "policy": "entity_asset_point_in_time",
+            },
+            expression=combined_expression,
+            enabled=True,
+            version=1,
+            available_versions=[1],
+            definition_hash=identity,
+        )
+        start_date = pd.Timestamp(date_start).date()
+        end_date = pd.Timestamp(date_end).date()
+        with factor_query_source(
+            factor,
+            overrides={},
+            date_start=start_date,
+            date_end=end_date,
+            job_id="model-sample-filter",
+        ) as source_binding:
+            plan = build_factor_query_plan(
+                factor,
+                overrides={},
+                entity_type="stock",
+                date_start=start_date,
+                date_end=end_date,
+                job_id="model-sample-filter",
+                source_binding=source_binding,
+            )
+            rows = self.client.query(
+                f"""
+                SELECT trade_date, entity_code
+                FROM (
+                    {plan.sql}
+                )
+                WHERE score != 0
+                  AND entity_code IN {{codes:Array(String)}}
+                ORDER BY trade_date, entity_code
+                """,
+                parameters={
+                    **plan.params,
+                    "codes": sorted(
+                        membership["instrument"].astype(str).unique().tolist()
+                    ),
+                },
+            ).result_rows
+        eligible = pd.DataFrame(rows, columns=["trade_date", "instrument"])
+        if eligible.empty:
+            return membership.iloc[0:0].copy()
+        eligible["trade_date"] = pd.to_datetime(eligible["trade_date"])
+        eligible["instrument"] = eligible["instrument"].astype(str)
+        return membership.merge(
+            eligible.drop_duplicates(["trade_date", "instrument"]),
+            on=["trade_date", "instrument"],
+            how="inner",
+        )
+
+    def _apply_legacy_custom_formula_filters(
+        self,
+        membership: pd.DataFrame,
+        *,
+        date_start: str,
+        date_end: str,
+        formulas: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        compiled = [
+            compile_sample_filter_formula(str(item.get("expression") or ""))
+            for item in formulas
+        ]
+        maximum_window = max(item.max_window for item in compiled)
+        lookback_days = max(maximum_window * 4 + 20, 90)
+        source_start = (
+            pd.Timestamp(date_start) - timedelta(days=lookback_days)
+        ).date().isoformat()
+        database = _sql_identifier(
+            str(self.settings.factor_database), "factor_database",
+        )
+        table = _sql_identifier(
+            str(
+                getattr(
+                    self.settings,
+                    "stock_daily_table",
+                    "stock_daily_factor_source",
+                )
+            ),
+            "stock_daily_table",
+        )
+        projections = [
+            f"toUInt8(ifNull(({item.sql}) != 0, 0)) AS formula_{index}"
+            for index, item in enumerate(compiled)
+        ]
+        predicates = [
+            f"formula_{index} = 1" for index in range(len(compiled))
+        ]
+        rows = self.client.query(
+            f"""
+            SELECT trade_date, instrument
+            FROM (
+                SELECT
+                    toDate(trade_time) AS trade_date,
+                    code AS instrument,
+                    {', '.join(projections)}
+                FROM {database}.{table}
+                WHERE code IN {{codes:Array(String)}}
+                  AND toDate(trade_time) >= {{source_start:Date}}
+                  AND toDate(trade_time) <= {{date_end:Date}}
+            )
+            WHERE trade_date >= {{date_start:Date}}
+              AND {' AND '.join(predicates)}
+            ORDER BY trade_date, instrument
+            """,
+            parameters={
+                "codes": sorted(
+                    membership["instrument"].astype(str).unique().tolist()
+                ),
+                "source_start": source_start,
+                "date_start": date_start,
+                "date_end": date_end,
+            },
+        ).result_rows
+        eligible = pd.DataFrame(rows, columns=["trade_date", "instrument"])
+        if eligible.empty:
+            return membership.iloc[0:0].copy()
+        eligible["trade_date"] = pd.to_datetime(eligible["trade_date"])
+        eligible["instrument"] = eligible["instrument"].astype(str)
+        return membership.merge(
+            eligible.drop_duplicates(["trade_date", "instrument"]),
+            on=["trade_date", "instrument"],
+            how="inner",
         )
 
     def trading_dates_ending_at(
@@ -1220,6 +1452,12 @@ def walk_forward_segments(
 
 def _date_range(dates: pd.Index, start: int, end: int) -> tuple[str, str]:
     return (dates[start].date().isoformat(), dates[end].date().isoformat())
+
+
+def _sql_identifier(value: str, label: str) -> str:
+    if not SQL_IDENTIFIER_RE.fullmatch(str(value or "")):
+        raise ValueError(f"{label}不是安全的ClickHouse标识符")
+    return str(value)
 
 
 def _feature_name(item: dict[str, Any]) -> str:
