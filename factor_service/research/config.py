@@ -23,12 +23,16 @@ class Settings:
     model_artifacts_root: Path
     scheduler_enabled: bool = True
     scheduler_refresh_seconds: float = 60.0
+    experiment_worker_enabled: bool = True
+    factor_query_chunk_days: int = 90
 
 
 def load_settings() -> Settings:
     runtime = load_runtime_config()
     storage = section(runtime, "research", "storage")
     scheduler = section(runtime, "research", "scheduler")
+    worker = section(runtime, "research", "worker")
+    dataset = section(runtime, "research", "dataset")
     clickhouse = section(runtime, "clickhouse")
     source = section(runtime, "sources", "research")
     clickhouse_host = str(clickhouse.get("host") or "127.0.0.1").strip()
@@ -47,6 +51,10 @@ def load_settings() -> Settings:
         scheduler_enabled=bool(scheduler.get("enabled", True)),
         scheduler_refresh_seconds=max(
             10.0, float(scheduler.get("refresh_seconds") or 60.0),
+        ),
+        experiment_worker_enabled=bool(worker.get("enabled", True)),
+        factor_query_chunk_days=max(
+            30, min(int(dataset.get("factor_query_chunk_days") or 90), 366),
         ),
     )
     return result

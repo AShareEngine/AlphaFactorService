@@ -54,6 +54,7 @@ PERSISTED_PROGRESS_STAGES = frozenset({
     "remote_downloading",
     "remote_powering_off",
     "remote_power_off_failed",
+    "remote_kept_alive",
 })
 
 
@@ -133,14 +134,20 @@ class ResearchWorker:
                 daemon=True,
             )
             self._scheduler_thread.start()
-        self._experiment_queue_thread = threading.Thread(
-            target=self._experiment_queue_loop,
-            name="model-experiment-queue",
-            daemon=True,
-        )
-        self._experiment_queue_thread.start()
+        if bool(getattr(self.settings, "experiment_worker_enabled", True)):
+            self._experiment_queue_thread = threading.Thread(
+                target=self._experiment_queue_loop,
+                name="model-experiment-queue",
+                daemon=True,
+            )
+            self._experiment_queue_thread.start()
         print(
-            "AlphaFactorService内置研究调度器已启动",
+            "AlphaFactorService内置研究调度器已启动"
+            + (
+                ""
+                if bool(getattr(self.settings, "experiment_worker_enabled", True))
+                else "（实验训练Worker已禁用）"
+            ),
             flush=True,
         )
 

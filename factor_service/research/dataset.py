@@ -28,7 +28,8 @@ FACTOR_EVENT_CUTOFF = (
     "event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR"
 )
 SW2021_INDUSTRY_SAFE_START = "2021-12-13"
-FACTOR_QUERY_CHUNK_DAYS = 366
+DEFAULT_FACTOR_QUERY_CHUNK_DAYS = 90
+LISTING_AGE_CALENDAR_CODE = "000001.SH"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,19 @@ class PreparedDataset:
 class DatasetBuilder:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.factor_query_chunk_days = max(
+            30,
+            min(
+                int(
+                    getattr(
+                        settings,
+                        "factor_query_chunk_days",
+                        DEFAULT_FACTOR_QUERY_CHUNK_DAYS,
+                    )
+                ),
+                366,
+            ),
+        )
         self.client = clickhouse_connect.get_client(
             host=settings.clickhouse_host,
             port=settings.clickhouse_port,
@@ -203,9 +217,10 @@ class DatasetBuilder:
         index_code = str(spec.get("index_code") or "000905.SH")
         membership = self._membership(
             date_start, date_end, universe_id=universe_id, index_code=index_code,
+            sample_filters=spec.get("sample_filters"),
         )
         if membership.empty:
-            raise ValueError("中证500历史成分股为空")
+            raise ValueError("历史股票池应用样本过滤后为空")
         expected = membership[["trade_date", "instrument"]].drop_duplicates()
         expected_count = max(1, len(expected))
         for index, item in enumerate(factors, start=1):
@@ -366,6 +381,11 @@ class DatasetBuilder:
             "five session split embargo",
             "preprocessors fitted on train only",
         ]
+        sample_filters = dict(spec.get("sample_filters") or {})
+        if sample_filters:
+            future_function_guards.append(
+                "daily point-in-time listing age, ST and delisting filters applied before materialization"
+            )
         if research_target == "market_style":
             future_function_guards.append(
                 "market-style membership uses close-date market cap and shares available by signal date"
@@ -385,6 +405,7 @@ class DatasetBuilder:
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "target_contract": target_contract,
+            "sample_filters": sample_filters,
             "future_function_guards": future_function_guards,
             "materialization": {
                 "mode": "on_demand",
@@ -408,6 +429,7 @@ class DatasetBuilder:
         *,
         universe_id: str = "csi500",
         index_code: str = "000905.SH",
+        sample_filters: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         if universe_id not in UNIVERSES:
             raise ValueError(f"不支持的股票池: {universe_id}")
@@ -463,7 +485,125 @@ class DatasetBuilder:
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+            frame = self._apply_sample_filters(
+                frame,
+                date_start=date_start,
+                date_end=date_end,
+                sample_filters=sample_filters,
+            )
         return frame
+
+    def _apply_sample_filters(
+        self,
+        membership: pd.DataFrame,
+        *,
+        date_start: str,
+        date_end: str,
+        sample_filters: dict[str, Any] | None,
+    ) -> pd.DataFrame:
+        filters = dict(sample_filters or {})
+        minimum_days = int(filters.get("minimum_listing_trading_days") or 0)
+        exclude_st = filters.get("exclude_st") is True
+        exclude_delisting = filters.get("exclude_delisting") is True
+        if minimum_days <= 0 and not exclude_st and not exclude_delisting:
+            return membership
+
+        result = membership.copy()
+        instruments = sorted(result["instrument"].astype(str).unique().tolist())
+        if minimum_days > 0:
+            basic_rows = self.client.query(
+                """
+                SELECT code, toDateOrNull(ipo_date)
+                FROM baostock.bs_stock_basic
+                WHERE type = '1' AND code IN {codes:Array(String)}
+                """,
+                parameters={"codes": instruments},
+            ).result_rows
+            basics = pd.DataFrame(basic_rows, columns=["instrument", "ipo_date"])
+            basics["ipo_date"] = pd.to_datetime(
+                basics["ipo_date"], errors="coerce",
+            )
+            calendar_start = (
+                pd.Timestamp(date_start)
+                - timedelta(days=minimum_days * 3 + 30)
+            ).date().isoformat()
+            calendar_rows = self.client.query(
+                f"""
+                SELECT DISTINCT toDate(trade_time) AS trade_date
+                FROM {self.settings.source_database}.ad_market_kline_daily
+                WHERE code = {{calendar_code:String}}
+                  AND toDate(trade_time) >= {{calendar_start:Date}}
+                  AND toDate(trade_time) <= {{date_end:Date}}
+                ORDER BY trade_date
+                """,
+                parameters={
+                    "calendar_code": LISTING_AGE_CALENDAR_CODE,
+                    "calendar_start": calendar_start,
+                    "date_end": date_end,
+                },
+            ).result_rows
+            calendar = pd.DatetimeIndex(
+                pd.to_datetime([row[0] for row in calendar_rows]),
+            )
+            if calendar.empty:
+                raise ValueError("缺少上市交易日过滤所需的A股交易日历")
+            result = result.merge(basics, on="instrument", how="left")
+            signal_positions = calendar.searchsorted(result["trade_date"])
+            ipo_positions = calendar.searchsorted(
+                result["ipo_date"].fillna(result["trade_date"]),
+            )
+            result["listing_trading_days"] = signal_positions - ipo_positions
+            result = result[
+                result["listing_trading_days"] >= minimum_days
+            ]
+
+        if (exclude_st or exclude_delisting) and not result.empty:
+            status_rows = self.client.query(
+                f"""
+                SELECT
+                    toDate(trade_date) AS trade_date,
+                    market_code AS instrument,
+                    toUInt8(ifNull(is_st_sec, '') IN ('1','true','True')) AS is_st,
+                    toUInt8(ifNull(is_wd_sec, '') IN ('1','true','True')) AS is_delisting
+                FROM {self.settings.source_database}.ad_history_stock_status
+                WHERE market_code IN {{codes:Array(String)}}
+                  AND toDate(trade_date) >= {{date_start:Date}}
+                  AND toDate(trade_date) <= {{date_end:Date}}
+                """,
+                parameters={
+                    "codes": sorted(
+                        result["instrument"].astype(str).unique().tolist()
+                    ),
+                    "date_start": date_start,
+                    "date_end": date_end,
+                },
+            ).result_rows
+            statuses = pd.DataFrame(
+                status_rows,
+                columns=["trade_date", "instrument", "is_st", "is_delisting"],
+            )
+            if not statuses.empty:
+                statuses["trade_date"] = pd.to_datetime(statuses["trade_date"])
+                statuses = statuses.drop_duplicates(
+                    ["trade_date", "instrument"], keep="last",
+                )
+                result = result.merge(
+                    statuses, on=["trade_date", "instrument"], how="left",
+                )
+            else:
+                result["is_st"] = 0
+                result["is_delisting"] = 0
+            result[["is_st", "is_delisting"]] = result[
+                ["is_st", "is_delisting"]
+            ].fillna(0)
+            if exclude_st:
+                result = result[result["is_st"] != 1]
+            if exclude_delisting:
+                result = result[result["is_delisting"] != 1]
+
+        return result[["trade_date", "instrument"]].drop_duplicates().sort_values(
+            ["trade_date", "instrument"], ignore_index=True,
+        )
 
     def trading_dates_ending_at(
         self, trade_date: str, count: int, *,
@@ -529,10 +669,13 @@ class DatasetBuilder:
         chunk_start = pd.Timestamp(date_start).date()
         final_end = pd.Timestamp(date_end).date()
         rows: list[tuple[Any, ...]] = []
+        chunk_days = int(
+            getattr(self, "factor_query_chunk_days", 366)
+        )
         while chunk_start <= final_end:
             _checkpoint(cancellation)
             chunk_end = min(
-                chunk_start + timedelta(days=FACTOR_QUERY_CHUNK_DAYS - 1),
+                chunk_start + timedelta(days=chunk_days - 1),
                 final_end,
             )
             with factor_query_source(

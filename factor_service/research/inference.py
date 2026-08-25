@@ -82,6 +82,7 @@ class DailyInferenceRunner:
         feature_date_start = trade_date
         universe_id = str(dataset_spec.get("universe_id") or "csi500")
         index_code = str(dataset_spec.get("index_code") or "000905.SH")
+        sample_filters = dataset_spec.get("sample_filters")
         universe_label = {
             "csi300": "沪深300", "csi500": "中证500", "csi800": "中证800",
             "csi1000": "中证1000", "all_a": "全A",
@@ -109,12 +110,14 @@ class DailyInferenceRunner:
         _progress(progress, "building_inference_features", 35, {"trade_date": trade_date})
         target_membership = self.dataset_builder._membership(
             trade_date, trade_date, universe_id=universe_id, index_code=index_code,
+            sample_filters=sample_filters,
         )
         if target_membership.empty:
             raise PermanentJobError(f"{trade_date}不是{universe_label}可推理交易日")
         membership = self.dataset_builder._membership(
             feature_date_start, trade_date,
             universe_id=universe_id, index_code=index_code,
+            sample_filters=sample_filters,
         )
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}

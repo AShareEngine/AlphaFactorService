@@ -3519,6 +3519,90 @@ def _calendar_code(universe_id: str) -> str:
     return UNIVERSES[universe_id]["benchmark"]
 
 
+def active_model_backtest_jobs(
+    *, model_id: str, model_version: int,
+) -> list[dict[str, str]]:
+    database = settings().model_database
+    rows = client().query(
+        f"""
+        SELECT backtest_job_id, status
+        FROM {database}.model_backtest_jobs FINAL
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+          AND status IN ('pending', 'running')
+        ORDER BY created_at DESC
+        """,
+        parameters={
+            "model_id": str(model_id),
+            "model_version": int(model_version),
+        },
+    ).result_rows
+    return [
+        {"backtest_job_id": str(row[0]), "status": str(row[1])}
+        for row in rows
+    ]
+
+
+def delete_model_data(*, model_id: str, model_version: int) -> dict[str, object]:
+    """Permanently remove one model version's ClickHouse evidence rows."""
+
+    active = active_model_backtest_jobs(
+        model_id=model_id, model_version=model_version,
+    )
+    if active:
+        raise ValueError(
+            "模型仍有运行中的回测任务："
+            + "、".join(item["backtest_job_id"] for item in active)
+        )
+    database = settings().model_database
+    parameters = {
+        "model_id": str(model_id),
+        "model_version": int(model_version),
+    }
+    connection = client()
+    backtest_rows = connection.query(
+        f"""
+        SELECT DISTINCT backtest_job_id
+        FROM {database}.model_backtest_jobs FINAL
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+        """,
+        parameters=parameters,
+    ).result_rows
+    backtest_job_ids = [str(row[0]) for row in backtest_rows]
+    if backtest_job_ids:
+        connection.command(
+            f"""
+            ALTER TABLE {database}.model_backtest_daily DELETE
+            WHERE backtest_job_id IN {{backtest_job_ids:Array(String)}}
+            SETTINGS mutations_sync = 2
+            """,
+            parameters={"backtest_job_ids": backtest_job_ids},
+        )
+    connection.command(
+        f"""
+        ALTER TABLE {database}.model_backtest_jobs DELETE
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+        SETTINGS mutations_sync = 2
+        """,
+        parameters=parameters,
+    )
+    connection.command(
+        f"""
+        ALTER TABLE {database}.model_predictions_daily DELETE
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+        SETTINGS mutations_sync = 2
+        """,
+        parameters=parameters,
+    )
+    return {
+        "backtest_job_count": len(backtest_job_ids),
+        "predictions_deleted": True,
+    }
+
+
 def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJobOut:
     if payload.universe_id not in UNIVERSES:
         raise ValueError("不支持的股票池")

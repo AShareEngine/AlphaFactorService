@@ -145,6 +145,23 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         raise PermanentJobError(f"不支持的股票池: {universe_id}")
     if index_code != UNIVERSES[universe_id]["index_code"]:
         raise PermanentJobError("dataset_spec的股票池与index_code不一致")
+    sample_filters = spec.get("sample_filters")
+    if sample_filters is not None:
+        if not isinstance(sample_filters, dict):
+            raise PermanentJobError("dataset_spec.sample_filters必须是对象")
+        expected_filter_fields = {
+            "minimum_listing_trading_days", "exclude_st", "exclude_delisting",
+        }
+        if set(sample_filters) != expected_filter_fields:
+            raise PermanentJobError(
+                "dataset_spec.sample_filters字段不完整或包含未知字段"
+            )
+        minimum_listing_days = sample_filters["minimum_listing_trading_days"]
+        if type(minimum_listing_days) is not int or not 0 <= minimum_listing_days <= 5000:
+            raise PermanentJobError("最少上市交易日必须是0至5000的整数")
+        for field in ("exclude_st", "exclude_delisting"):
+            if type(sample_filters[field]) is not bool:
+                raise PermanentJobError(f"sample_filters.{field}必须是布尔值")
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")
@@ -351,16 +368,21 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _number(params.get("bagging_temperature", 0.8), "bagging_temperature", 0.0, 10.0)
         _integer(params.get("od_wait", 100), "od_wait", 1, 1000)
     elif kind == "random_forest":
-        _integer(params.get("n_estimators", 500), "n_estimators", 1, 100_000)
+        _integer(params.get("n_estimators", 300), "n_estimators", 1, 100_000)
         _integer(params.get("max_depth", 0), "max_depth", 0, 128)
         _integer(params.get("min_samples_split", 2), "min_samples_split", 2, 1_000_000)
         _integer(params.get("min_samples_leaf", 1), "min_samples_leaf", 1, 1_000_000)
-        _number(params.get("max_features", 1.0), "max_features", 0.000001, 1.0)
+        max_features = params.get("max_features", "sqrt")
+        if isinstance(max_features, str):
+            if max_features not in {"sqrt", "log2"}:
+                raise PermanentJobError("max_features只支持sqrt、log2或(0, 1]数值")
+        else:
+            _number(max_features, "max_features", 0.000001, 1.0)
         return
     elif kind == "linear":
         _number(params.get("alpha", 1.0), "alpha", 0.0, 1_000_000.0)
         _integer(params.get("max_iter", 1000), "max_iter", 1, 1_000_000)
-        if not isinstance(params.get("fit_intercept", False), bool):
+        if not isinstance(params.get("fit_intercept", True), bool):
             raise PermanentJobError("fit_intercept必须是布尔值")
         if str(params.get("solver") or "auto") not in {
             "auto", "svd", "cholesky", "lsqr", "sparse_cg", "sag", "saga", "lbfgs",
@@ -381,7 +403,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 2048), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
         return
     elif kind in {"gru", "lstm", "alstm"}:
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -392,7 +414,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 512), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
         return
     elif kind in {"transformer", "nativetft"}:
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -444,7 +466,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 256), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
         return
     _integer(params.get("n_estimators", 1000), "n_estimators", 1, 100_000)
     _integer(params.get("early_stopping_rounds", 50), "early_stopping_rounds", 1, 10_000)
@@ -462,7 +484,7 @@ def _validate_deep_training_loop(
     _integer(params.get("batch_size", default_batch_size), "batch_size", 16, 1_000_000)
     _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
     _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-    _integer(params.get("early_stopping_rounds", 10), "early_stopping_rounds", 1, 10_000)
+    _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
 
 
 def _validate_walk_forward(source: Any) -> None:

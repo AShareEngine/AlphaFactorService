@@ -67,6 +67,8 @@ class RemoteNode:
     auto_start: bool
     auto_stop: bool
     boot_timeout_minutes: int
+    ssh_key_config: str = ""
+    known_hosts_config: str = ""
 
     def public(self) -> dict[str, Any]:
         credential = (
@@ -171,9 +173,9 @@ def remote_node_storage_payload(node: RemoteNode) -> dict[str, Any]:
         "host": node.host,
         "port": node.port,
         "user": node.user,
-        "ssh_key": str(node.ssh_key or ""),
+        "ssh_key": node.ssh_key_config or str(node.ssh_key or ""),
         "password_env": node.password_env,
-        "known_hosts": str(node.known_hosts or ""),
+        "known_hosts": node.known_hosts_config or str(node.known_hosts or ""),
         "work_dir": node.work_dir,
         "runner": node.runner,
         "python_executable": node.python_executable,
@@ -639,7 +641,7 @@ class RemoteResearchExecutor:
         finally:
             if remote_ready:
                 self._stop_remote_runner(container, remote_root)
-            self._power_off_after_job(progress)
+            self._power_off_after_job(job, progress)
 
     def _remote_cache_ready(
         self, remote_path: str, cancellation: CancellationToken,
@@ -731,9 +733,19 @@ class RemoteResearchExecutor:
 
     def _power_off_after_job(
         self,
+        job: dict[str, Any],
         progress: Callable[[str, int, dict[str, Any]], None],
     ) -> None:
         if self.lifecycle is None or not self.node.auto_stop:
+            return
+        if self._experiment_has_pending_remote_jobs(job):
+            try:
+                progress("remote_kept_alive", 89, {
+                    "node_id": self.node.node_id,
+                    "reason": "experiment_jobs_pending",
+                })
+            except Exception:
+                pass
             return
         try:
             progress("remote_powering_off", 89, {
@@ -753,6 +765,39 @@ class RemoteResearchExecutor:
                 })
             except Exception:
                 pass
+
+    def _experiment_has_pending_remote_jobs(self, job: dict[str, Any]) -> bool:
+        config = dict(job.get("config_json") or {})
+        experiment_id = str(
+            dict(config.get("experiment") or {}).get("experiment_id") or ""
+        ).strip()
+        if not experiment_id:
+            return False
+        try:
+            from factor_service.model_research_repository import (
+                ModelResearchRepository,
+            )
+
+            jobs = ModelResearchRepository().list_jobs(
+                experiment_id=experiment_id,
+                limit=100,
+            )
+        except Exception:
+            return False
+        current_job_id = str(job.get("job_id") or "")
+        for candidate in jobs:
+            if str(candidate.get("job_id") or "") == current_job_id:
+                continue
+            if str(candidate.get("status") or "") not in {
+                "queued", "leased", "running", "uploading",
+            }:
+                continue
+            execution = dict(
+                dict(candidate.get("config_json") or {}).get("execution") or {}
+            )
+            if str(execution.get("node_id") or "local") == self.node.node_id:
+                return True
+        return False
 
     def _direct_python_command(self, remote_root: str, thread_count: int) -> str:
         gpu_enabled = bool(self.node.gpus and self.node.gpus != "0")
@@ -1099,6 +1144,8 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         boot_timeout_minutes=max(
             2, min(int(source.get("boot_timeout_minutes") or 15), 60),
         ),
+        ssh_key_config=ssh_key_text,
+        known_hosts_config=known_hosts_text,
     )
 
 

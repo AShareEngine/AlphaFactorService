@@ -27,6 +27,7 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 - `POST /model-inference/availability` 按冻结因子、数据截止时间和历史交易日检查每日推理可用性。
 - `GET /model-signals` 返回指定不可变模型版本、交易日的PIT安全TopN信号，供AlphaBlocks正式策略回测读取。
 - `POST /model-research/jobs` 创建训练任务，`POST /model-research/jobs/{job_id}/dispatch` 在本服务中调度执行。
+- `DELETE /model-research/models/{model_id}/versions/{version}` 永久删除未被主模型、运行任务、部署、架构或其他冻结模型引用的版本，并清理其预测、回测与独占产物。
 - `GET /research/ready` 和 `GET /research/status` 查询内置研究调度器状态。
 
 聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过

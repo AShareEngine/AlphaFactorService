@@ -49,6 +49,10 @@ sources:
     database: starlight
 
 research:
+  worker:
+    enabled: true
+  dataset:
+    factor_query_chunk_days: 90
   scheduler:
     enabled: true
     refresh_seconds: 60

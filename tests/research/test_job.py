@@ -24,6 +24,32 @@ def test_job_validation_accepts_frozen_contract() -> None:
     assert job["dataset_spec"]["universe_id"] == "csi500"
 
 
+def test_job_validation_accepts_and_validates_sample_filters() -> None:
+    source = valid_job()
+    filters = {
+        "minimum_listing_trading_days": 60,
+        "exclude_st": True,
+        "exclude_delisting": True,
+    }
+    source["dataset_spec"]["sample_filters"] = filters
+    source["config_json"]["dataset"]["sample_filters"] = deepcopy(filters)
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    job = validate_job(source)
+
+    assert job["dataset_spec"]["sample_filters"] == filters
+
+    source["dataset_spec"]["sample_filters"]["exclude_st"] = "yes"
+    source["config_json"]["dataset"]["sample_filters"]["exclude_st"] = "yes"
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="exclude_st必须是布尔值"):
+        validate_job(source)
+
+
 def test_job_validation_accepts_classification_target_with_binary_loss() -> None:
     source = valid_job()
     for target in (source["dataset_spec"], source["config_json"]["dataset"]):
@@ -331,6 +357,27 @@ def test_job_validation_rejects_unbounded_model_parameter() -> None:
     job["config_json"]["model"]["params"]["num_threads"] = 1000
 
     with pytest.raises(PermanentJobError, match="num_threads"):
+        validate_job(job)
+
+
+def test_job_validation_accepts_quantmind_random_forest_feature_sampling() -> None:
+    job = valid_job()
+    job["config_json"]["model"] = {
+        "kind": "random_forest",
+        "params": {"n_estimators": 300, "max_depth": 0, "max_features": "sqrt"},
+    }
+
+    assert validate_job(job)["config_json"]["model"]["params"]["max_features"] == "sqrt"
+
+
+def test_job_validation_rejects_unknown_random_forest_feature_sampling() -> None:
+    job = valid_job()
+    job["config_json"]["model"] = {
+        "kind": "random_forest",
+        "params": {"max_features": "all"},
+    }
+
+    with pytest.raises(PermanentJobError, match="max_features"):
         validate_job(job)
 
 

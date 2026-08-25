@@ -125,12 +125,12 @@ def _settings_view(node: RemoteNode) -> dict[str, Any]:
     )
     return {
         **node.public(),
-        "ssh_key": str(node.ssh_key or ""),
+        "ssh_key": node.ssh_key_config or str(node.ssh_key or ""),
         "password_env": node.password_env,
         "password_environment_configured": bool(
             node.password_env and os.environ.get(node.password_env)
         ),
-        "known_hosts": str(node.known_hosts or ""),
+        "known_hosts": node.known_hosts_config or str(node.known_hosts or ""),
         "cleanup_success": node.cleanup_success,
         "max_runtime_minutes": node.max_runtime_minutes,
         "api_token_env": node.api_token_env,

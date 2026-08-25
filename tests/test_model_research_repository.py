@@ -19,6 +19,7 @@ from factor_service.model_research_repository import (
     _incremental_training_assessment,
     _job_row,
     _model_spec,
+    _model_payload_references,
     _research_origin_spec,
     _research_template_spec,
     _walk_forward_spec,
@@ -70,6 +71,36 @@ def _trained_model(
     }
 
 
+def test_model_reference_detection_covers_ensemble_and_incremental_lineage() -> None:
+    ensemble = {
+        "manifest_json": {
+            "ensemble": {
+                "sources": [{"model_id": "source-model", "model_version": 2}],
+            },
+        },
+        "config_json": {},
+    }
+    incremental = {
+        "manifest_json": {},
+        "config_json": {
+            "incremental_training": {
+                "source_model_id": "source-model",
+                "source_model_version": 2,
+            },
+        },
+    }
+
+    assert _model_payload_references(
+        ensemble, model_id="source-model", model_version=2,
+    ) is True
+    assert _model_payload_references(
+        incremental, model_id="source-model", model_version=2,
+    ) is True
+    assert _model_payload_references(
+        ensemble, model_id="source-model", model_version=3,
+    ) is False
+
+
 class _Cursor:
     def __init__(self, row=None) -> None:
         self.row = row
@@ -119,10 +150,49 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
-    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v2"
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v3"
+    assert spec["sample_filters"] == {
+        "minimum_listing_trading_days": 60,
+        "exclude_st": True,
+        "exclude_delisting": True,
+    }
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
     }
+
+
+def test_dataset_contract_preserves_legacy_unfiltered_replay() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "pipeline_version": "alphablocks.dataset-pipeline.v2",
+    })
+
+    assert spec["sample_filters"] == {
+        "minimum_listing_trading_days": 0,
+        "exclude_st": False,
+        "exclude_delisting": False,
+    }
+
+
+def test_dataset_contract_validates_sample_filters() -> None:
+    with pytest.raises(ModelResearchError, match="0至5000"):
+        _dataset_spec({
+            **_source(),
+            "sample_filters": {
+                "minimum_listing_trading_days": 5001,
+                "exclude_st": True,
+                "exclude_delisting": True,
+            },
+        })
+    with pytest.raises(ModelResearchError, match="exclude_st必须是布尔值"):
+        _dataset_spec({
+            **_source(),
+            "sample_filters": {
+                "minimum_listing_trading_days": 60,
+                "exclude_st": "yes",
+                "exclude_delisting": True,
+            },
+        })
 
 
 def test_classification_target_freezes_binary_label_and_model_loss() -> None:
@@ -1765,7 +1835,14 @@ def test_model_spec_matches_quantmind_hyperparameter_contract() -> None:
     assert catboost["bagging_temperature"] == 0.8
     assert catboost["od_wait"] == 100
 
-    assert _model_spec({"kind": "linear", "params": {}})["params"]["alpha"] == 3.0
+    random_forest = _model_spec({"kind": "random_forest", "params": {}})["params"]
+    assert random_forest["n_estimators"] == 300
+    assert random_forest["max_depth"] == 0
+    assert random_forest["max_features"] == "sqrt"
+
+    linear = _model_spec({"kind": "linear", "params": {}})["params"]
+    assert linear["alpha"] == 3.0
+    assert linear["fit_intercept"] is True
     mlp = _model_spec({
         "kind": "mlp", "params": {"hidden_size": 128, "layer_count": 3},
     })["params"]
@@ -1783,6 +1860,7 @@ def test_model_spec_matches_quantmind_hyperparameter_contract() -> None:
         "batch_size": 4000,
     }
     assert {key: gru[key] for key in expected_gru} == expected_gru
+    assert gru["early_stopping_rounds"] == 20
     transformer = _model_spec({"kind": "transformer", "params": {}})["params"]
     assert transformer["learning_rate"] == 0.0001
     assert transformer["lookback_window"] == 20

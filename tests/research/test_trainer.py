@@ -65,6 +65,42 @@ def test_remote_runtime_overrides_default_threads_and_enables_lgb_gpu(
     assert params["gpu_use_dp"] is False
 
 
+def test_catboost_translates_od_wait_without_passing_conflicting_aliases() -> None:
+    model, params = _create_model(
+        "catboost",
+        {"od_wait": 37, "n_estimators": 10, "num_threads": 2},
+        1,
+    )
+
+    assert "od_wait" not in params
+    assert "od_wait" not in model._params
+    assert model._alphablocks_early_stopping_rounds == 37
+
+
+def test_sklearn_baselines_use_quantmind_defaults() -> None:
+    random_forest, forest_params = _create_model("random_forest", {}, 3)
+    ridge, ridge_params = _create_model("linear", {}, 3)
+
+    assert forest_params["n_estimators"] == 300
+    assert forest_params["max_depth"] == 0
+    assert forest_params["max_features"] == "sqrt"
+    assert random_forest.model.n_estimators == 300
+    assert random_forest.model.max_depth is None
+    assert random_forest.model.max_features == "sqrt"
+    assert ridge_params["alpha"] == 3.0
+    assert ridge_params["fit_intercept"] is True
+    assert ridge.model.alpha == 3.0
+    assert ridge.model.fit_intercept is True
+
+
+def test_mlp_uses_quantmind_default_hidden_layer_shape() -> None:
+    model, params = _create_model("mlp", {}, 3)
+
+    assert params["hidden_layers"] == [64, 32]
+    assert params["early_stopping_rounds"] == 20
+    assert model.hidden_layers == (64, 32)
+
+
 def test_validation_sampling_is_deterministic_and_spans_full_period() -> None:
     selected = _validation_indices(1_000, 100)
 

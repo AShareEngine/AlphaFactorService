@@ -332,6 +332,53 @@ def test_dataset_build_checks_cancellation_before_clickhouse_query() -> None:
         builder.build(valid_job(), cancellation=cancellation)
 
 
+def test_sample_filters_apply_listing_age_and_daily_stock_status() -> None:
+    class _Client:
+        def query(self, query, parameters):
+            if "bs_stock_basic" in query:
+                return SimpleNamespace(result_rows=[
+                    ("A", "2024-01-02"),
+                    ("B", "2020-01-02"),
+                    ("C", "2020-01-02"),
+                ])
+            if "SELECT DISTINCT toDate(trade_time)" in query:
+                assert parameters["calendar_code"] == "000001.SH"
+                return SimpleNamespace(result_rows=[
+                    (pd.Timestamp("2024-01-02"),),
+                    (pd.Timestamp("2024-01-03"),),
+                    (pd.Timestamp("2024-01-04"),),
+                ])
+            if "ad_history_stock_status" in query:
+                return SimpleNamespace(result_rows=[
+                    (pd.Timestamp("2024-01-04"), "B", 1, 0),
+                    (pd.Timestamp("2024-01-04"), "C", 0, 1),
+                ])
+            raise AssertionError(query)
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace(source_database="starlight")
+    builder.client = _Client()
+    membership = pd.DataFrame([
+        {"trade_date": pd.Timestamp("2024-01-04"), "instrument": code}
+        for code in ("A", "B", "C")
+    ])
+
+    filtered = builder._apply_sample_filters(
+        membership,
+        date_start="2024-01-04",
+        date_end="2024-01-04",
+        sample_filters={
+            "minimum_listing_trading_days": 2,
+            "exclude_st": True,
+            "exclude_delisting": True,
+        },
+    )
+
+    assert filtered.to_dict("records") == [{
+        "trade_date": pd.Timestamp("2024-01-04"), "instrument": "A",
+    }]
+
+
 def test_factor_query_calculates_on_demand_without_factor_value_persistence(monkeypatch) -> None:
     class _Client:
         query_text = ""

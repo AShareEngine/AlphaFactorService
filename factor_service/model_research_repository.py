@@ -2039,6 +2039,149 @@ class ModelResearchRepository:
                 )
         return self.get_model(model_id, version)
 
+    def delete_model(self, model_id: str, version: int) -> dict[str, Any]:
+        """Permanently delete one unreferenced model version and its job metadata."""
+
+        clean_model_id = _required_identifier(model_id, "model_id")
+        clean_version = int(version)
+        if clean_version <= 0:
+            raise ModelResearchError("model_version必须是正整数")
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    SELECT versions.*, specs.spec_hash AS dataset_hash
+                    FROM model_versions versions
+                    JOIN model_dataset_specs specs USING(dataset_id)
+                    WHERE versions.model_id = %s AND versions.version = %s
+                    FOR UPDATE OF versions
+                    """,
+                    (clean_model_id, clean_version),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型版本不存在")
+                current = dict(row)
+                if bool(current.get("is_default")):
+                    raise ModelResearchConflict("主模型不能删除；请先取消主模型或切换其他版本")
+
+                deployments = conn.execute(
+                    """
+                    SELECT deployment_id, mode, state
+                    FROM model_strategy_deployments
+                    WHERE model_id = %s AND model_version = %s
+                    ORDER BY created_at
+                    """,
+                    (clean_model_id, clean_version),
+                ).fetchall()
+                if deployments:
+                    raise ModelResearchConflict(
+                        "模型存在模拟盘或策略部署，必须先删除关联策略："
+                        + "、".join(str(item["deployment_id"]) for item in deployments)
+                    )
+
+                architectures = conn.execute(
+                    """
+                    SELECT architectures.architecture_id, architectures.name,
+                           architectures.state
+                    FROM model_architecture_engines engines
+                    JOIN model_architectures architectures
+                      USING(architecture_id)
+                    WHERE engines.model_id = %s AND engines.model_version = %s
+                    ORDER BY architectures.created_at
+                    """,
+                    (clean_model_id, clean_version),
+                ).fetchall()
+                if architectures:
+                    raise ModelResearchConflict(
+                        "模型仍被模型架构引用："
+                        + "、".join(
+                            str(item.get("name") or item["architecture_id"])
+                            for item in architectures
+                        )
+                    )
+
+                active_jobs = conn.execute(
+                    """
+                    SELECT job_id, kind, status
+                    FROM model_jobs
+                    WHERE model_id = %s AND model_version = %s
+                      AND job_id <> %s
+                      AND status NOT IN ('succeeded', 'failed', 'canceled')
+                    ORDER BY requested_at
+                    """,
+                    (clean_model_id, clean_version, str(current["job_id"])),
+                ).fetchall()
+                if active_jobs:
+                    raise ModelResearchConflict(
+                        "模型仍有运行中的推理或研究任务："
+                        + "、".join(str(item["job_id"]) for item in active_jobs)
+                    )
+
+                candidates = conn.execute(
+                    """
+                    SELECT versions.model_id, versions.version, versions.name,
+                           versions.manifest_json, jobs.config_json
+                    FROM model_versions versions
+                    JOIN model_jobs jobs USING(job_id)
+                    WHERE NOT (
+                        versions.model_id = %s AND versions.version = %s
+                    )
+                    ORDER BY versions.created_at DESC
+                    """,
+                    (clean_model_id, clean_version),
+                ).fetchall()
+                dependents = [
+                    dict(item)
+                    for item in candidates
+                    if _model_payload_references(
+                        item,
+                        model_id=clean_model_id,
+                        model_version=clean_version,
+                    )
+                ]
+                if dependents:
+                    raise ModelResearchConflict(
+                        "模型仍被其他冻结模型引用："
+                        + "、".join(
+                            f"{item.get('name') or item['model_id']} · v{item['version']}"
+                            for item in dependents
+                        )
+                    )
+
+                conn.execute(
+                    "DELETE FROM model_versions WHERE model_id = %s AND version = %s",
+                    (clean_model_id, clean_version),
+                )
+                conn.execute(
+                    "DELETE FROM model_jobs WHERE job_id = %s",
+                    (str(current["job_id"]),),
+                )
+                dataset_deleted = bool(conn.execute(
+                    """
+                    DELETE FROM model_dataset_specs specs
+                    WHERE specs.dataset_id = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM model_jobs jobs
+                          WHERE jobs.dataset_id = specs.dataset_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM model_versions versions
+                          WHERE versions.dataset_id = specs.dataset_id
+                      )
+                    RETURNING dataset_id
+                    """,
+                    (str(current["dataset_id"]),),
+                ).fetchone())
+        return {
+            "model_id": clean_model_id,
+            "version": clean_version,
+            "name": str(current.get("name") or clean_model_id),
+            "job_id": str(current["job_id"]),
+            "dataset_id": str(current["dataset_id"]),
+            "dataset_hash": str(current.get("dataset_hash") or ""),
+            "dataset_deleted": dataset_deleted,
+        }
+
     def create_model_architecture(
         self, payload: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -4086,10 +4229,11 @@ def _incremental_training_assessment(
         },
         {
             "key": "target_contract",
-            "label": "股票池、研究目标和标签周期完全一致",
+            "label": "股票池、样本过滤、研究目标和标签周期完全一致",
             "passed": (
                 source_dataset.get("universe_id") == dataset.get("universe_id")
                 and source_dataset.get("index_code") == dataset.get("index_code")
+                and source_dataset.get("sample_filters") == dataset.get("sample_filters")
                 and source_dataset.get("research_target") == dataset.get("research_target")
                 and source_dataset.get("prediction_scope") == dataset.get("prediction_scope")
                 and source_label == candidate_label
@@ -4397,15 +4541,56 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         )
     index_code = UNIVERSES[universe_id]["index_code"]
     benchmark_code = UNIVERSES[universe_id]["benchmark"]
+    raw_sample_filters = source.get("sample_filters")
+    legacy_without_sample_filters = (
+        raw_sample_filters is None
+        and str(source.get("pipeline_version") or "")
+        in {
+            "alphablocks.dataset-pipeline.v1",
+            "alphablocks.dataset-pipeline.v2",
+        }
+    )
+    if raw_sample_filters is None:
+        raw_sample_filters = {}
+    if not isinstance(raw_sample_filters, Mapping):
+        raise ModelResearchError("sample_filters必须是对象")
+    try:
+        minimum_listing_trading_days = int(
+            raw_sample_filters.get(
+                "minimum_listing_trading_days",
+                0 if legacy_without_sample_filters else 60,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("最少上市交易日必须是0至5000的整数") from exc
+    if not 0 <= minimum_listing_trading_days <= 5000:
+        raise ModelResearchError("最少上市交易日必须是0至5000的整数")
+
+    def sample_filter_switch(name: str, default: bool) -> bool:
+        value = raw_sample_filters.get(name, default)
+        if not isinstance(value, bool):
+            raise ModelResearchError(f"sample_filters.{name}必须是布尔值")
+        return value
+
+    sample_filters = {
+        "minimum_listing_trading_days": minimum_listing_trading_days,
+        "exclude_st": sample_filter_switch(
+            "exclude_st", not legacy_without_sample_filters,
+        ),
+        "exclude_delisting": sample_filter_switch(
+            "exclude_delisting", not legacy_without_sample_filters,
+        ),
+    }
     return {
         # Part of the immutable dataset identity. Bump this whenever label or
         # feature materialization semantics change so an older canonical
         # snapshot can never be silently reused by a newly created job.
-        "pipeline_version": "alphablocks.dataset-pipeline.v2",
+        "pipeline_version": "alphablocks.dataset-pipeline.v3",
         "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
         "universe_id": universe_id,
         "index_code": index_code,
         "benchmark_code": benchmark_code,
+        "sample_filters": sample_filters,
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,
@@ -4558,9 +4743,9 @@ def _model_spec(
                 "min_samples_leaf", "max_features", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "n_estimators": 500, "max_depth": 0,
+                "loss": "mse", "n_estimators": 300, "max_depth": 0,
                 "min_samples_split": 2, "min_samples_leaf": 1,
-                "max_features": 1.0,
+                "max_features": "sqrt",
             },
         },
         "linear": {
@@ -4569,7 +4754,7 @@ def _model_spec(
                 "alpha", "fit_intercept", "solver", "max_iter", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "alpha": 3.0, "fit_intercept": False,
+                "loss": "mse", "alpha": 3.0, "fit_intercept": True,
                 "solver": "auto", "max_iter": 1000,
             },
         },
@@ -4584,7 +4769,7 @@ def _model_spec(
                 "loss": "mse", "learning_rate": 0.0001,
                 "hidden_size": 64, "layer_count": 2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4600,7 +4785,7 @@ def _model_spec(
                 "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4616,7 +4801,7 @@ def _model_spec(
                 "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4632,7 +4817,7 @@ def _model_spec(
                 "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4649,7 +4834,7 @@ def _model_spec(
                 "lookback_window": 20, "d_model": 64, "nhead": 4,
                 "transformer_layers": 2, "dim_feedforward": 256,
                 "dropout": 0.2, "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4680,7 +4865,7 @@ def _model_spec(
                 "lookback_window": 20, "hidden_size": 128,
                 "kernel_size": 5, "num_layers": 2, "dropout": 0.2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4698,7 +4883,7 @@ def _model_spec(
                 "gru_hidden_size": 64, "num_layers": 2,
                 "dim_feedforward": 128, "dropout": 0.2,
                 "max_steps": 200, "batch_size": 4000,
-                "early_stopping_rounds": 10, "eval_steps": 10,
+                "early_stopping_rounds": 20, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
         },
@@ -4856,6 +5041,42 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "embargo_days": embargo_days,
         "session_convention": {"year": 252, "month": 21},
     }
+
+
+def _model_payload_references(
+    model: Mapping[str, Any], *, model_id: str, model_version: int,
+) -> bool:
+    """Return whether a frozen model depends on another immutable version."""
+
+    manifest = dict(model.get("manifest_json") or {})
+    config = dict(model.get("config_json") or {})
+    reference_objects: list[Mapping[str, Any]] = []
+    for payload in (manifest, config):
+        ensemble = dict(payload.get("ensemble") or {})
+        reference_objects.extend(
+            item for item in ensemble.get("sources") or []
+            if isinstance(item, Mapping)
+        )
+    for key in ("incremental_training", "research_origin"):
+        item = config.get(key) or {}
+        if isinstance(item, Mapping):
+            reference_objects.append(item)
+    for item in reference_objects:
+        referenced_id = str(
+            item.get("model_id") or item.get("source_model_id") or ""
+        )
+        try:
+            referenced_version = int(
+                item.get("model_version")
+                or item.get("source_model_version")
+                or item.get("version")
+                or 0
+            )
+        except (TypeError, ValueError):
+            continue
+        if referenced_id == str(model_id) and referenced_version == int(model_version):
+            return True
+    return False
 
 
 def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:

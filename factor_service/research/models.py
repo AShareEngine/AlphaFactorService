@@ -88,7 +88,7 @@ class QlibTorchMLPModel:
         self, *, input_dim: int, hidden_layers: list[int] | tuple[int, ...] | None = None,
         hidden_size: int | None = None, layer_count: int | None = None,
         learning_rate: float = 0.001, max_steps: int = 300, batch_size: int = 2048,
-        early_stopping_rounds: int = 10, eval_steps: int = 10,
+        early_stopping_rounds: int = 20, eval_steps: int = 10,
         weight_decay: float = 0.0001, seed: int = 42, num_threads: int = 4,
         loss: str = "mse",
     ) -> None:
@@ -100,7 +100,10 @@ class QlibTorchMLPModel:
             # Keep direct callers of the original constructor working while all
             # newly frozen model specs use the explicit per-layer representation.
             width = int(hidden_size or 64)
-            hidden_layers = [width] * int(layer_count or 2)
+            hidden_layers = [
+                max(4, width // (2 ** index))
+                for index in range(int(layer_count or 2))
+            ]
         self.hidden_layers = tuple(int(width) for width in hidden_layers)
         if not 1 <= len(self.hidden_layers) <= 8:
             raise ValueError("hidden_layers必须包含1到8层")
@@ -275,7 +278,7 @@ class QlibTorchLSTMModel:
         self, *, input_dim: int, lookback_window: int = 60,
         hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2,
         learning_rate: float = 0.001, max_steps: int = 300,
-        batch_size: int = 512, early_stopping_rounds: int = 10,
+        batch_size: int = 512, early_stopping_rounds: int = 20,
         eval_steps: int = 10, weight_decay: float = 0.0001,
         seed: int = 42, num_threads: int = 4,
         loss: str = "mse",
@@ -582,7 +585,7 @@ class QlibTorchTransformerLSTMModel(QlibTorchLSTMModel):
         dim_feedforward: int = 256, lstm_hidden_size: int = 128,
         lstm_layers: int = 1, dropout: float = 0.2,
         learning_rate: float = 0.001, max_steps: int = 300,
-        batch_size: int = 256, early_stopping_rounds: int = 10,
+        batch_size: int = 256, early_stopping_rounds: int = 20,
         eval_steps: int = 10, weight_decay: float = 0.0001,
         seed: int = 42, num_threads: int = 4,
         loss: str = "mse",
@@ -1039,7 +1042,7 @@ class QlibSklearnRidgeModel(_QlibSklearnMixin):
 
     def __init__(
         self, *, input_dim: int, alpha: float = 1.0,
-        fit_intercept: bool = False, solver: str = "auto",
+        fit_intercept: bool = True, solver: str = "auto",
         max_iter: int = 1000, seed: int = 42, num_threads: int = 4,
         loss: str = "mse",
     ) -> None:
@@ -1080,9 +1083,9 @@ class QlibSklearnRandomForestModel(_QlibSklearnMixin):
     """随机森林回归/分类基线，用于与Boosting模型对比。"""
 
     def __init__(
-        self, *, input_dim: int, n_estimators: int = 500,
+        self, *, input_dim: int, n_estimators: int = 300,
         max_depth: int = 0, min_samples_split: int = 2,
-        min_samples_leaf: int = 1, max_features: float = 1.0,
+        min_samples_leaf: int = 1, max_features: float | str = "sqrt",
         seed: int = 42, num_threads: int = 4,
         loss: str = "mse",
     ) -> None:
@@ -1100,7 +1103,7 @@ class QlibSklearnRandomForestModel(_QlibSklearnMixin):
             max_depth=None if depth <= 0 else depth,
             min_samples_split=int(min_samples_split),
             min_samples_leaf=int(min_samples_leaf),
-            max_features=float(max_features),
+            max_features=max_features,
             n_jobs=int(num_threads),
             random_state=int(seed),
             verbose=0,

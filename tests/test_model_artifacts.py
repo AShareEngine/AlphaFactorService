@@ -131,3 +131,27 @@ def test_chunk_zero_cleans_interrupted_upload_parts(tmp_path) -> None:
     directory = store.root / ".uploads" / "job-1" / "bundle" / "model.tgz" / "stable-upload"
     assert (directory / "00000000.part").read_bytes() == fresh
     assert not (directory / "00000001.part").exists()
+
+
+def test_model_delete_removes_job_artifacts_but_preserves_shared_dataset(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    dataset_hash = "d" * 64
+    body = b"model artifact"
+    store.save(
+        job_id="job-delete", artifact_kind="bundle", file_name="model.tgz",
+        source=BytesIO(body), expected_sha256=sha256(body).hexdigest(),
+    )
+    dataset_path = tmp_path / "dataset.parquet"
+    dataset_path.write_bytes(b"shared dataset")
+    store.publish_file(
+        job_id="job-delete", artifact_kind="dataset",
+        source_path=dataset_path, dataset_hash=dataset_hash,
+    )
+
+    removed = store.delete_job_artifacts("job-delete")
+
+    assert removed["job_artifacts"] is True
+    assert not (store.root / "job-delete").exists()
+    assert (store.root / "datasets" / dataset_hash / "dataset.parquet").exists()
+    assert store.delete_dataset_artifacts(dataset_hash) is True
+    assert not (store.root / "datasets" / dataset_hash).exists()

@@ -1391,7 +1391,6 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "l2_leaf_reg": float(source.get("l2_leaf_reg", 3.0)),
             "random_strength": float(source.get("random_strength", 1.5)),
             "bagging_temperature": float(source.get("bagging_temperature", 0.8)),
-            "od_wait": int(source.get("od_wait", 100)),
             "thread_count": _effective_num_threads(source),
             "random_seed": int(source.get("seed", 42)),
             "allow_writing_files": False,
@@ -1401,7 +1400,14 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         model = CatBoostModel(loss="Logloss" if classification else "RMSE", **params)
         model._alphablocks_loss = loss
         model._alphablocks_num_boost_round = int(source.get("n_estimators", 2000))
-        model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
+        # Qlib's CatBoostModel.fit always forwards early_stopping_rounds to
+        # CatBoost.  CatBoost treats that value and od_wait as aliases and
+        # rejects a configuration containing both, so translate the UI's
+        # od_wait into Qlib's single early-stopping setting instead of passing
+        # both aliases to the native estimator.
+        model._alphablocks_early_stopping_rounds = int(
+            source.get("early_stopping_rounds", source.get("od_wait", 50))
+        )
         return model, {
             **params,
             "loss": loss,
@@ -1419,15 +1425,17 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         if isinstance(raw_layers, list) and raw_layers:
             hidden_layers = [int(width) for width in raw_layers]
         else:
-            hidden_layers = [int(source.get("hidden_size", 64))] * int(
-                source.get("layer_count", 2)
-            )
+            hidden_size = int(source.get("hidden_size", 64))
+            hidden_layers = [
+                max(4, hidden_size // (2 ** index))
+                for index in range(int(source.get("layer_count", 2)))
+            ]
         params = {
             "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.0001)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1452,7 +1460,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1480,7 +1488,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 300)),
             "batch_size": int(source.get("batch_size", 256)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1507,7 +1515,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1533,7 +1541,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1558,7 +1566,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1585,7 +1593,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "dropout": float(source.get("dropout", 0.2)),
             "max_steps": int(source.get("max_steps", 200)),
             "batch_size": int(source.get("batch_size", 4000)),
-            "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
+            "early_stopping_rounds": int(source.get("early_stopping_rounds", 20)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
@@ -1621,7 +1629,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         params = {
             "loss": loss,
             "alpha": float(source.get("alpha", 3.0)),
-            "fit_intercept": bool(source.get("fit_intercept", False)),
+            "fit_intercept": bool(source.get("fit_intercept", True)),
             "solver": str(source.get("solver", "auto")),
             "max_iter": int(source.get("max_iter", 1000)),
             "seed": int(source.get("seed", 42)),
@@ -1634,11 +1642,11 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "n_estimators": int(source.get("n_estimators", 500)),
+            "n_estimators": int(source.get("n_estimators", 300)),
             "max_depth": int(source.get("max_depth", 0)),
             "min_samples_split": int(source.get("min_samples_split", 2)),
             "min_samples_leaf": int(source.get("min_samples_leaf", 1)),
-            "max_features": float(source.get("max_features", 1.0)),
+            "max_features": source.get("max_features", "sqrt"),
             "seed": int(source.get("seed", 42)),
             "num_threads": _effective_num_threads(source),
             "input_dim": feature_count,

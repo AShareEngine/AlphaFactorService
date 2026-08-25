@@ -4,6 +4,7 @@ from hashlib import sha256
 from pathlib import Path
 import os
 import re
+import shutil
 import tempfile
 from typing import BinaryIO
 
@@ -116,6 +117,38 @@ class ModelArtifactStore:
             raise ArtifactError("模型产物不存在")
         return target
 
+    def delete_job_artifacts(self, job_id: str) -> dict[str, bool]:
+        """Delete only artifacts owned by one model job.
+
+        Dataset snapshots live under ``datasets/{dataset_hash}`` and may be
+        shared by multiple jobs, so this method deliberately leaves them in
+        place.  The caller can remove an unreferenced dataset separately.
+        """
+
+        safe_job = self._name(job_id, "job_id")
+        job_directory = (self.root / safe_job).resolve()
+        upload_directory = (self.root / ".uploads" / safe_job).resolve()
+        removed = {
+            "job_artifacts": self._remove_directory(job_directory),
+            "pending_uploads": self._remove_directory(upload_directory),
+        }
+        uploads_root = (self.root / ".uploads").resolve()
+        try:
+            uploads_root.rmdir()
+        except OSError:
+            pass
+        return removed
+
+    def delete_dataset_artifacts(self, dataset_hash: str) -> bool:
+        """Delete an immutable dataset snapshot after its final DB reference is gone."""
+
+        clean_hash = str(dataset_hash or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", clean_hash):
+            raise ArtifactError("dataset_hash无效")
+        return self._remove_directory(
+            (self.root / "datasets" / clean_hash).resolve(),
+        )
+
     def save_chunk(
         self, *, job_id: str, artifact_kind: str, file_name: str,
         upload_id: str, chunk_index: int, chunk_sha256: str, source: BinaryIO,
@@ -196,6 +229,16 @@ class ModelArtifactStore:
         if self.root not in directory.parents:
             raise ArtifactError("分片上传路径越界")
         return directory
+
+    def _remove_directory(self, directory: Path) -> bool:
+        if self.root not in directory.parents:
+            raise ArtifactError("产物路径越界")
+        if not directory.exists():
+            return False
+        if not directory.is_dir():
+            raise ArtifactError("模型产物目录无效")
+        shutil.rmtree(directory)
+        return True
 
     @staticmethod
     def _name(value: str, field: str) -> str:

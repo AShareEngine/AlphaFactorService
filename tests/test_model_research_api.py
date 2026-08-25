@@ -20,6 +20,7 @@ class _Repository:
         self.inference_payload = None
         self.validation_payload = None
         self.registry_payload = None
+        self.deleted_payload = None
         self.architectures = {}
         self.research_templates = {}
 
@@ -268,6 +269,18 @@ class _Repository:
         if action == "archive":
             model["state"] = "archived"
         return model
+
+    def delete_model(self, model_id, version):
+        self.deleted_payload = {"model_id": model_id, "version": version}
+        return {
+            "model_id": model_id,
+            "version": version,
+            "name": "测试模型",
+            "job_id": "job-done",
+            "dataset_id": "dataset-1",
+            "dataset_hash": "d" * 64,
+            "dataset_deleted": False,
+        }
 
     def mark_validated(self, model_id, version, backtest_job_id, *, validation):
         self.validation_payload = dict(validation)
@@ -545,6 +558,71 @@ def test_model_registry_action_uses_validation_gate_and_returns_pool_state(monke
         "note": "首个正式主模型",
     }
     assert response.json()["model"]["registry"]["is_default"] is True
+
+
+def test_model_version_delete_cleans_evidence_and_artifacts(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    cleanup_calls = []
+
+    class _Store:
+        def __init__(self, _root):
+            pass
+
+        @staticmethod
+        def delete_job_artifacts(job_id):
+            cleanup_calls.append(("artifacts", job_id))
+            return {"job_artifacts": True, "pending_uploads": False}
+
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "active_model_backtest_jobs",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "delete_model_data",
+        lambda **kwargs: cleanup_calls.append(("clickhouse", kwargs)) or {
+            "backtest_job_count": 2,
+            "predictions_deleted": True,
+        },
+    )
+    monkeypatch.setattr(model_research, "ModelArtifactStore", _Store)
+    monkeypatch.setattr(
+        model_research,
+        "load_research_settings",
+        lambda: SimpleNamespace(model_artifacts_root="/tmp/model-artifacts"),
+    )
+
+    response = client.delete("/model-research/models/model-1/versions/1")
+
+    assert response.status_code == 200
+    assert response.json()["deleted"]["job_id"] == "job-done"
+    assert response.json()["warnings"] == []
+    assert repository.deleted_payload == {"model_id": "model-1", "version": 1}
+    assert cleanup_calls == [
+        ("clickhouse", {"model_id": "model-1", "model_version": 1}),
+        ("artifacts", "job-done"),
+    ]
+
+
+def test_model_version_delete_rejects_active_backtest(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "active_model_backtest_jobs",
+        lambda **_kwargs: [{
+            "backtest_job_id": "model-backtest-running",
+            "status": "running",
+        }],
+    )
+
+    response = client.delete("/model-research/models/model-1/versions/1")
+
+    assert response.status_code == 409
+    assert "model-backtest-running" in response.json()["detail"]
+    assert repository.deleted_payload is None
 
 
 def test_model_research_report_routes(monkeypatch) -> None:

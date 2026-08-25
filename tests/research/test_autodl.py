@@ -271,7 +271,35 @@ def test_remote_executor_still_powers_off_when_progress_is_canceled() -> None:
     })()
 
     executor._power_off_after_job(
+        {"job_id": "model_job_test", "config_json": {}},
         lambda *_args: (_ for _ in ()).throw(RuntimeError("job canceled")),
     )
 
     assert calls == ["power_off"]
+
+
+def test_remote_executor_keeps_instance_alive_for_pending_experiment_jobs() -> None:
+    calls = []
+
+    class Lifecycle:
+        def power_off(self):
+            calls.append("power_off")
+
+    executor = object.__new__(RemoteResearchExecutor)
+    executor.lifecycle = Lifecycle()
+    executor.node = type("Node", (), {
+        "auto_stop": True, "node_id": "autodl-pro-01",
+    })()
+    executor._experiment_has_pending_remote_jobs = lambda _job: True
+    events = []
+
+    executor._power_off_after_job(
+        {"job_id": "model_job_test", "config_json": {}},
+        lambda stage, percent, details: events.append((stage, percent, details)),
+    )
+
+    assert calls == []
+    assert events == [(
+        "remote_kept_alive", 89,
+        {"node_id": "autodl-pro-01", "reason": "experiment_jobs_pending"},
+    )]

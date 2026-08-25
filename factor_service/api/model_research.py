@@ -1512,6 +1512,55 @@ def get_model(model_id: str, version: int) -> dict[str, Any]:
         _raise(exc)
 
 
+@router.delete("/models/{model_id}/versions/{version}")
+def delete_model(model_id: str, version: int) -> dict[str, Any]:
+    """Permanently delete one model version after all durable references clear."""
+
+    try:
+        active_backtests = model_repository.active_model_backtest_jobs(
+            model_id=model_id, model_version=version,
+        )
+        if active_backtests:
+            raise ModelResearchConflict(
+                "模型仍有运行中的回测任务："
+                + "、".join(
+                    str(item["backtest_job_id"]) for item in active_backtests
+                )
+            )
+        deleted = repository.delete_model(model_id, version)
+        warnings: list[str] = []
+        cleanup: dict[str, Any] = {}
+        try:
+            cleanup["clickhouse"] = model_repository.delete_model_data(
+                model_id=model_id, model_version=version,
+            )
+        except Exception as exc:
+            warnings.append(f"ClickHouse历史数据清理失败：{exc}")
+        try:
+            artifact_store = ModelArtifactStore(
+                load_research_settings().model_artifacts_root,
+            )
+            cleanup["artifacts"] = artifact_store.delete_job_artifacts(
+                str(deleted["job_id"]),
+            )
+            if bool(deleted.get("dataset_deleted")):
+                cleanup["dataset_artifacts_deleted"] = (
+                    artifact_store.delete_dataset_artifacts(
+                        str(deleted["dataset_hash"]),
+                    )
+                )
+        except Exception as exc:
+            warnings.append(f"模型文件清理失败：{exc}")
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "cleanup": cleanup,
+            "warnings": warnings,
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.get("/models/{model_id}/versions/{version}/reproducibility-audit")
 def get_model_reproducibility_audit(
     model_id: str, version: int,

@@ -15,6 +15,7 @@ from factor_service.research.remote import (
     _remote_result_is_complete,
     _source_fingerprint,
     load_remote_nodes,
+    remote_node_storage_payload,
 )
 from factor_service.research.remote_runner import _scoped_path
 from factor_service.research.trainer import QlibTrainer
@@ -72,6 +73,25 @@ def test_remote_node_supports_autodl_direct_python_runner(
     assert node.runner == "direct_python"
     assert node.python_executable == "/root/miniconda3/bin/python"
     assert node.public()["runner"] == "direct_python"
+
+
+def test_remote_node_storage_preserves_relative_secret_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    key_path = tmp_path / ".secrets" / "remote_nodes" / "autodl_ed25519"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("test-key", encoding="utf-8")
+    runtime = _runtime(tmp_path)
+    config = runtime["research"]["execution"]["remote_nodes"][0]
+    config.pop("password_env")
+    config["ssh_key"] = ".secrets/remote_nodes/autodl_ed25519"
+
+    node = load_remote_nodes(runtime)[0]
+    stored = remote_node_storage_payload(node)
+
+    assert node.ssh_key == key_path
+    assert stored["ssh_key"] == ".secrets/remote_nodes/autodl_ed25519"
 
 
 @pytest.mark.parametrize(
