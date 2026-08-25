@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from hashlib import sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,9 @@ _GPU_SPEC = re.compile(r"^[A-Za-z0-9=,._-]{0,128}$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _REMOTE_RUNNERS = {"docker", "direct_python"}
 _LIFECYCLE_PROVIDERS = {"", "autodl_pro"}
+_REMOTE_MAX_THREADS = 32
+_REMOTE_VALIDATION_SAMPLE_ROWS = 200_000
+_REMOTE_TRAIN_METRIC_SAMPLE_ROWS = 200_000
 
 
 @dataclass(frozen=True)
@@ -279,7 +283,9 @@ class RemoteTransport:
         # --protect-args flag. Node configuration is validated before it reaches
         # this transport and subprocess receives an argv list, so no shell
         # interpolation is involved here.
-        args = [*self._auth_prefix(), "rsync", "-az", "--partial"]
+        # Parquet and model bundles are already compressed. Recompressing them
+        # with rsync's -z consumes a CPU core and slows large AutoDL transfers.
+        args = [*self._auth_prefix(), "rsync", "-a", "--partial"]
         if delete:
             args.append("--delete")
         if directory:
@@ -301,7 +307,7 @@ class RemoteTransport:
     ) -> None:
         destination.mkdir(parents=True, exist_ok=True) if directory else destination.parent.mkdir(parents=True, exist_ok=True)
         args = [
-            *self._auth_prefix(), "rsync", "-az", "--partial",
+            *self._auth_prefix(), "rsync", "-a", "--partial",
             "-e", shlex.join(self._ssh_base(include_target=False)),
         ]
         remote = f"{self._target()}:{remote_path}" + ("/" if directory else "")
@@ -401,6 +407,7 @@ class RemoteResearchExecutor:
         job_id = str(job["job_id"])
         attempt = max(1, int(job.get("attempt_count") or 1))
         remote_root = f"{self.node.work_dir}/runs/{job_id}/attempt-{attempt:03d}"
+        cache_root = f"{self.node.work_dir}/cache"
         container = f"ab-research-{job_id[-32:]}-{attempt:03d}"
         remote_ready = False
         try:
@@ -414,11 +421,17 @@ class RemoteResearchExecutor:
             )
             cancellation.checkpoint()
             progress("remote_preparing", 57, {"node_id": self.node.node_id})
+            source_root = Path(__file__).resolve().parents[1]
+            source_fingerprint = _source_fingerprint(source_root)
+            source_cache = f"{cache_root}/source/{source_fingerprint}"
+            dataset_cache = f"{cache_root}/datasets/{job['dataset_hash']}"
             mkdir = " ".join(shlex.quote(path) for path in (
                 remote_root,
-                f"{remote_root}/source/factor_service",
-                f"{remote_root}/artifacts/datasets/{job['dataset_hash']}",
+                f"{remote_root}/source",
+                f"{remote_root}/artifacts/datasets",
                 f"{remote_root}/work",
+                f"{cache_root}/source",
+                f"{cache_root}/datasets",
             ))
             completed = self.transport.ssh(
                 f"mkdir -p {mkdir}", timeout=60, cancellation=cancellation,
@@ -431,16 +444,36 @@ class RemoteResearchExecutor:
                 json.dumps(job, ensure_ascii=False, sort_keys=True, default=str),
                 encoding="utf-8",
             )
-            source_root = Path(__file__).resolve().parents[1]
             dataset_dir = snapshot.dataset_path.parent
-            self.transport.push(
-                source_root, f"{remote_root}/source/factor_service",
-                directory=True, delete=True, cancellation=cancellation,
+            source_cache_hit = self._remote_cache_ready(source_cache, cancellation)
+            if not source_cache_hit:
+                self.transport.push(
+                    source_root, source_cache,
+                    directory=True, delete=True, cancellation=cancellation,
+                )
+                self._mark_remote_cache_ready(source_cache, cancellation)
+            dataset_cache_hit = self._remote_cache_ready(dataset_cache, cancellation)
+            if not dataset_cache_hit:
+                self.transport.push(
+                    dataset_dir, dataset_cache,
+                    directory=True, delete=True, cancellation=cancellation,
+                )
+                self._mark_remote_cache_ready(dataset_cache, cancellation)
+            links = (
+                f"rm -rf -- {shlex.quote(remote_root + '/source/factor_service')} "
+                f"{shlex.quote(remote_root + '/artifacts/datasets/' + str(job['dataset_hash']))}; "
+                f"ln -s {shlex.quote(source_cache)} "
+                f"{shlex.quote(remote_root + '/source/factor_service')}; "
+                f"ln -s {shlex.quote(dataset_cache)} "
+                f"{shlex.quote(remote_root + '/artifacts/datasets/' + str(job['dataset_hash']))}"
             )
-            self.transport.push(
-                dataset_dir, f"{remote_root}/artifacts/datasets/{job['dataset_hash']}",
-                directory=True, delete=True, cancellation=cancellation,
+            linked = self.transport.ssh(
+                links, timeout=60, cancellation=cancellation,
             )
+            if linked.returncode != 0:
+                raise RetryableJobError(
+                    linked.stderr.strip() or "无法挂载远程训练缓存"
+                )
             incremental = dict((job.get("config_json") or {}).get("incremental_training") or {})
             source_artifact = dict(incremental.get("source_artifact") or {})
             source_relative = str(source_artifact.get("relative_path") or "").strip()
@@ -463,11 +496,23 @@ class RemoteResearchExecutor:
             progress("remote_snapshot_uploaded", 60, {
                 "node_id": self.node.node_id,
                 "dataset_hash": job["dataset_hash"],
+                "dataset_cache_hit": dataset_cache_hit,
+                "source_cache_hit": source_cache_hit,
             })
 
-            thread_count = max(1, int(
-                ((job.get("config_json") or {}).get("model") or {}).get("params", {}).get("num_threads") or 4
-            ))
+            cpu_cores = self._remote_cpu_cores(cancellation)
+            thread_count = _effective_remote_thread_count(
+                cpu_cores, _requested_job_threads(job),
+            )
+            progress("remote_resources_ready", 61, {
+                "node_id": self.node.node_id,
+                "cpu_cores": cpu_cores,
+                "training_threads": thread_count,
+                "gpu_enabled": bool(self.node.gpus and self.node.gpus != "0"),
+                    "amp_enabled": bool(self.node.gpus and self.node.gpus != "0"),
+                    "validation_sample_rows": _REMOTE_VALIDATION_SAMPLE_ROWS,
+                    "train_metric_sample_rows": _REMOTE_TRAIN_METRIC_SAMPLE_ROWS,
+            })
             if self.node.runner == "direct_python":
                 command = self._direct_python_command(remote_root, thread_count)
             else:
@@ -484,6 +529,12 @@ class RemoteResearchExecutor:
                     "-e", f"MKL_NUM_THREADS={thread_count}",
                     "-e", f"ALPHA_TORCH_DEVICE={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
                     "-e", f"ALPHA_MODEL_ACCELERATOR={'cuda' if self.node.gpus and self.node.gpus != '0' else 'cpu'}",
+                    "-e", f"ALPHA_EFFECTIVE_NUM_THREADS={thread_count}",
+                    "-e", "ALPHA_TORCH_AMP=1",
+                    "-e", "ALPHA_TORCH_TF32=1",
+                    "-e", "ALPHA_TORCH_AUTO_BATCH=1",
+                    "-e", f"ALPHA_VALIDATION_SAMPLE_ROWS={_REMOTE_VALIDATION_SAMPLE_ROWS}",
+                    "-e", f"ALPHA_TRAIN_METRIC_SAMPLE_ROWS={_REMOTE_TRAIN_METRIC_SAMPLE_ROWS}",
                     "-v", f"{remote_root}:/workspace",
                     "-v", f"{remote_root}/source:/opt/alphafactor:ro",
                     self.node.docker_image,
@@ -538,6 +589,37 @@ class RemoteResearchExecutor:
             if remote_ready:
                 self._stop_remote_runner(container, remote_root)
             self._power_off_after_job(progress)
+
+    def _remote_cache_ready(
+        self, remote_path: str, cancellation: CancellationToken,
+    ) -> bool:
+        marker = shlex.quote(f"{remote_path}/.alphablocks-cache-complete")
+        completed = self.transport.ssh(
+            f"test -f {marker}", timeout=30, cancellation=cancellation,
+        )
+        return completed.returncode == 0
+
+    def _mark_remote_cache_ready(
+        self, remote_path: str, cancellation: CancellationToken,
+    ) -> None:
+        marker = shlex.quote(f"{remote_path}/.alphablocks-cache-complete")
+        completed = self.transport.ssh(
+            f"touch {marker}", timeout=30, cancellation=cancellation,
+        )
+        if completed.returncode != 0:
+            raise RetryableJobError(
+                completed.stderr.strip() or "无法写入远程缓存完成标记"
+            )
+
+    def _remote_cpu_cores(self, cancellation: CancellationToken) -> int:
+        completed = self.transport.ssh(
+            "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '4\\n'",
+            timeout=30, cancellation=cancellation,
+        )
+        if completed.returncode != 0:
+            return 4
+        match = re.search(r"\d+", completed.stdout)
+        return max(1, int(match.group(0))) if match else 4
 
     def _prepare_lifecycle(
         self,
@@ -640,6 +722,12 @@ class RemoteResearchExecutor:
             f"MKL_NUM_THREADS={thread_count}",
             f"ALPHA_TORCH_DEVICE={'cuda' if gpu_enabled else 'cpu'}",
             f"ALPHA_MODEL_ACCELERATOR={'cuda' if gpu_enabled else 'cpu'}",
+            f"ALPHA_EFFECTIVE_NUM_THREADS={thread_count}",
+            "ALPHA_TORCH_AMP=1",
+            "ALPHA_TORCH_TF32=1",
+            "ALPHA_TORCH_AUTO_BATCH=1",
+            f"ALPHA_VALIDATION_SAMPLE_ROWS={_REMOTE_VALIDATION_SAMPLE_ROWS}",
+            f"ALPHA_TRAIN_METRIC_SAMPLE_ROWS={_REMOTE_TRAIN_METRIC_SAMPLE_ROWS}",
             self.node.python_executable,
             "-m", "factor_service.research.remote_runner",
             paths["job"], paths["work"], paths["result"], paths["artifacts"],
@@ -707,6 +795,22 @@ class RemoteResearchExecutor:
             exit_code = values[1] if len(values) > 1 else "-1"
             if process_state == "exited" and exit_code == "0":
                 return
+            if (
+                process_state == "exited"
+                and _remote_result_is_complete(
+                    self.transport, remote_root, cancellation=cancellation,
+                )
+            ):
+                # Qlib/MLflow may fail during interpreter teardown while trying
+                # to inspect a non-git remote work directory. The result file is
+                # written atomically before the packaged marker, so both are a
+                # stronger completion signal than that late cleanup exit code.
+                progress("remote_process_cleanup_warning", 88, {
+                    "node_id": self.node.node_id,
+                    "exit_code": exit_code,
+                    "result_complete": True,
+                })
+                return
             if process_state in {"exited", "missing"}:
                 logs = self.transport.ssh(
                     f"tail -n 200 {shlex.quote(remote_root + '/runner.log')} 2>&1 || true",
@@ -752,6 +856,18 @@ class RemoteResearchExecutor:
             if status in {"exited", "dead", "missing"}:
                 if status == "exited" and exit_code == "0":
                     return
+                if (
+                    status == "exited"
+                    and _remote_result_is_complete(
+                        self.transport, remote_root, cancellation=cancellation,
+                    )
+                ):
+                    progress("remote_process_cleanup_warning", 88, {
+                        "node_id": self.node.node_id,
+                        "exit_code": exit_code,
+                        "result_complete": True,
+                    })
+                    return
                 logs = self.transport.ssh(
                     f"docker logs --tail 200 {shlex.quote(container)} 2>&1 || true",
                     timeout=60,
@@ -786,6 +902,61 @@ class RemoteResearchExecutor:
                 {"node_id": self.node.node_id, **dict(item.get("details") or {})},
             )
         return len(lines)
+
+
+def _remote_result_is_complete(
+    transport: RemoteTransport,
+    remote_root: str,
+    *,
+    cancellation: CancellationToken | None,
+) -> bool:
+    result_path = shlex.quote(f"{remote_root}/remote_result.json")
+    progress_path = shlex.quote(f"{remote_root}/progress.jsonl")
+    completed = transport.ssh(
+        f"test -s {result_path} && grep -q '\"stage\": \"remote_packaged\"' "
+        f"{progress_path}",
+        timeout=30,
+        cancellation=cancellation,
+    )
+    return completed.returncode == 0
+
+
+def _source_fingerprint(source_root: Path) -> str:
+    digest = sha256()
+    files = sorted(
+        path for path in source_root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+    for path in files:
+        digest.update(path.relative_to(source_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:24]
+
+
+def _requested_job_threads(job: dict[str, Any]) -> int:
+    model = dict((job.get("config_json") or {}).get("model") or {})
+    candidates = [dict(model.get("params") or {}).get("num_threads")]
+    candidates.extend(
+        dict(item.get("params") or {}).get("num_threads")
+        for item in list(model.get("base_models") or [])
+        if isinstance(item, dict)
+    )
+    values = []
+    for value in candidates:
+        try:
+            values.append(max(1, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return max(values, default=4)
+
+
+def _effective_remote_thread_count(cpu_cores: int, requested: int) -> int:
+    available = max(1, int(cpu_cores or 1))
+    configured = max(1, int(requested or 1))
+    automatic = max(4, available // 2)
+    return min(available, _REMOTE_MAX_THREADS, max(configured, automatic))
 
 
 def _normalize_node(source: dict[str, Any]) -> RemoteNode:

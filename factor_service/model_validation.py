@@ -184,6 +184,82 @@ def select_parameter_trial(
     }
 
 
+def select_model_trial(
+    jobs: list[Mapping[str, Any]], *, complete: bool,
+) -> dict[str, Any]:
+    """Select the single best model kind using QuantMind's validation ICIR rule.
+
+    Every model still receives the normal validation-gate assessment for audit and
+    later research controls.  Multi-model comparison itself always produces one
+    primary model once all trials are terminal, ranked only by the absolute
+    validation ICIR; test metrics are deliberately excluded from selection.
+    """
+    assessments = []
+    observed = []
+    qualified_count = 0
+    for source in jobs:
+        job = dict(source)
+        experiment = dict((job.get("config_json") or {}).get("experiment") or {})
+        validation_metrics = dict(
+            ((job.get("result_json") or {}).get("metrics") or {}).get("validation") or {}
+        )
+        assessment = assess_parameter_trial(validation_metrics)
+        item = {
+            "job_id": str(job.get("job_id") or ""),
+            "model_id": str(job.get("model_id") or ""),
+            "model_version": int(job.get("model_version") or 0),
+            "trial_index": int(experiment.get("trial_index") or 0),
+            "status": str(job.get("status") or "unknown"),
+            "model_kind": str(
+                dict(experiment.get("search_params") or {}).get("model_kind")
+                or job.get("model_kind") or ""
+            ),
+            "search_params": dict(experiment.get("search_params") or {}),
+            "metrics": validation_metrics,
+            **assessment,
+        }
+        assessments.append(item)
+        if assessment["passed"]:
+            qualified_count += 1
+        if (
+            item["status"] == "succeeded"
+            and _number(validation_metrics.get("ic_ir")) is not None
+        ):
+            observed.append(item)
+
+    observed.sort(key=_model_trial_sort_key)
+    best_observed = observed[0] if observed else None
+    selected = best_observed if complete else None
+    if not complete:
+        status = "evaluating"
+    elif selected:
+        status = "selected"
+    else:
+        status = "no_completed_models"
+    return {
+        "policy": "alphablocks.model-ensemble-selection.v2",
+        "status": status,
+        "complete": bool(complete),
+        "ranking_metric": "abs(validation.ic_ir)",
+        "qualified_count": qualified_count,
+        "selected_job_id": selected["job_id"] if selected else "",
+        "selected_model_id": selected["model_id"] if selected else "",
+        "selected_model_version": selected["model_version"] if selected else 0,
+        "selected_trial_index": selected["trial_index"] if selected else 0,
+        "selected_model_kind": selected["model_kind"] if selected else "",
+        "best_observed_job_id": best_observed["job_id"] if best_observed else "",
+        "best_observed_trial_index": best_observed["trial_index"] if best_observed else 0,
+        "best_observed_model_kind": best_observed["model_kind"] if best_observed else "",
+        "best_observed_rank_ic": (
+            _number(best_observed["metrics"].get("rank_ic")) if best_observed else None
+        ),
+        "best_observed_ic_ir": (
+            _number(best_observed["metrics"].get("ic_ir")) if best_observed else None
+        ),
+        "trial_assessments": assessments,
+    }
+
+
 def assess_walk_forward_stability(
     aggregate: Mapping[str, Any] | None, *, window_count: int,
 ) -> dict[str, Any]:
@@ -241,6 +317,15 @@ def _parameter_trial_sort_key(item: Mapping[str, Any]) -> tuple[float, float, fl
     )
 
 
+def _model_trial_sort_key(item: Mapping[str, Any]) -> tuple[float, int]:
+    metrics = dict(item.get("metrics") or {})
+    ic_ir = _number(metrics.get("ic_ir"))
+    return (
+        -(abs(ic_ir) if ic_ir is not None else float("-inf")),
+        int(item.get("trial_index") or 0),
+    )
+
+
 def _number(value: Any) -> float | None:
     try:
         numeric = float(value)
@@ -266,5 +351,6 @@ __all__ = [
     "assess_model_validation",
     "assess_parameter_trial",
     "assess_walk_forward_stability",
+    "select_model_trial",
     "select_parameter_trial",
 ]

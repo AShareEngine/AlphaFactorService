@@ -1,11 +1,84 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 import os
+import time
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+def _enabled_environment(name: str, *, default: bool = False) -> bool:
+    raw = str(os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _configure_torch_runtime(torch: Any, device: Any) -> dict[str, Any]:
+    profile = {
+        "device": str(device),
+        "amp_enabled": False,
+        "tf32_enabled": False,
+    }
+    if device.type != "cuda":
+        return profile
+    amp_enabled = _enabled_environment("ALPHA_TORCH_AMP", default=True)
+    tf32_enabled = _enabled_environment("ALPHA_TORCH_TF32", default=True)
+    if tf32_enabled:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    profile.update({
+        "amp_enabled": amp_enabled,
+        "tf32_enabled": tf32_enabled,
+        "gpu_name": torch.cuda.get_device_name(device),
+        "gpu_memory_mb": int(
+            torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
+        ),
+    })
+    return profile
+
+
+def _effective_torch_batch_size(torch: Any, device: Any, requested: int) -> int:
+    batch_size = max(1, int(requested))
+    if device.type != "cuda" or not _enabled_environment("ALPHA_TORCH_AUTO_BATCH"):
+        return batch_size
+    memory_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    multiplier = 4 if memory_gb >= 24 else 2 if memory_gb >= 12 else 1
+    return min(32_768, batch_size * multiplier)
+
+
+def _autocast(torch: Any, device: Any, enabled: bool) -> Any:
+    if device.type != "cuda" or not enabled:
+        return nullcontext()
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return torch.cuda.amp.autocast(dtype=torch.float16)
+
+
+def _grad_scaler(torch: Any, enabled: bool) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _validation_sample_limit() -> int:
+    try:
+        return max(0, int(os.environ.get("ALPHA_VALIDATION_SAMPLE_ROWS") or 0))
+    except ValueError:
+        return 0
+
+
+def _validation_indices(row_count: int, limit: int) -> list[int]:
+    if row_count <= 0:
+        return []
+    if limit <= 0 or row_count <= limit:
+        return list(range(row_count))
+    return np.linspace(0, row_count - 1, num=limit, dtype=np.int64).tolist()
 
 
 class QlibTorchMLPModel:
@@ -35,7 +108,7 @@ class QlibTorchMLPModel:
             raise ValueError("hidden_layers每层宽度必须在4到4096之间")
         self.learning_rate = float(learning_rate)
         self.max_steps = int(max_steps)
-        self.batch_size = int(batch_size)
+        self.requested_batch_size = int(batch_size)
         self.early_stopping_rounds = int(early_stopping_rounds)
         self.eval_steps = int(eval_steps)
         self.weight_decay = float(weight_decay)
@@ -51,6 +124,14 @@ class QlibTorchMLPModel:
         self.device = _torch_device(torch)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(self.seed)
+        self.runtime_profile = _configure_torch_runtime(torch, self.device)
+        self.batch_size = _effective_torch_batch_size(
+            torch, self.device, self.requested_batch_size,
+        )
+        self.runtime_profile.update({
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.batch_size,
+        })
         layers: list[Any] = []
         width = self.input_dim
         for hidden_width in self.hidden_layers:
@@ -81,6 +162,8 @@ class QlibTorchMLPModel:
         optimizer = torch.optim.AdamW(
             self.network.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
         )
+        amp_enabled = bool(self.runtime_profile.get("amp_enabled"))
+        scaler = _grad_scaler(torch, amp_enabled)
         loss_fn = (
             torch.nn.BCEWithLogitsLoss()
             if self.classification else torch.nn.MSELoss()
@@ -90,6 +173,7 @@ class QlibTorchMLPModel:
         best_state = deepcopy(self.network.state_dict())
         stale = 0
         evaluations.update({"train": [], "valid": [], "steps": []})
+        started_at = time.perf_counter()
         self.network.train()
         for step in range(1, self.max_steps + 1):
             if cancellation is not None:
@@ -98,21 +182,36 @@ class QlibTorchMLPModel:
                 0, len(x_train), (min(self.batch_size, len(x_train)),), generator=generator,
             ).to(self.device)
             optimizer.zero_grad(set_to_none=True)
-            train_loss = loss_fn(self.network(x_train[indices]).reshape(-1), y_train[indices])
-            train_loss.backward()
-            optimizer.step()
+            with _autocast(torch, self.device, amp_enabled):
+                output = self.network(x_train[indices]).reshape(-1)
+                train_loss = loss_fn(output.float(), y_train[indices])
+            scaler.scale(train_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             if step % self.eval_steps != 0 and step != self.max_steps:
                 continue
             self.network.eval()
             with torch.no_grad():
-                valid_loss = loss_fn(self.network(x_valid).reshape(-1), y_valid).item()
+                with _autocast(torch, self.device, amp_enabled):
+                    valid_output = self.network(x_valid).reshape(-1)
+                    valid_loss = loss_fn(valid_output.float(), y_valid).item()
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
             evaluations["steps"].append(step)
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
-                    {"iteration": step, "total_iterations": self.max_steps},
+                    {
+                        "iteration": step,
+                        "total_iterations": self.max_steps,
+                        "effective_batch_size": self.batch_size,
+                        "amp_enabled": amp_enabled,
+                        "samples_per_second": round(
+                            step * self.batch_size
+                            / max(0.001, time.perf_counter() - started_at),
+                            1,
+                        ),
+                    },
                 )
             if valid_loss + 1e-12 < best_loss:
                 best_loss = valid_loss
@@ -150,7 +249,10 @@ class QlibTorchMLPModel:
         self.network.eval()
         with torch.no_grad():
             values = torch.as_tensor(features.values, dtype=torch.float32, device=self.device)
-            output = self.network(values).reshape(-1)
+            with _autocast(
+                torch, self.device, bool(self.runtime_profile.get("amp_enabled")),
+            ):
+                output = self.network(values).reshape(-1)
             if self.classification:
                 output = torch.sigmoid(output)
             return output.cpu().numpy().astype(float)
@@ -188,7 +290,7 @@ class QlibTorchLSTMModel:
         self.dropout = float(dropout)
         self.learning_rate = float(learning_rate)
         self.max_steps = int(max_steps)
-        self.batch_size = int(batch_size)
+        self.requested_batch_size = int(batch_size)
         self.early_stopping_rounds = int(early_stopping_rounds)
         self.eval_steps = int(eval_steps)
         self.weight_decay = float(weight_decay)
@@ -203,6 +305,14 @@ class QlibTorchLSTMModel:
         self.device = _torch_device(torch)
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(self.seed)
+        self.runtime_profile = _configure_torch_runtime(torch, self.device)
+        self.batch_size = _effective_torch_batch_size(
+            torch, self.device, self.requested_batch_size,
+        )
+        self.runtime_profile.update({
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.batch_size,
+        })
         self.encoder = nn.LSTM(
             input_size=self.input_dim,
             hidden_size=self.hidden_size,
@@ -231,6 +341,19 @@ class QlibTorchLSTMModel:
         )
         if not len(train) or not len(valid):
             raise ValueError(f"{self.model_name}训练集或验证集为空")
+        valid_indices = _validation_indices(
+            len(valid), _validation_sample_limit(),
+        )
+        valid_features, valid_labels = _materialize_sequence_rows(
+            valid, valid_indices, self.input_dim,
+        )
+        if not len(valid_features):
+            raise ValueError(f"{self.model_name}验证集没有完整历史窗口")
+        self.runtime_profile.update({
+            "validation_rows_total": int(len(valid)),
+            "validation_rows_used": int(len(valid_features)),
+            "validation_sampled": len(valid_features) < len(valid),
+        })
         optimizer = torch.optim.AdamW(
             [*self.encoder.parameters(), *self.head.parameters()],
             lr=self.learning_rate,
@@ -240,6 +363,8 @@ class QlibTorchLSTMModel:
             torch.nn.BCEWithLogitsLoss()
             if self.classification else torch.nn.MSELoss()
         )
+        amp_enabled = bool(self.runtime_profile.get("amp_enabled"))
+        scaler = _grad_scaler(torch, amp_enabled)
         generator = torch.Generator().manual_seed(self.seed)
         best_loss = float("inf")
         best_encoder = deepcopy(self.encoder.state_dict())
@@ -247,6 +372,7 @@ class QlibTorchLSTMModel:
         stale = 0
         successful_steps = 0
         evaluations.update({"train": [], "valid": [], "steps": []})
+        started_at = time.perf_counter()
         self.encoder.train()
         self.head.train()
         for step in range(1, self.max_steps + 1):
@@ -262,19 +388,35 @@ class QlibTorchLSTMModel:
             x_train = torch.as_tensor(features, dtype=torch.float32, device=self.device)
             y_train = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
             optimizer.zero_grad(set_to_none=True)
-            train_loss = loss_fn(self._forward(x_train), y_train)
-            train_loss.backward()
-            optimizer.step()
+            with _autocast(torch, self.device, amp_enabled):
+                output = self._forward(x_train)
+                train_loss = loss_fn(output.float(), y_train)
+            scaler.scale(train_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             if step % self.eval_steps != 0 and step != self.max_steps:
                 continue
-            valid_loss = self._validation_loss(valid, loss_fn, cancellation)
+            valid_loss = self._validation_loss(
+                valid_features, valid_labels, loss_fn, cancellation,
+            )
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
             evaluations["steps"].append(step)
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
-                    {"iteration": step, "total_iterations": self.max_steps},
+                    {
+                        "iteration": step,
+                        "total_iterations": self.max_steps,
+                        "effective_batch_size": self.batch_size,
+                        "amp_enabled": amp_enabled,
+                        "validation_rows": len(valid_features),
+                        "samples_per_second": round(
+                            successful_steps * self.batch_size
+                            / max(0.001, time.perf_counter() - started_at),
+                            1,
+                        ),
+                    },
                 )
             if valid_loss + 1e-12 < best_loss:
                 best_loss = valid_loss
@@ -288,7 +430,9 @@ class QlibTorchLSTMModel:
             self.encoder.train()
             self.head.train()
         if successful_steps and not np.isfinite(best_loss):
-            valid_loss = self._validation_loss(valid, loss_fn, cancellation)
+            valid_loss = self._validation_loss(
+                valid_features, valid_labels, loss_fn, cancellation,
+            )
             evaluations["train"].append(float(train_loss.item()))
             evaluations["valid"].append(float(valid_loss))
             evaluations["steps"].append(self.max_steps)
@@ -312,28 +456,33 @@ class QlibTorchLSTMModel:
         except (AttributeError, RuntimeError):
             pass
 
-    def _validation_loss(self, sampler: Any, loss_fn: Any, cancellation: Any) -> float:
+    def _validation_loss(
+        self, features: np.ndarray, labels: np.ndarray,
+        loss_fn: Any, cancellation: Any,
+    ) -> float:
         import torch
 
         total_loss = 0.0
         total_rows = 0
         self.encoder.eval()
         self.head.eval()
+        amp_enabled = bool(self.runtime_profile.get("amp_enabled"))
         with torch.no_grad():
-            for start in range(0, len(sampler), self.batch_size):
+            for start in range(0, len(features), self.batch_size):
                 if cancellation is not None:
                     cancellation.checkpoint()
-                indices = list(range(start, min(len(sampler), start + self.batch_size)))
-                features, labels, _ = _sequence_batch(
-                    sampler, indices, self.input_dim, with_label=True,
+                end = min(len(features), start + self.batch_size)
+                batch_features = torch.as_tensor(
+                    features[start:end], dtype=torch.float32, device=self.device,
                 )
-                if not len(features):
-                    continue
-                values = self._forward(torch.as_tensor(features, dtype=torch.float32, device=self.device))
-                target = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
-                loss = float(loss_fn(values, target).item())
-                total_loss += loss * len(features)
-                total_rows += len(features)
+                target = torch.as_tensor(
+                    labels[start:end], dtype=torch.float32, device=self.device,
+                )
+                with _autocast(torch, self.device, amp_enabled):
+                    values = self._forward(batch_features)
+                    loss = float(loss_fn(values.float(), target).item())
+                total_loss += loss * (end - start)
+                total_rows += end - start
         if not total_rows:
             raise ValueError(f"{self.model_name}验证集没有完整历史窗口")
         return total_loss / total_rows
@@ -348,7 +497,30 @@ class QlibTorchLSTMModel:
         index = sampler.get_index().take(positions)
         return pd.Series(values, index=index).sort_index()
 
-    def predict_sampler(self, sampler: Any) -> tuple[np.ndarray, list[int]]:
+    def predict_sampled(
+        self, dataset: Any, segment: str, *, max_rows: int,
+    ) -> pd.Series:
+        """Predict a deterministic segment sample for diagnostic-only metrics."""
+        from qlib.data.dataset import DataHandlerLP
+
+        sampler = dataset.prepare(
+            segment, col_set="feature", data_key=DataHandlerLP.DK_I,
+        )
+        selected_positions = _validation_indices(len(sampler), max_rows)
+        values, positions = self.predict_sampler(
+            sampler, selected_positions=selected_positions,
+        )
+        self.runtime_profile.update({
+            "train_metric_rows_total": int(len(sampler)),
+            "train_metric_rows_used": int(len(positions)),
+            "train_metric_sampled": len(positions) < len(sampler),
+        })
+        index = sampler.get_index().take(positions)
+        return pd.Series(values, index=index).sort_index()
+
+    def predict_sampler(
+        self, sampler: Any, *, selected_positions: list[int] | None = None,
+    ) -> tuple[np.ndarray, list[int]]:
         import torch
 
         if not self.fitted:
@@ -357,17 +529,29 @@ class QlibTorchLSTMModel:
         positions: list[int] = []
         self.encoder.eval()
         self.head.eval()
+        amp_enabled = bool(self.runtime_profile.get("amp_enabled"))
+        selected_count = (
+            len(selected_positions) if selected_positions is not None else len(sampler)
+        )
         with torch.no_grad():
-            for start in range(0, len(sampler), self.batch_size):
-                indices = list(range(start, min(len(sampler), start + self.batch_size)))
+            for start in range(0, selected_count, self.batch_size):
+                if selected_positions is None:
+                    indices = list(range(
+                        start, min(len(sampler), start + self.batch_size),
+                    ))
+                else:
+                    indices = selected_positions[start:start + self.batch_size]
                 features, _, valid_positions = _sequence_batch(
                     sampler, indices, self.input_dim, with_label=False,
                 )
                 if not len(features):
                     continue
-                output = self._forward(
-                    torch.as_tensor(features, dtype=torch.float32, device=self.device),
-                )
+                with _autocast(torch, self.device, amp_enabled):
+                    output = self._forward(
+                        torch.as_tensor(
+                            features, dtype=torch.float32, device=self.device,
+                        ),
+                    )
                 if self.classification:
                     output = torch.sigmoid(output)
                 output = output.cpu().numpy().astype(float)
@@ -995,6 +1179,27 @@ class QlibNativeTabNetAdapter:
 
     def to_cpu(self) -> None:
         return None
+
+
+def _materialize_sequence_rows(
+    sampler: Any, indices: list[int], input_dim: int,
+    *, chunk_size: int = 8192,
+) -> tuple[np.ndarray, np.ndarray]:
+    feature_chunks: list[np.ndarray] = []
+    label_chunks: list[np.ndarray] = []
+    for start in range(0, len(indices), chunk_size):
+        features, labels, _ = _sequence_batch(
+            sampler, indices[start:start + chunk_size], input_dim, with_label=True,
+        )
+        if len(features):
+            feature_chunks.append(features)
+            label_chunks.append(labels)
+    if not feature_chunks:
+        return (
+            np.empty((0, 0, input_dim), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    return np.concatenate(feature_chunks), np.concatenate(label_chunks)
 
 
 def _sequence_batch(

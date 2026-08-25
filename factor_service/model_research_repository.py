@@ -19,7 +19,7 @@ from factor_service.entity_field_feature import (
     is_entity_field_feature,
     normalize_entity_field_feature,
 )
-from factor_service.model_validation import select_parameter_trial
+from factor_service.model_validation import select_model_trial, select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
 
 
@@ -29,11 +29,21 @@ MAX_EXPERIMENT_TRIALS = 24
 MAX_EXPERIMENT_ITERATIONS = 3
 MAX_LINEAGE_TRIALS = 24
 
+CLASSICAL_STACKING_KINDS = frozenset({
+    "lightgbm", "xgboost", "catboost", "random_forest", "linear",
+})
+DEEP_STACKING_KINDS = frozenset({
+    "mlp", "gru", "lstm", "alstm", "transformer", "tabnet", "tcn",
+    "nativetft", "transformer_lstm",
+})
+
 SEARCHABLE_MODEL_PARAMS: dict[str, frozenset[str]] = {
     "lightgbm": frozenset({
         "learning_rate", "num_leaves", "max_depth", "n_estimators",
         "subsample", "colsample_bytree", "reg_alpha", "reg_lambda",
-        "min_child_samples",
+        "min_child_samples", "min_data_in_leaf", "path_smooth",
+        "bagging_freq", "lambda_l1", "lambda_l2", "feature_fraction",
+        "bagging_fraction",
     }),
     "xgboost": frozenset({
         "learning_rate", "max_depth", "n_estimators", "subsample",
@@ -41,7 +51,7 @@ SEARCHABLE_MODEL_PARAMS: dict[str, frozenset[str]] = {
     }),
     "catboost": frozenset({
         "learning_rate", "depth", "n_estimators", "l2_leaf_reg",
-        "random_strength",
+        "random_strength", "bagging_temperature", "od_wait",
     }),
     "random_forest": frozenset({
         "n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
@@ -51,8 +61,8 @@ SEARCHABLE_MODEL_PARAMS: dict[str, frozenset[str]] = {
         "alpha", "fit_intercept", "solver", "max_iter",
     }),
     "mlp": frozenset({
-        "learning_rate", "hidden_layers", "max_steps", "batch_size",
-        "weight_decay",
+        "learning_rate", "hidden_layers", "hidden_size", "layer_count",
+        "max_steps", "batch_size", "weight_decay",
     }),
     "gru": frozenset({
         "learning_rate", "lookback_window", "hidden_size", "num_layers",
@@ -473,25 +483,71 @@ class ModelResearchRepository:
                 trial["model"] = model
         elif strategy == "model_ensemble":
             dataset = _dataset_spec(dataset_source)
+            target_mode = str(dataset.get("target_mode") or "return")
             model_kinds = search.get("model_kinds")
             if not isinstance(model_kinds, list) or not 2 <= len(model_kinds) <= 8:
                 raise ModelResearchError("model_ensemble需要选择2到8个模型")
+            normalized_kinds = [str(kind).strip().lower() for kind in model_kinds]
+            if len(set(normalized_kinds)) != len(normalized_kinds):
+                raise ModelResearchError("model_ensemble不能重复选择同一个模型")
             params_by_kind = search.get("model_params_by_kind") or {}
             if not isinstance(params_by_kind, Mapping):
                 raise ModelResearchError("model_params_by_kind必须是对象")
-            normalized_trials = []
-            for kind in model_kinds:
-                trial_kind = str(kind).strip().lower()
+            base_models = []
+            for trial_kind in normalized_kinds:
                 params_source = params_by_kind.get(trial_kind) or {}
                 if not isinstance(params_source, Mapping):
                     raise ModelResearchError(f"{trial_kind}的参数配置无效")
-                normalized_trials.append({
+                base_models.append(_model_spec({
+                    "kind": trial_kind, "params": params_source,
+                }, target_mode=target_mode))
+            ensemble_method = str(
+                search.get("ensemble_method") or "none"
+            ).strip().lower()
+            if ensemble_method not in {"none", "stacking"}:
+                raise ModelResearchError("集成方法只支持none或stacking")
+            if ensemble_method == "stacking":
+                family = _stacking_family(normalized_kinds)
+                try:
+                    n_folds = int(search.get("n_folds") or 3)
+                    meta_alpha = float(search.get("meta_alpha") or 1.0)
+                except (TypeError, ValueError) as exc:
+                    raise ModelResearchError("Stacking参数格式无效") from exc
+                if not 2 <= n_folds <= 10:
+                    raise ModelResearchError("Stacking OOF折数必须在2到10之间")
+                if not 0.01 <= meta_alpha <= 100.0:
+                    raise ModelResearchError("Stacking元学习器alpha必须在0.01到100之间")
+                normalized_trials = [{
                     "dataset": dataset,
                     "model": _model_spec({
-                        "kind": trial_kind, "params": params_source,
-                    }),
-                    "search_params": {"model_kind": trial_kind},
-                })
+                        "kind": "stacking",
+                        "params": {
+                            "n_folds": n_folds,
+                            "meta_alpha": meta_alpha,
+                        },
+                        "base_models": base_models,
+                    }, target_mode=target_mode),
+                    "search_params": {
+                        "model_kind": "stacking",
+                        "ensemble_method": "stacking",
+                        "stacking_family": family,
+                        "base_model_kinds": normalized_kinds,
+                        "n_folds": n_folds,
+                        "meta_alpha": meta_alpha,
+                    },
+                }]
+                experiment_title = str(
+                    payload.get("title") or "Stacking 集成研究"
+                ).strip()[:160]
+            else:
+                normalized_trials = [
+                    {
+                        "dataset": dataset,
+                        "model": model,
+                        "search_params": {"model_kind": model["kind"]},
+                    }
+                    for model in base_models
+                ]
         else:
             dataset = _dataset_spec(dataset_source)
             trials = _grid_search_trials(model_source, search)
@@ -564,6 +620,72 @@ class ModelResearchRepository:
                 },
             }))
         return _experiment_summary(experiment_id, jobs)
+
+    def restart_training_experiment(self, experiment_id: str) -> dict[str, Any]:
+        """Clone a terminal experiment into a fresh, auto-dispatched run.
+
+        The failed experiment and its events remain immutable history.  Every
+        normalized trial is copied verbatim so a retry cannot silently change
+        the frozen dataset, model parameters, walk-forward contract, or node.
+        """
+        source = self.get_training_experiment(experiment_id)
+        source_jobs = sorted(
+            (dict(job) for job in source.get("jobs") or []),
+            key=lambda job: int(
+                dict((job.get("config_json") or {}).get("experiment") or {}).get(
+                    "trial_index"
+                )
+                or 0
+            ),
+        )
+        if not source_jobs:
+            raise ModelResearchNotFound("待重试实验不存在")
+        active = [
+            str(job.get("job_id") or "")
+            for job in source_jobs
+            if str(job.get("status") or "") not in TERMINAL_STATUSES
+        ]
+        if active:
+            raise ModelResearchConflict("实验仍有运行中任务，不能重复启动")
+        if not any(
+            str(job.get("status") or "") in {"failed", "canceled"}
+            for job in source_jobs
+        ):
+            raise ModelResearchConflict("只有失败或已取消的实验可以重新训练")
+
+        restarted_experiment_id = f"model_experiment_{uuid4().hex}"
+        restarted_jobs: list[dict[str, Any]] = []
+        for source_job in source_jobs:
+            config = dict(source_job.get("config_json") or {})
+            source_experiment = dict(config.get("experiment") or {})
+            payload: dict[str, Any] = {
+                "title": str(source_job.get("title") or source.get("title") or "重新训练"),
+                "model_id": str(source_job.get("model_id") or source.get("model_id") or ""),
+                "dataset": dict(source_job.get("dataset_spec") or config.get("dataset") or {}),
+                "model": dict(config.get("model") or {}),
+                "walk_forward": dict(config.get("walk_forward") or {}),
+                "execution": dict(config.get("execution") or {"node_id": "local"}),
+                "experiment": {
+                    **source_experiment,
+                    "experiment_id": restarted_experiment_id,
+                    "auto_dispatch": True,
+                },
+            }
+            if config.get("research_origin"):
+                payload["research_origin"] = dict(config["research_origin"])
+            incremental = dict(config.get("incremental_training") or {})
+            if incremental.get("source_model_id") and incremental.get(
+                "source_model_version"
+            ):
+                payload["incremental_from"] = {
+                    "model_id": incremental["source_model_id"],
+                    "model_version": incremental["source_model_version"],
+                }
+            restarted_jobs.append(self.create_training_job(payload))
+
+        result = _experiment_summary(restarted_experiment_id, restarted_jobs)
+        result["restarted_from_experiment_id"] = str(source["experiment_id"])
+        return result
 
     def _experiment_parent_context(
         self, parent_experiment_id: str, parent_job_id: str,
@@ -1349,22 +1471,31 @@ class ModelResearchRepository:
     def renew_lease(
         self, job_id: str, *, lease_token: str, lease_seconds: int = 90,
         progress: Mapping[str, Any] | None = None,
+        record_event: bool = False,
     ) -> dict[str, Any]:
         now = _utcnow()
         expires = now + timedelta(seconds=max(30, min(int(lease_seconds), 300)))
         with self.database.connection() as conn:
-            row = conn.execute(
-                """
-                UPDATE model_jobs
-                SET lease_expires_at = %s, progress_json = %s, updated_at = %s,
-                    status = CASE WHEN status = 'leased' THEN 'running' ELSE status END
-                WHERE job_id = %s AND lease_owner = %s AND lease_token = %s
-                  AND status IN ('leased', 'running', 'uploading')
-                  AND cancel_requested = FALSE
-                RETURNING *
-                """,
-                (expires, Jsonb(dict(progress or {})), now, job_id, "alpha-factor-service", lease_token),
-            ).fetchone()
+            with conn.transaction():
+                payload = dict(progress or {})
+                row = conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET lease_expires_at = %s, progress_json = %s, updated_at = %s,
+                        status = CASE WHEN status = 'leased' THEN 'running' ELSE status END
+                    WHERE job_id = %s AND lease_owner = %s AND lease_token = %s
+                      AND status IN ('leased', 'running', 'uploading')
+                      AND cancel_requested = FALSE
+                    RETURNING *
+                    """,
+                    (expires, Jsonb(payload), now, job_id, "alpha-factor-service", lease_token),
+                ).fetchone()
+                if row and record_event:
+                    stage = str(payload.get("stage") or "progress")
+                    self._event(
+                        conn, job_id, "job.progress", stage=stage,
+                        payload=payload,
+                    )
         if not row:
             raise ModelResearchConflict("任务租约失效、已取消或不属于调度服务")
         return self.get_job(job_id)
@@ -2762,8 +2893,11 @@ def _experiment_summary(
         count for status, count in statuses.items() if status in TERMINAL_STATUSES
     )
     strategy = str(first_experiment.get("strategy") or "grid")
-    selection = select_parameter_trial(
-        jobs, complete=bool(jobs) and completed_count == len(jobs),
+    complete = bool(jobs) and completed_count == len(jobs)
+    selection = (
+        select_model_trial(jobs, complete=complete)
+        if strategy == "model_ensemble"
+        else select_parameter_trial(jobs, complete=complete)
     )
     if strategy == "horizon_grid":
         selection = {
@@ -2780,7 +2914,6 @@ def _experiment_summary(
     elif strategy == "model_ensemble":
         selection = {
             **selection,
-            "policy": "alphablocks.model-ensemble-selection.v1",
             "selection_unit": "model_kind",
         }
     dataset_hashes = sorted({
@@ -2906,7 +3039,7 @@ def _experiment_comparison(
     return {
         "schema_version": "alphablocks.experiment-comparison.v1",
         "selection_split": "validation",
-        "selection_metric": "rank_ic",
+        "selection_metric": str(selection.get("ranking_metric") or "validation.rank_ic"),
         "test_metrics_role": "report_only",
         "test_metrics_disclosed": complete,
         "summary": summary,
@@ -4306,19 +4439,88 @@ def _model_spec(
     source: Mapping[str, Any], *, target_mode: str | None = None,
 ) -> dict[str, Any]:
     kind = str(source.get("kind") or "lightgbm").strip().lower()
+    if kind == "stacking":
+        base_sources = source.get("base_models")
+        if (
+            not isinstance(base_sources, list)
+            or not 2 <= len(base_sources) <= 8
+            or any(not isinstance(item, Mapping) for item in base_sources)
+        ):
+            raise ModelResearchError("Stacking必须配置2到8个基模型")
+        base_models = [
+            _model_spec(item, target_mode=target_mode) for item in base_sources
+        ]
+        base_kinds = [str(item["kind"]) for item in base_models]
+        family = _stacking_family(base_kinds)
+        raw_params = dict(source.get("params") or {})
+        unknown = sorted(set(raw_params) - {
+            "n_folds", "meta_alpha", "loss", "objective", "metric",
+        })
+        if unknown:
+            raise ModelResearchError(
+                "stacking参数包含未允许字段: " + ", ".join(unknown)
+            )
+        try:
+            n_folds = int(raw_params.get("n_folds") or 3)
+            meta_alpha = float(raw_params.get("meta_alpha") or 1.0)
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError("Stacking参数格式无效") from exc
+        if not 2 <= n_folds <= 10:
+            raise ModelResearchError("Stacking OOF折数必须在2到10之间")
+        if not 0.01 <= meta_alpha <= 100.0:
+            raise ModelResearchError("Stacking元学习器alpha必须在0.01到100之间")
+        requested_loss = (
+            "binary" if target_mode == "classification"
+            else str(raw_params.get("loss") or "mse").strip().lower()
+        )
+        if requested_loss not in {"mse", "binary"}:
+            raise ModelResearchError("stacking.params.loss只支持mse或binary")
+        objective = "binary" if requested_loss == "binary" else "regression"
+        metric = str(raw_params.get("metric") or (
+            "auc" if requested_loss == "binary" else "rmse"
+        )).strip().lower()
+        supported_metrics = (
+            {"auc", "binary_logloss"}
+            if requested_loss == "binary"
+            else {"l2", "rmse", "mae"}
+        )
+        if metric not in supported_metrics:
+            raise ModelResearchError("Metric必须与Objective一致")
+        return {
+            "kind": "stacking",
+            "qlib_model": "factor_service.research.trainer.QlibStackingModel",
+            "params": {
+                "n_folds": n_folds,
+                "meta_alpha": meta_alpha,
+                "loss": requested_loss,
+                "objective": objective,
+                "metric": metric,
+            },
+            "base_models": base_models,
+            "ensemble": {
+                "method": "stacking",
+                "family": family,
+                "base_model_kinds": base_kinds,
+            },
+        }
     definitions: dict[str, dict[str, Any]] = {
         "lightgbm": {
             "qlib_model": "qlib.contrib.model.gbdt.LGBModel",
             "allowed": {
                 "learning_rate", "num_leaves", "max_depth", "n_estimators",
                 "subsample", "colsample_bytree", "reg_alpha", "reg_lambda",
-                "min_child_samples", "early_stopping_rounds", "num_threads",
+                "min_child_samples", "min_data_in_leaf", "path_smooth",
+                "bagging_freq", "lambda_l1", "lambda_l2", "feature_fraction",
+                "bagging_fraction", "early_stopping_rounds", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.05, "num_leaves": 31,
-                "max_depth": -1, "n_estimators": 1000, "subsample": 0.9,
-                "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 0.0,
-                "min_child_samples": 20, "early_stopping_rounds": 50,
+                "loss": "mse", "learning_rate": 0.02, "num_leaves": 31,
+                "max_depth": -1, "n_estimators": 2000,
+                "min_data_in_leaf": 300, "min_child_samples": 150,
+                "path_smooth": 1.0, "bagging_freq": 5,
+                "lambda_l1": 0.5, "lambda_l2": 1.0,
+                "feature_fraction": 0.7, "bagging_fraction": 0.8,
+                "early_stopping_rounds": 50,
             },
         },
         "xgboost": {
@@ -4329,22 +4531,24 @@ def _model_spec(
                 "min_child_weight", "early_stopping_rounds", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.05, "max_depth": 6,
-                "n_estimators": 1000, "subsample": 0.9,
-                "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 1.0,
-                "min_child_weight": 1.0, "early_stopping_rounds": 50,
+                "loss": "mse", "learning_rate": 0.02, "max_depth": 4,
+                "n_estimators": 2000, "subsample": 0.7,
+                "colsample_bytree": 0.65, "reg_alpha": 0.5, "reg_lambda": 2.0,
+                "min_child_weight": 100.0, "early_stopping_rounds": 50,
             },
         },
         "catboost": {
             "qlib_model": "qlib.contrib.model.catboost_model.CatBoostModel",
             "allowed": {
                 "learning_rate", "depth", "n_estimators", "l2_leaf_reg",
-                "random_strength", "early_stopping_rounds", "num_threads",
+                "random_strength", "bagging_temperature", "od_wait",
+                "early_stopping_rounds", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.05, "depth": 6,
-                "n_estimators": 1000, "l2_leaf_reg": 3.0,
-                "random_strength": 1.0, "early_stopping_rounds": 50,
+                "loss": "mse", "learning_rate": 0.02, "depth": 6,
+                "n_estimators": 2000, "l2_leaf_reg": 3.0,
+                "random_strength": 1.5, "bagging_temperature": 0.8,
+                "od_wait": 100, "early_stopping_rounds": 50,
             },
         },
         "random_forest": {
@@ -4365,21 +4569,21 @@ def _model_spec(
                 "alpha", "fit_intercept", "solver", "max_iter", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "alpha": 1.0, "fit_intercept": False,
+                "loss": "mse", "alpha": 3.0, "fit_intercept": False,
                 "solver": "auto", "max_iter": 1000,
             },
         },
         "mlp": {
             "qlib_model": "factor_service.research.models.QlibTorchMLPModel",
             "allowed": {
-                "learning_rate", "hidden_layers", "max_steps",
+                "learning_rate", "hidden_layers", "hidden_size", "layer_count", "max_steps",
                 "batch_size", "early_stopping_rounds", "eval_steps",
                 "weight_decay", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.001,
-                "hidden_layers": [64, 128, 256],
-                "max_steps": 300, "batch_size": 2048,
+                "loss": "mse", "learning_rate": 0.0001,
+                "hidden_size": 64, "layer_count": 2,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4393,9 +4597,9 @@ def _model_spec(
             },
             "defaults": {
                 "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "hidden_size": 128,
+                "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
-                "max_steps": 300, "batch_size": 512,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4409,9 +4613,9 @@ def _model_spec(
             },
             "defaults": {
                 "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "hidden_size": 128,
+                "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
-                "max_steps": 300, "batch_size": 512,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4425,9 +4629,9 @@ def _model_spec(
             },
             "defaults": {
                 "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "hidden_size": 128,
+                "lookback_window": 20, "hidden_size": 64,
                 "num_layers": 2, "dropout": 0.2,
-                "max_steps": 300, "batch_size": 512,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4441,10 +4645,10 @@ def _model_spec(
                 "eval_steps", "weight_decay", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "d_model": 64, "nhead": 4,
+                "loss": "mse", "learning_rate": 0.0001,
+                "lookback_window": 20, "d_model": 64, "nhead": 4,
                 "transformer_layers": 2, "dim_feedforward": 256,
-                "dropout": 0.2, "max_steps": 300, "batch_size": 256,
+                "dropout": 0.2, "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4457,9 +4661,9 @@ def _model_spec(
                 "pretrain", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.01, "n_d": 64, "n_a": 64,
+                "loss": "mse", "learning_rate": 0.005, "n_d": 64, "n_a": 64,
                 "n_steps": 5, "n_shared": 2, "n_ind": 2,
-                "batch_size": 4096, "max_steps": 100,
+                "batch_size": 4000, "max_steps": 200,
                 "early_stopping_rounds": 20, "pretrain": False,
             },
         },
@@ -4472,10 +4676,10 @@ def _model_spec(
                 "weight_decay", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "hidden_size": 128,
-                "kernel_size": 5, "num_layers": 5, "dropout": 0.5,
-                "max_steps": 300, "batch_size": 256,
+                "loss": "mse", "learning_rate": 0.0001,
+                "lookback_window": 20, "hidden_size": 128,
+                "kernel_size": 5, "num_layers": 2, "dropout": 0.2,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4489,11 +4693,11 @@ def _model_spec(
                 "eval_steps", "weight_decay", "num_threads",
             },
             "defaults": {
-                "loss": "mse", "learning_rate": 0.001,
-                "lookback_window": 60, "d_model": 64, "nhead": 4,
-                "gru_hidden_size": 64, "num_layers": 1,
+                "loss": "mse", "learning_rate": 0.0005,
+                "lookback_window": 20, "d_model": 64, "nhead": 4,
+                "gru_hidden_size": 64, "num_layers": 2,
                 "dim_feedforward": 128, "dropout": 0.2,
-                "max_steps": 300, "batch_size": 256,
+                "max_steps": 200, "batch_size": 4000,
                 "early_stopping_rounds": 10, "eval_steps": 10,
                 "weight_decay": 0.0001,
             },
@@ -4551,6 +4755,9 @@ def _model_spec(
             "data_random_seed": 42,
         })
     defaults.update(params)
+    if kind == "mlp" and "hidden_layers" in params:
+        defaults.pop("hidden_size", None)
+        defaults.pop("layer_count", None)
     requested_loss = str(defaults.get("loss") or "mse").strip().lower()
     if target_mode is not None:
         requested_loss = "binary" if target_mode == "classification" else "mse"
@@ -4600,6 +4807,17 @@ def _execution_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "node_id": node_id,
         "mode": "local" if node_id == "local" else "remote_ssh_docker",
     }
+
+
+def _stacking_family(model_kinds: list[str]) -> str:
+    kinds = {str(kind).strip().lower() for kind in model_kinds}
+    if kinds and kinds <= CLASSICAL_STACKING_KINDS:
+        return "classical"
+    if kinds and kinds <= DEEP_STACKING_KINDS:
+        return "deep_learning"
+    raise ModelResearchError(
+        "Stacking只支持同一模型族多选；传统模型与深度学习模型不能混合集成"
+    )
 
 
 def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:

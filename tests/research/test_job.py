@@ -57,6 +57,32 @@ def test_job_validation_names_unknown_model_parameters() -> None:
         validate_job(source)
 
 
+def test_job_validation_accepts_quantmind_tree_hyperparameters() -> None:
+    lightgbm = valid_job()
+    lightgbm["config_json"]["model"]["params"].update({
+        "min_data_in_leaf": 300,
+        "min_child_samples": 150,
+        "path_smooth": 1.0,
+        "bagging_freq": 5,
+        "lambda_l1": 0.5,
+        "lambda_l2": 1.0,
+        "feature_fraction": 0.7,
+        "bagging_fraction": 0.8,
+    })
+    assert validate_job(lightgbm)["config_json"]["model"]["params"][
+        "min_data_in_leaf"
+    ] == 300
+
+    catboost = valid_job()
+    catboost["config_json"]["model"] = {
+        "kind": "catboost",
+        "params": {"bagging_temperature": 0.8, "od_wait": 100},
+    }
+    assert validate_job(catboost)["config_json"]["model"]["params"][
+        "bagging_temperature"
+    ] == 0.8
+
+
 def test_job_validation_rejects_classification_target_with_regression_loss() -> None:
     source = valid_job()
     for target in (source["dataset_spec"], source["config_json"]["dataset"]):
@@ -154,6 +180,40 @@ def test_job_validation_accepts_all_phase2_model_kinds() -> None:
         candidate = deepcopy(source)
         candidate["config_json"]["model"] = {"kind": kind, "params": params}
         assert validate_job(candidate)["config_json"]["model"]["kind"] == kind
+
+
+def test_job_validation_accepts_same_family_stacking_and_rejects_cross_family() -> None:
+    source = valid_job()
+    source["config_json"]["model"] = {
+        "kind": "stacking",
+        "params": {
+            "n_folds": 3,
+            "meta_alpha": 1.0,
+            "loss": "mse",
+            "objective": "regression",
+            "metric": "rmse",
+        },
+        "base_models": [
+            {"kind": "lightgbm", "params": {
+                "loss": "mse", "objective": "regression", "metric": "rmse",
+            }},
+            {"kind": "linear", "params": {
+                "loss": "mse", "objective": "regression", "metric": "rmse",
+            }},
+        ],
+    }
+    validated = validate_job(source)
+    assert validated["config_json"]["model"]["kind"] == "stacking"
+
+    cross_family = deepcopy(source)
+    cross_family["config_json"]["model"]["base_models"][1] = {
+        "kind": "lstm",
+        "params": {
+            "loss": "mse", "objective": "regression", "metric": "rmse",
+        },
+    }
+    with pytest.raises(PermanentJobError, match="同一模型族"):
+        validate_job(cross_family)
 
 
 def test_job_validation_accepts_walk_forward_contract() -> None:

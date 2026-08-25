@@ -63,6 +63,7 @@ class ResearchControl:
 
     def renew(
         self, job_id: str, lease_token: str, progress: dict[str, Any],
+        *, record_event: bool = False,
     ) -> dict[str, Any]:
         job = self._call(
             self.repository.renew_lease,
@@ -70,6 +71,7 @@ class ResearchControl:
             lease_token=lease_token,
             lease_seconds=90,
             progress=progress,
+            record_event=record_event,
         )
         return {"ok": True, "job": job}
 

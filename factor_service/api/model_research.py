@@ -675,6 +675,23 @@ def get_experiment(experiment_id: str) -> dict[str, Any]:
         _raise(exc)
 
 
+@router.post(
+    "/experiments/{experiment_id}/retry",
+    status_code=HTTPStatus.CREATED,
+)
+def retry_experiment(experiment_id: str) -> dict[str, Any]:
+    try:
+        source = repository.get_training_experiment(experiment_id)
+        for job in source.get("jobs") or []:
+            _validate_execution_node(job.get("config_json") or {})
+        return {
+            "ok": True,
+            "experiment": repository.restart_training_experiment(experiment_id),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     try:
@@ -1764,7 +1781,15 @@ def get_model_permutation_importance(
             for index, item in enumerate(stored_importance)
         }
         model_kind = str(model.get("model_kind") or "")
-        is_sequence_model = model_kind in SEQUENCE_MODEL_KINDS
+        model_params = dict(manifest.get("model_params") or {})
+        is_sequence_model = model_kind in SEQUENCE_MODEL_KINDS or (
+            model_kind == "stacking"
+            and any(
+                str(item.get("kind") or "") in SEQUENCE_MODEL_KINDS
+                for item in list(model_params.get("base_models") or [])
+                if isinstance(item, dict)
+            )
+        )
         effective_limit = min(limit, 8) if is_sequence_model else limit
         selected = sorted(
             feature_names,
@@ -1784,7 +1809,7 @@ def get_model_permutation_importance(
             dataset_path,
             model_kind=model_kind,
             segments=dict(manifest.get("segments") or {}),
-            model_params=dict(manifest.get("model_params") or {}),
+            model_params=model_params,
             feature_names=selected,
         )
         return {

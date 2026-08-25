@@ -171,6 +171,15 @@ class _Repository:
             "jobs": jobs,
         }
 
+    def restart_training_experiment(self, experiment_id):
+        return {
+            "experiment_id": "model_experiment_retried",
+            "restarted_from_experiment_id": experiment_id,
+            "trial_count": 2,
+            "statuses": {"queued": 2},
+            "jobs": [],
+        }
+
     def get_job(self, job_id):
         return dict(self.jobs[job_id])
 
@@ -576,6 +585,36 @@ def test_grid_experiment_creates_a_queryable_job_batch(monkeypatch) -> None:
     assert len(jobs.json()["jobs"]) == 2
 
 
+def test_failed_experiment_can_be_restarted_as_a_new_run(monkeypatch) -> None:
+    repository = _Repository()
+    repository.jobs["failed-trial"] = {
+        "job_id": "failed-trial",
+        "status": "failed",
+        "config_json": {
+            "execution": {"node_id": "local"},
+            "experiment": {
+                "experiment_id": "model_experiment_failed",
+                "trial_index": 1,
+                "trial_count": 1,
+                "search_params": {"model_kind": "lightgbm"},
+            },
+        },
+    }
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    response = client.post(
+        "/model-research/experiments/model_experiment_failed/retry",
+    )
+
+    assert response.status_code == 201
+    experiment = response.json()["experiment"]
+    assert experiment["experiment_id"] == "model_experiment_retried"
+    assert (
+        experiment["restarted_from_experiment_id"]
+        == "model_experiment_failed"
+    )
+
+
 def test_experiment_lineage_conflict_is_returned_as_http_409(monkeypatch) -> None:
     repository = _Repository()
 
@@ -594,6 +633,17 @@ def test_experiment_lineage_conflict_is_returned_as_http_409(monkeypatch) -> Non
 
     assert response.status_code == 409
     assert "冻结因子" in response.json()["detail"]
+
+
+def test_removed_page_only_experiment_and_scheduler_endpoints_return_404(
+    monkeypatch,
+) -> None:
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+
+    assert client.get("/model-research/experiments").status_code == 405
+    assert client.post(
+        "/model-research/inference-scheduler/tick", json={"force": True},
+    ).status_code == 404
 
 
 def test_research_template_crud_routes(monkeypatch) -> None:

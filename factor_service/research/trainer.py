@@ -42,6 +42,33 @@ class TrainingResult:
     predictions_path: Path
 
 
+@dataclass
+class QlibStackingModel:
+    """Serializable Stacking bundle: fitted Qlib bases plus Ridge meta learner."""
+
+    base_models: list[dict[str, Any]]
+    meta_model: Any
+    classification: bool = False
+
+    def combine(self, predictions: list[np.ndarray]) -> np.ndarray:
+        if len(predictions) != len(self.base_models):
+            raise ValueError("Stacking基模型预测数量与模型产物不一致")
+        matrix = np.column_stack([
+            np.asarray(values, dtype=float).reshape(-1) for values in predictions
+        ])
+        raw = np.asarray(self.meta_model.predict(matrix), dtype=float).reshape(-1)
+        if self.classification:
+            return np.clip(raw, 1e-7, 1.0 - 1e-7)
+        return raw
+
+    def to_cpu(self) -> None:
+        for item in self.base_models:
+            model = item.get("model")
+            if hasattr(model, "to_cpu"):
+                model.to_cpu()
+            _prepare_model_for_serialization(str(item.get("kind") or ""), model)
+
+
 class QlibTrainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -109,15 +136,24 @@ class QlibTrainer:
         dataset_path = snapshot.dataset_path
         raw_dataset_path = snapshot.raw_dataset_path
         dataset_manifest_path = snapshot.manifest_path
-        raw_params = dict(config.get("model", {}).get("params") or {})
-        model_kind = str(config.get("model", {}).get("kind") or "lightgbm")
+        model_spec = dict(config.get("model") or {})
+        raw_params = dict(model_spec.get("params") or {})
+        model_kind = str(model_spec.get("kind") or "lightgbm")
         handler = DataHandlerLP.from_df(training_prepared.frame)
-        dataset = _dataset_for_model(
-            handler, training_prepared.segments, model_kind, raw_params, DatasetH,
-        )
-        model, model_params = _create_model(
-            model_kind, raw_params, len(training_prepared.feature_names),
-        )
+        dataset = None
+        model: Any = None
+        model_params: dict[str, Any] = dict(raw_params)
+        if model_kind != "stacking":
+            dataset = _dataset_for_model(
+                handler, training_prepared.segments, model_kind, raw_params, DatasetH,
+            )
+            model, model_params = _create_model(
+                model_kind, raw_params, len(training_prepared.feature_names),
+            )
+        elif incremental_config:
+            raise ValueError("Stacking暂不支持增量续训")
+        if model_kind == "stacking" and walk_forward_config.get("enabled") is True:
+            raise ValueError("Stacking已使用时序OOF，不能同时开启Walk-Forward")
         recorder_root = work_dir / "mlruns"
         # DatasetH由已冻结的DataFrame驱动，不读取Qlib本地行情；0.9.7仍要求
         # provider_uri非空，因此给每个任务一个隔离的空Provider目录。
@@ -144,44 +180,62 @@ class QlibTrainer:
                 dataset_hash=job["dataset_hash"],
                 schema_version="alphablocks.qlib-training.v1",
             )
-            if walk_forward_config.get("enabled") is True:
-                walk_forward_prediction, walk_forward_report = _run_walk_forward(
-                    prepared,
-                    walk_forward_config,
-                    model_kind=model_kind,
-                    raw_params=raw_params,
+            if model_kind == "stacking":
+                stacking = _fit_stacking(
+                    training_prepared,
+                    model_spec=model_spec,
                     DataHandlerLP=DataHandlerLP,
                     DatasetH=DatasetH,
+                    classification=classification,
                     cancellation=cancellation,
                     progress=progress,
                 )
-                training_start = 73
+                model = stacking["model"]
+                model_params = stacking["model_params"]
+                evals_result = stacking["evals_result"]
+                train_prediction = stacking["train_prediction"]
+                valid_prediction = stacking["valid_prediction"]
+                test_prediction = stacking["test_prediction"]
             else:
-                training_start = 58
-            _progress(progress, "training_final_model", training_start, {"iteration": 0})
-            _fit_model(
-                model_kind, model, dataset, evals_result,
-                cancellation=cancellation, progress=progress,
-                stage="training_final_model",
-                progress_start=training_start,
-                progress_end=80,
-                metric_prefix="final.",
-                initial_model=source_model,
-            )
-            _checkpoint(cancellation)
-            _progress(progress, "predicting", 82, {})
-            train_prediction = _predict_dataset(
-                model, model_kind, dataset, "train", classification=classification,
-            )
-            valid_prediction = _predict_dataset(
-                model, model_kind, dataset, "valid", classification=classification,
-            )
-            test_prediction = _predict_dataset(
-                model, model_kind, dataset, "test", classification=classification,
-            )
+                if walk_forward_config.get("enabled") is True:
+                    walk_forward_prediction, walk_forward_report = _run_walk_forward(
+                        prepared,
+                        walk_forward_config,
+                        model_kind=model_kind,
+                        raw_params=raw_params,
+                        DataHandlerLP=DataHandlerLP,
+                        DatasetH=DatasetH,
+                        cancellation=cancellation,
+                        progress=progress,
+                    )
+                    training_start = 73
+                else:
+                    training_start = 58
+                _progress(progress, "training_final_model", training_start, {"iteration": 0})
+                _fit_model(
+                    model_kind, model, dataset, evals_result,
+                    cancellation=cancellation, progress=progress,
+                    stage="training_final_model",
+                    progress_start=training_start,
+                    progress_end=80,
+                    metric_prefix="final.",
+                    initial_model=source_model,
+                )
+                _checkpoint(cancellation)
+                _progress(progress, "predicting", 82, {})
+                train_prediction = _predict_training_dataset(
+                    model, model_kind, dataset, "train", classification=classification,
+                )
+                valid_prediction = _predict_dataset(
+                    model, model_kind, dataset, "valid", classification=classification,
+                )
+                test_prediction = _predict_dataset(
+                    model, model_kind, dataset, "test", classification=classification,
+                )
             if hasattr(model, "to_cpu"):
                 model.to_cpu()
-            _prepare_model_for_serialization(model_kind, model)
+            if model_kind != "stacking":
+                _prepare_model_for_serialization(model_kind, model)
             R.save_objects(trained_model=model)
             recorder_id = R.get_recorder().id
         # 研究回测只允许使用完全样本外的test段；train/valid预测不得进入模型信号库。
@@ -249,12 +303,22 @@ class QlibTrainer:
                 "train": normalized_train_metrics,
                 "validation": validation_metrics,
             }
-        feature_importance = _feature_importance(
-            model, training_prepared.feature_names,
-        )
-        training_diagnostics = build_training_diagnostics(
-            model_kind, evals_result, model_params,
-        )
+        if model_kind == "stacking":
+            feature_importance = _stacking_feature_importance(
+                model, training_prepared.feature_names,
+            )
+            training_diagnostics = _stacking_training_diagnostics(
+                model, evals_result, model_params, train_prediction_rows=int(
+                    metrics["train"]["rows"]
+                ),
+            )
+        else:
+            feature_importance = _feature_importance(
+                model, training_prepared.feature_names,
+            )
+            training_diagnostics = build_training_diagnostics(
+                model_kind, evals_result, model_params,
+            )
         research_target = str(
             dataset_spec.get("research_target") or "stock_selection"
         )
@@ -275,8 +339,23 @@ class QlibTrainer:
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
             "model_params": model_params,
+            "ensemble": (
+                {
+                    **dict(model_spec.get("ensemble") or {}),
+                    "method": "stacking",
+                    "n_folds": int(model_params.get("n_folds") or 3),
+                    "meta_alpha": float(model_params.get("meta_alpha") or 1.0),
+                    "meta_coefficients": [
+                        float(value) for value in np.asarray(
+                            model.meta_model.coef_, dtype=float,
+                        ).reshape(-1)
+                    ],
+                }
+                if model_kind == "stacking" else None
+            ),
             "validation_metrics": validation_metrics,
             "training_diagnostics": training_diagnostics,
+            "runtime_optimization": _runtime_optimization_profile(model),
             "walk_forward": walk_forward_report,
             "incremental_training": (
                 {
@@ -299,6 +378,12 @@ class QlibTrainer:
                 "platform": platform.platform(),
                 "machine": platform.machine(),
                 "accelerator": str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu"),
+                "effective_num_threads": int(
+                    os.environ.get("ALPHA_EFFECTIVE_NUM_THREADS") or 0
+                ),
+                "validation_sample_rows": int(
+                    os.environ.get("ALPHA_VALIDATION_SAMPLE_ROWS") or 0
+                ),
                 "qlib": getattr(qlib, "__version__", "unknown"),
                 **_model_package_version(model_kind),
             },
@@ -732,6 +817,300 @@ def _tree_count(model: Any | None) -> int:
     return 0
 
 
+def _fit_stacking(
+    prepared: PreparedDataset,
+    *,
+    model_spec: dict[str, Any],
+    DataHandlerLP: Any,
+    DatasetH: Any,
+    classification: bool,
+    cancellation: CancellationToken | None,
+    progress: ProgressCallback | None,
+) -> dict[str, Any]:
+    """Fit expanding-window OOF bases and a Ridge meta learner."""
+    from sklearn.linear_model import Ridge
+
+    base_specs = list(model_spec.get("base_models") or [])
+    if not 2 <= len(base_specs) <= 8:
+        raise ValueError("Stacking必须配置2到8个基模型")
+    params = dict(model_spec.get("params") or {})
+    n_folds = int(params.get("n_folds") or 3)
+    meta_alpha = float(params.get("meta_alpha") or 1.0)
+    train_dates = _segment_trading_dates(
+        prepared.frame, prepared.segments["train"],
+    )
+    if len(train_dates) < n_folds + 1:
+        raise ValueError(
+            f"训练段只有{len(train_dates)}个交易日，不足以生成{n_folds}折时序OOF"
+        )
+    fold_size = len(train_dates) // (n_folds + 1)
+    if fold_size < 1:
+        raise ValueError("训练段交易日不足，无法生成Stacking OOF")
+    total_fits = len(base_specs) * (n_folds + 1)
+    fit_index = 0
+    base_items: list[dict[str, Any]] = []
+    oof_by_kind: dict[str, pd.Series] = {}
+    valid_by_kind: dict[str, pd.Series] = {}
+    test_by_kind: dict[str, pd.Series] = {}
+    evals_by_kind: dict[str, Any] = {}
+
+    def fit_progress_bounds() -> tuple[int, int]:
+        start = 58 + int(22 * fit_index / max(1, total_fits))
+        end = 58 + int(22 * (fit_index + 1) / max(1, total_fits))
+        return start, max(start + 1, end)
+
+    for base_index, base_spec in enumerate(base_specs, start=1):
+        kind = str(base_spec.get("kind") or "").strip().lower()
+        raw_params = dict(base_spec.get("params") or {})
+        oof_parts: list[pd.Series] = []
+        for fold_index in range(n_folds):
+            _checkpoint(cancellation)
+            train_end_index = fold_size * (fold_index + 1)
+            valid_start_index = train_end_index
+            valid_end_index = (
+                len(train_dates)
+                if fold_index == n_folds - 1
+                else min(len(train_dates), train_end_index + fold_size)
+            )
+            fold_segments = {
+                "train": (
+                    train_dates[0].strftime("%Y-%m-%d"),
+                    train_dates[train_end_index - 1].strftime("%Y-%m-%d"),
+                ),
+                "valid": (
+                    train_dates[valid_start_index].strftime("%Y-%m-%d"),
+                    train_dates[valid_end_index - 1].strftime("%Y-%m-%d"),
+                ),
+                "test": (
+                    train_dates[valid_start_index].strftime("%Y-%m-%d"),
+                    train_dates[valid_end_index - 1].strftime("%Y-%m-%d"),
+                ),
+            }
+            fold_dataset = _dataset_for_model(
+                DataHandlerLP.from_df(prepared.frame),
+                fold_segments, kind, raw_params, DatasetH,
+            )
+            fold_model, _ = _create_model(
+                kind, raw_params, len(prepared.feature_names),
+            )
+            fold_evals: dict[str, Any] = {}
+            start, end = fit_progress_bounds()
+            _fit_model(
+                kind, fold_model, fold_dataset, fold_evals,
+                cancellation=cancellation,
+                progress=progress,
+                stage="stacking_oof_training",
+                progress_start=start,
+                progress_end=end,
+                progress_details={
+                    "base_model_kind": kind,
+                    "base_model_index": base_index,
+                    "base_model_count": len(base_specs),
+                    "fold": fold_index + 1,
+                    "fold_count": n_folds,
+                },
+                metric_prefix=f"stacking.{kind}.fold_{fold_index + 1}.",
+            )
+            fit_index += 1
+            oof_parts.append(_predict_dataset(
+                fold_model, kind, fold_dataset, "valid",
+                classification=classification,
+            ).rename(kind))
+            del fold_model, fold_dataset
+        oof_by_kind[kind] = pd.concat(oof_parts).sort_index()
+
+        full_dataset = _dataset_for_model(
+            DataHandlerLP.from_df(prepared.frame),
+            prepared.segments, kind, raw_params, DatasetH,
+        )
+        full_model, normalized_params = _create_model(
+            kind, raw_params, len(prepared.feature_names),
+        )
+        full_evals: dict[str, Any] = {}
+        start, end = fit_progress_bounds()
+        _fit_model(
+            kind, full_model, full_dataset, full_evals,
+            cancellation=cancellation,
+            progress=progress,
+            stage="stacking_base_training",
+            progress_start=start,
+            progress_end=end,
+            progress_details={
+                "base_model_kind": kind,
+                "base_model_index": base_index,
+                "base_model_count": len(base_specs),
+            },
+            metric_prefix=f"stacking.{kind}.final.",
+        )
+        fit_index += 1
+        valid_by_kind[kind] = _predict_dataset(
+            full_model, kind, full_dataset, "valid", classification=classification,
+        ).rename(kind)
+        test_by_kind[kind] = _predict_dataset(
+            full_model, kind, full_dataset, "test", classification=classification,
+        ).rename(kind)
+        base_items.append({
+            "kind": kind,
+            "params": normalized_params,
+            "model": full_model,
+        })
+        evals_by_kind[kind] = full_evals
+        del full_dataset
+
+    meta_train = pd.concat(oof_by_kind, axis=1, join="inner").dropna()
+    if meta_train.empty:
+        raise ValueError("Stacking OOF预测没有共同有效样本")
+    label = prepared.frame[("label", "LABEL0")]
+    meta_label = label.reindex(meta_train.index)
+    valid_rows = meta_label.notna() & np.isfinite(meta_train).all(axis=1)
+    meta_train = meta_train.loc[valid_rows]
+    meta_label = meta_label.loc[valid_rows]
+    if len(meta_train) < max(100, len(base_specs) * 20):
+        raise ValueError(f"Stacking元学习器有效样本过少: {len(meta_train)}")
+    meta_model = Ridge(alpha=meta_alpha, fit_intercept=True)
+    meta_model.fit(meta_train.to_numpy(dtype=float), meta_label.to_numpy(dtype=float))
+    ensemble_model = QlibStackingModel(
+        base_models=base_items,
+        meta_model=meta_model,
+        classification=classification,
+    )
+
+    train_prediction = pd.Series(
+        ensemble_model.combine([
+            meta_train[item["kind"]].to_numpy(dtype=float) for item in base_items
+        ]),
+        index=meta_train.index,
+        name="prediction",
+    )
+    valid_prediction = _combine_stacking_series(
+        ensemble_model, valid_by_kind,
+    )
+    test_prediction = _combine_stacking_series(
+        ensemble_model, test_by_kind,
+    )
+    _progress(progress, "stacking_meta_training", 81, {
+        "base_model_kinds": [item["kind"] for item in base_items],
+        "oof_rows": len(meta_train),
+        "n_folds": n_folds,
+        "meta_alpha": meta_alpha,
+    })
+    return {
+        "model": ensemble_model,
+        "model_params": {
+            **params,
+            "n_folds": n_folds,
+            "meta_alpha": meta_alpha,
+            "base_models": [
+                {"kind": item["kind"], "params": item["params"]}
+                for item in base_items
+            ],
+            "oof_rows": int(len(meta_train)),
+        },
+        "evals_result": evals_by_kind,
+        "train_prediction": train_prediction,
+        "valid_prediction": valid_prediction,
+        "test_prediction": test_prediction,
+    }
+
+
+def _segment_trading_dates(
+    frame: pd.DataFrame, segment: tuple[str, str],
+) -> pd.DatetimeIndex:
+    dates = pd.DatetimeIndex(frame.index.get_level_values("datetime")).normalize()
+    start, end = pd.Timestamp(segment[0]), pd.Timestamp(segment[1])
+    return pd.DatetimeIndex(sorted(dates[(dates >= start) & (dates <= end)].unique()))
+
+
+def _combine_stacking_series(
+    model: QlibStackingModel, predictions: dict[str, pd.Series],
+) -> pd.Series:
+    frame = pd.concat(
+        {item["kind"]: predictions[item["kind"]] for item in model.base_models},
+        axis=1,
+        join="inner",
+    ).dropna()
+    if frame.empty:
+        raise ValueError("Stacking基模型预测没有共同有效样本")
+    raw = model.combine([
+        frame[item["kind"]].to_numpy(dtype=float) for item in model.base_models
+    ])
+    return pd.Series(raw, index=frame.index, name="prediction")
+
+
+def _stacking_feature_importance(
+    model: QlibStackingModel, feature_names: list[str],
+) -> list[dict[str, float | str | int]]:
+    coefficients = np.abs(
+        np.asarray(model.meta_model.coef_, dtype=float).reshape(-1)
+    )
+    if coefficients.size != len(model.base_models) or not coefficients.any():
+        coefficients = np.ones(len(model.base_models), dtype=float)
+    coefficients = coefficients / coefficients.sum()
+    combined = {name: 0.0 for name in feature_names}
+    for weight, item in zip(coefficients, model.base_models):
+        for row in _feature_importance(item["model"], feature_names):
+            combined[str(row["factor"])] += float(weight) * abs(float(row["importance"]))
+    rows: list[dict[str, float | str | int]] = [
+        {"factor": name, "importance": float(combined[name])}
+        for name in feature_names
+    ]
+    rows.sort(key=lambda item: (-float(item["importance"]), str(item["factor"])))
+    for rank, item in enumerate(rows, start=1):
+        item["rank"] = rank
+    return rows
+
+
+def _stacking_training_diagnostics(
+    model: QlibStackingModel,
+    evals_by_kind: dict[str, Any],
+    model_params: dict[str, Any],
+    *,
+    train_prediction_rows: int,
+) -> dict[str, Any]:
+    coefficients = np.asarray(model.meta_model.coef_, dtype=float).reshape(-1)
+    return {
+        "schema_version": "alphablocks.stacking-diagnostics.v1",
+        "status": "available",
+        "model_kind": "stacking",
+        "ensemble_method": "stacking",
+        "n_folds": int(model_params.get("n_folds") or 3),
+        "oof_rows": int(model_params.get("oof_rows") or train_prediction_rows),
+        "meta_learner": {
+            "kind": "ridge",
+            "alpha": float(model_params.get("meta_alpha") or 1.0),
+            "intercept": float(np.asarray(model.meta_model.intercept_).reshape(-1)[0]),
+            "coefficients": {
+                item["kind"]: float(coefficients[index])
+                for index, item in enumerate(model.base_models)
+            },
+        },
+        "base_models": [
+            {
+                "kind": item["kind"],
+                "diagnostics": build_training_diagnostics(
+                    item["kind"], evals_by_kind.get(item["kind"], {}), item["params"],
+                ),
+            }
+            for item in model.base_models
+        ],
+    }
+
+
+def _runtime_optimization_profile(model: Any) -> dict[str, Any]:
+    if isinstance(model, QlibStackingModel):
+        return {
+            "kind": "stacking",
+            "base_models": [
+                {
+                    "kind": str(item.get("kind") or ""),
+                    **dict(getattr(item.get("model"), "runtime_profile", {}) or {}),
+                }
+                for item in model.base_models
+            ],
+        }
+    return dict(getattr(model, "runtime_profile", {}) or {})
+
+
 def _fit_model(
     model_kind: str,
     model: Any,
@@ -837,25 +1216,53 @@ def _fit_model(
 
     cooperative_callback.order = 0  # type: ignore[attr-defined]
     cooperative_callback.before_iteration = True  # type: ignore[attr-defined]
-    callbacks = [
-        cooperative_callback,
-        lgb.early_stopping(model.early_stopping_rounds),
-        lgb.log_evaluation(period=20),
-        lgb.record_evaluation(evals_result),
-    ]
+    def training_callbacks() -> list[Any]:
+        return [
+            cooperative_callback,
+            lgb.early_stopping(model.early_stopping_rounds),
+            lgb.log_evaluation(period=20),
+            lgb.record_evaluation(evals_result),
+        ]
+
     initial_booster = getattr(initial_model, "model", None) if initial_model is not None else None
     if initial_model is not None and initial_booster is None:
         raise ValueError("增量训练来源模型缺少LightGBM Booster")
-    model.model = lgb.train(
-        model.params,
-        datasets[0],
-        num_boost_round=model.num_boost_round,
-        valid_sets=datasets,
-        valid_names=names,
-        callbacks=callbacks,
-        init_model=initial_booster,
-        keep_training_booster=True,
-    )
+    try:
+        model.model = lgb.train(
+            model.params,
+            datasets[0],
+            num_boost_round=model.num_boost_round,
+            valid_sets=datasets,
+            valid_names=names,
+            callbacks=training_callbacks(),
+            init_model=initial_booster,
+            keep_training_booster=True,
+        )
+    except lgb.basic.LightGBMError as exc:
+        gpu_requested = str(model.params.get("device_type") or "") == "gpu"
+        gpu_error = any(token in str(exc).lower() for token in (
+            "gpu tree learner", "opencl", "gpu device", "gpu not found",
+        ))
+        if not gpu_requested or not gpu_error:
+            raise
+        for key in ("device_type", "gpu_use_dp", "max_bin"):
+            model.params.pop(key, None)
+        evals_result.clear()
+        _progress(progress, "lightgbm_gpu_fallback", progress_start, {
+            **(progress_details or {}),
+            "reason": str(exc)[:300],
+            "fallback": "cpu",
+        })
+        model.model = lgb.train(
+            model.params,
+            datasets[0],
+            num_boost_round=model.num_boost_round,
+            valid_sets=datasets,
+            valid_names=names,
+            callbacks=training_callbacks(),
+            init_model=initial_booster,
+            keep_training_booster=True,
+        )
     for name in names:
         for metric, values in evals_result[name].items():
             for epoch, value in enumerate(values):
@@ -879,23 +1286,37 @@ def _progress(
         callback(stage, percent, details)
 
 
+def _effective_num_threads(source: dict[str, Any]) -> int:
+    requested = max(1, int(source.get("num_threads", 4)))
+    raw_override = str(os.environ.get("ALPHA_EFFECTIVE_NUM_THREADS") or "").strip()
+    if not raw_override:
+        return requested
+    try:
+        return max(1, min(32, int(raw_override)))
+    except ValueError:
+        return requested
+
+
 def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
-    return {
+    params = {
         "loss": str(source.get("loss") or "mse"),
         "metric": str(source.get("metric") or (
             "auc" if source.get("loss") == "binary" else "rmse"
         )),
-        "learning_rate": float(source.get("learning_rate", 0.05)),
+        "learning_rate": float(source.get("learning_rate", 0.02)),
         "num_leaves": int(source.get("num_leaves", 31)),
         "max_depth": int(source.get("max_depth", -1)),
-        "num_boost_round": int(source.get("n_estimators", 1000)),
+        "num_boost_round": int(source.get("n_estimators", 2000)),
         "early_stopping_rounds": int(source.get("early_stopping_rounds", 50)),
-        "bagging_fraction": float(source.get("subsample", 0.9)),
-        "feature_fraction": float(source.get("colsample_bytree", 0.9)),
-        "lambda_l1": float(source.get("reg_alpha", 0.0)),
-        "lambda_l2": float(source.get("reg_lambda", 0.0)),
-        "min_child_samples": int(source.get("min_child_samples", 20)),
-        "num_threads": int(source.get("num_threads", 4)),
+        "bagging_fraction": float(source.get("bagging_fraction", source.get("subsample", 0.8))),
+        "feature_fraction": float(source.get("feature_fraction", source.get("colsample_bytree", 0.7))),
+        "lambda_l1": float(source.get("lambda_l1", source.get("reg_alpha", 0.5))),
+        "lambda_l2": float(source.get("lambda_l2", source.get("reg_lambda", 1.0))),
+        "min_data_in_leaf": int(source.get("min_data_in_leaf", 300)),
+        "min_child_samples": int(source.get("min_child_samples", 150)),
+        "path_smooth": float(source.get("path_smooth", 1.0)),
+        "bagging_freq": int(source.get("bagging_freq", 5)),
+        "num_threads": _effective_num_threads(source),
         "seed": 42,
         "feature_fraction_seed": 42,
         "bagging_seed": 42,
@@ -904,6 +1325,13 @@ def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
         "force_col_wise": True,
         "verbosity": -1,
     }
+    if str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu") == "cuda":
+        params.update({
+            "device_type": "gpu",
+            "gpu_use_dp": False,
+            "max_bin": 255,
+        })
+    return params
 
 
 def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tuple[Any, dict[str, Any]]:
@@ -926,21 +1354,21 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
                 "l2": "rmse", "rmse": "rmse", "mae": "mae",
                 "auc": "auc", "binary_logloss": "logloss",
             }[metric],
-            "eta": float(source.get("learning_rate", 0.05)),
-            "max_depth": int(source.get("max_depth", 6)),
-            "subsample": float(source.get("subsample", 0.9)),
-            "colsample_bytree": float(source.get("colsample_bytree", 0.9)),
-            "alpha": float(source.get("reg_alpha", 0.0)),
-            "lambda": float(source.get("reg_lambda", 1.0)),
-            "min_child_weight": float(source.get("min_child_weight", 1.0)),
-            "nthread": int(source.get("num_threads", 4)),
+            "eta": float(source.get("learning_rate", 0.02)),
+            "max_depth": int(source.get("max_depth", 4)),
+            "subsample": float(source.get("subsample", 0.7)),
+            "colsample_bytree": float(source.get("colsample_bytree", 0.65)),
+            "alpha": float(source.get("reg_alpha", 0.5)),
+            "lambda": float(source.get("reg_lambda", 2.0)),
+            "min_child_weight": float(source.get("min_child_weight", 100.0)),
+            "nthread": _effective_num_threads(source),
             "seed": int(source.get("seed", 42)),
             "verbosity": 0,
         }
         if str(os.environ.get("ALPHA_MODEL_ACCELERATOR") or "cpu") == "cuda":
             params.update({"device": "cuda", "tree_method": "hist"})
         model = XGBModel(**params)
-        model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
+        model._alphablocks_num_boost_round = int(source.get("n_estimators", 2000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
         return model, {
             **params,
@@ -958,11 +1386,13 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
                 "l2": "RMSE", "rmse": "RMSE", "mae": "MAE",
                 "auc": "AUC", "binary_logloss": "Logloss",
             }[metric],
-            "learning_rate": float(source.get("learning_rate", 0.05)),
+            "learning_rate": float(source.get("learning_rate", 0.02)),
             "depth": int(source.get("depth", 6)),
             "l2_leaf_reg": float(source.get("l2_leaf_reg", 3.0)),
-            "random_strength": float(source.get("random_strength", 1.0)),
-            "thread_count": int(source.get("num_threads", 4)),
+            "random_strength": float(source.get("random_strength", 1.5)),
+            "bagging_temperature": float(source.get("bagging_temperature", 0.8)),
+            "od_wait": int(source.get("od_wait", 100)),
+            "thread_count": _effective_num_threads(source),
             "random_seed": int(source.get("seed", 42)),
             "allow_writing_files": False,
         }
@@ -970,7 +1400,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             params.update({"task_type": "GPU", "devices": "0"})
         model = CatBoostModel(loss="Logloss" if classification else "RMSE", **params)
         model._alphablocks_loss = loss
-        model._alphablocks_num_boost_round = int(source.get("n_estimators", 1000))
+        model._alphablocks_num_boost_round = int(source.get("n_estimators", 2000))
         model._alphablocks_early_stopping_rounds = int(source.get("early_stopping_rounds", 50))
         return model, {
             **params,
@@ -994,16 +1424,16 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             )
         params = {
             "loss": loss,
-            "learning_rate": float(source.get("learning_rate", 0.001)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 2048)),
+            "learning_rate": float(source.get("learning_rate", 0.0001)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
             "hidden_layers": hidden_layers,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchMLPModel(**params), params
     if kind == "lstm":
@@ -1016,18 +1446,18 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         params = {
             "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
-            "lookback_window": int(source.get("lookback_window", 60)),
-            "hidden_size": int(source.get("hidden_size", 128)),
+            "lookback_window": int(source.get("lookback_window", 20)),
+            "hidden_size": int(source.get("hidden_size", 64)),
             "num_layers": int(source.get("num_layers", 2)),
             "dropout": float(source.get("dropout", 0.2)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 512)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchLSTMModel(**params), params
     if kind == "transformer_lstm":
@@ -1055,7 +1485,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchTransformerLSTMModel(**params), params
     if kind in {"gru", "alstm"}:
@@ -1071,18 +1501,18 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
         params = {
             "loss": loss,
             "learning_rate": float(source.get("learning_rate", 0.001)),
-            "lookback_window": int(source.get("lookback_window", 60)),
-            "hidden_size": int(source.get("hidden_size", 128)),
+            "lookback_window": int(source.get("lookback_window", 20)),
+            "hidden_size": int(source.get("hidden_size", 64)),
             "num_layers": int(source.get("num_layers", 2)),
             "dropout": float(source.get("dropout", 0.2)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 512)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return ModelClass(**params), params
     if kind == "transformer":
@@ -1094,21 +1524,21 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "learning_rate": float(source.get("learning_rate", 0.001)),
-            "lookback_window": int(source.get("lookback_window", 60)),
+            "learning_rate": float(source.get("learning_rate", 0.0001)),
+            "lookback_window": int(source.get("lookback_window", 20)),
             "d_model": int(source.get("d_model", 64)),
             "nhead": int(source.get("nhead", 4)),
             "transformer_layers": int(source.get("transformer_layers", 2)),
             "dim_feedforward": int(source.get("dim_feedforward", 256)),
             "dropout": float(source.get("dropout", 0.2)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 256)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchTransformerModel(**params), params
     if kind == "tcn":
@@ -1120,20 +1550,20 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "learning_rate": float(source.get("learning_rate", 0.001)),
-            "lookback_window": int(source.get("lookback_window", 60)),
+            "learning_rate": float(source.get("learning_rate", 0.0001)),
+            "lookback_window": int(source.get("lookback_window", 20)),
             "hidden_size": int(source.get("hidden_size", 128)),
             "kernel_size": int(source.get("kernel_size", 5)),
-            "num_layers": int(source.get("num_layers", 5)),
-            "dropout": float(source.get("dropout", 0.5)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 256)),
+            "num_layers": int(source.get("num_layers", 2)),
+            "dropout": float(source.get("dropout", 0.2)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchTCNModel(**params), params
     if kind == "nativetft":
@@ -1145,22 +1575,22 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "learning_rate": float(source.get("learning_rate", 0.001)),
-            "lookback_window": int(source.get("lookback_window", 60)),
+            "learning_rate": float(source.get("learning_rate", 0.0005)),
+            "lookback_window": int(source.get("lookback_window", 20)),
             "d_model": int(source.get("d_model", 64)),
             "nhead": int(source.get("nhead", 4)),
             "gru_hidden_size": int(source.get("gru_hidden_size", 64)),
-            "num_layers": int(source.get("num_layers", 1)),
+            "num_layers": int(source.get("num_layers", 2)),
             "dim_feedforward": int(source.get("dim_feedforward", 128)),
             "dropout": float(source.get("dropout", 0.2)),
-            "max_steps": int(source.get("max_steps", 300)),
-            "batch_size": int(source.get("batch_size", 256)),
+            "max_steps": int(source.get("max_steps", 200)),
+            "batch_size": int(source.get("batch_size", 4000)),
             "early_stopping_rounds": int(source.get("early_stopping_rounds", 10)),
             "eval_steps": int(source.get("eval_steps", 10)),
             "seed": int(source.get("seed", 42)),
             "weight_decay": float(source.get("weight_decay", 0.0001)),
             "input_dim": feature_count,
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
         }
         return QlibTorchNativeTFTModel(**params), params
     if kind == "tabnet":
@@ -1172,14 +1602,14 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "lr": float(source.get("learning_rate", 0.01)),
+            "lr": float(source.get("learning_rate", 0.005)),
             "n_d": int(source.get("n_d", 64)),
             "n_a": int(source.get("n_a", 64)),
             "n_steps": int(source.get("n_steps", 5)),
             "n_shared": int(source.get("n_shared", 2)),
             "n_ind": int(source.get("n_ind", 2)),
-            "batch_size": int(source.get("batch_size", 4096)),
-            "n_epochs": int(source.get("max_steps", 100)),
+            "batch_size": int(source.get("batch_size", 4000)),
+            "n_epochs": int(source.get("max_steps", 200)),
             "early_stop": int(source.get("early_stopping_rounds", 20)),
             "seed": int(source.get("seed", 42)),
             "pretrain": bool(source.get("pretrain", False)),
@@ -1190,12 +1620,12 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
         params = {
             "loss": loss,
-            "alpha": float(source.get("alpha", 1.0)),
+            "alpha": float(source.get("alpha", 3.0)),
             "fit_intercept": bool(source.get("fit_intercept", False)),
             "solver": str(source.get("solver", "auto")),
             "max_iter": int(source.get("max_iter", 1000)),
             "seed": int(source.get("seed", 42)),
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
             "input_dim": feature_count,
         }
         return QlibSklearnRidgeModel(**params), params
@@ -1210,7 +1640,7 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
             "min_samples_leaf": int(source.get("min_samples_leaf", 1)),
             "max_features": float(source.get("max_features", 1.0)),
             "seed": int(source.get("seed", 42)),
-            "num_threads": int(source.get("num_threads", 4)),
+            "num_threads": _effective_num_threads(source),
             "input_dim": feature_count,
         }
         return QlibSklearnRandomForestModel(**params), params
@@ -1265,6 +1695,32 @@ def _predict_dataset(
     return model.predict(dataset, segment=segment)
 
 
+def _predict_training_dataset(
+    model: Any,
+    model_kind: str,
+    dataset: Any,
+    segment: str,
+    *,
+    classification: bool,
+) -> pd.Series:
+    """Use a deterministic sample only for expensive sequence train diagnostics."""
+    try:
+        sample_rows = max(
+            0, int(os.environ.get("ALPHA_TRAIN_METRIC_SAMPLE_ROWS") or 0),
+        )
+    except ValueError:
+        sample_rows = 0
+    if (
+        model_kind in SEQUENCE_MODEL_KINDS
+        and sample_rows > 0
+        and hasattr(model, "predict_sampled")
+    ):
+        return model.predict_sampled(dataset, segment, max_rows=sample_rows)
+    return _predict_dataset(
+        model, model_kind, dataset, segment, classification=classification,
+    )
+
+
 def _catboost_positive_probability(predictor: Any, values: Any) -> np.ndarray:
     """Return class-one probabilities for sklearn and Qlib CatBoost wrappers."""
     if hasattr(predictor, "predict_proba"):
@@ -1314,6 +1770,7 @@ def predict_feature_frame(model: Any, model_kind: str, features: pd.DataFrame) -
 
 def _model_package_version(kind: str) -> dict[str, str]:
     package = {
+        "stacking": "sklearn",
         "lightgbm": "lightgbm", "xgboost": "xgboost", "catboost": "catboost",
         "random_forest": "sklearn", "linear": "sklearn",
         "mlp": "torch", "gru": "torch", "lstm": "torch", "alstm": "torch",
@@ -1467,4 +1924,7 @@ def _feature_importance(model: Any, feature_names: list[str]) -> list[dict[str, 
     return rows
 
 
-__all__ = ["QlibTrainer", "TrainingResult", "_qlib_lgb_params", "predict_feature_frame"]
+__all__ = [
+    "QlibStackingModel", "QlibTrainer", "TrainingResult",
+    "_qlib_lgb_params", "predict_feature_frame",
+]

@@ -32,6 +32,30 @@ from factor_service.research.trainer import QlibTrainer, TrainingResult
 
 ACTIVE_STATUSES = {"leased", "running", "uploading"}
 
+# Persist user-facing workflow milestones while keeping high-frequency iteration
+# heartbeats event-free. This makes the upload/queue chronology available after
+# the user leaves and reopens the training page.
+PERSISTED_PROGRESS_STAGES = frozenset({
+    "checking_dataset_snapshot",
+    "loading_factors",
+    "loading_prices",
+    "building_labels",
+    "splitting_dataset",
+    "dataset_ready",
+    "remote_powering_on",
+    "remote_waiting_for_ssh",
+    "remote_materializing_dataset",
+    "remote_preparing",
+    "remote_snapshot_uploaded",
+    "remote_resources_ready",
+    "remote_training",
+    "remote_packaged",
+    "remote_process_cleanup_warning",
+    "remote_downloading",
+    "remote_powering_off",
+    "remote_power_off_failed",
+})
+
 
 class ResearchWorker:
     def __init__(self, settings: Settings) -> None:
@@ -510,11 +534,18 @@ class ResearchWorker:
     ) -> None:
         cancellation.checkpoint()
         payload = {"stage": stage, "percent": max(0, min(int(percent), 100)), **details}
+        with self._state_lock:
+            previous_stage = str(self.current_progress.get("stage") or "")
         self.state_store.save(job, stage, payload)
         self._set_state(current_progress=payload)
-        # Heartbeat updates are event-free and therefore safe for granular progress.
+        record_event = stage != previous_stage and stage in PERSISTED_PROGRESS_STAGES
+        # Iteration heartbeats remain event-free; only workflow transitions are
+        # written to model_job_events for the persistent training log.
         try:
-            self.control.renew(str(job["job_id"]), str(job["lease_token"]), payload)
+            self.control.renew(
+                str(job["job_id"]), str(job["lease_token"]), payload,
+                record_event=record_event,
+            )
         except ResearchControlError as exc:
             if not exc.retryable:
                 cancellation.cancel("任务已取消或租约已失效")

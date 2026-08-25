@@ -19,9 +19,14 @@ from factor_service.research.errors import JobCanceled, PermanentJobError, Worke
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 HASH = re.compile(r"^[0-9a-f]{16,64}$")
 MODEL_PARAM_FIELDS = {
+    "stacking": {
+        "n_folds", "meta_alpha", "loss", "objective", "metric",
+    },
     "lightgbm": {
         "learning_rate", "num_leaves", "max_depth", "n_estimators", "subsample",
         "colsample_bytree", "reg_alpha", "reg_lambda", "min_child_samples",
+        "min_data_in_leaf", "path_smooth", "bagging_freq", "lambda_l1",
+        "lambda_l2", "feature_fraction", "bagging_fraction",
         "early_stopping_rounds", "num_threads", "loss", "seed",
         "feature_fraction_seed", "bagging_seed", "data_random_seed", "deterministic",
         "verbosity",
@@ -34,6 +39,7 @@ MODEL_PARAM_FIELDS = {
     },
     "catboost": {
         "learning_rate", "depth", "n_estimators", "l2_leaf_reg", "random_strength",
+        "bagging_temperature", "od_wait",
         "early_stopping_rounds", "num_threads", "loss", "seed", "deterministic",
         "verbosity",
     },
@@ -98,6 +104,14 @@ MODEL_PARAM_FIELDS = {
 }
 for _fields in MODEL_PARAM_FIELDS.values():
     _fields.update({"objective", "metric"})
+
+CLASSICAL_STACKING_KINDS = frozenset({
+    "lightgbm", "xgboost", "catboost", "random_forest", "linear",
+})
+DEEP_STACKING_KINDS = frozenset({
+    "mlp", "gru", "lstm", "alstm", "transformer", "tabnet", "tcn",
+    "nativetft", "transformer_lstm",
+})
 
 
 def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -193,7 +207,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     model_kind = str(model.get("kind") or "") if isinstance(model, dict) else ""
     if model_kind not in MODEL_PARAM_FIELDS:
         raise PermanentJobError(
-            "模型只允许lightgbm、xgboost、catboost、random_forest、linear、"
+            "模型只允许stacking、lightgbm、xgboost、catboost、random_forest、linear、"
             "mlp、gru、lstm、alstm、transformer、tabnet、tcn、nativetft或transformer_lstm"
         )
     params = model.get("params") or {}
@@ -205,6 +219,8 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             f"{model_kind}参数包含未允许字段: {', '.join(unknown_params)}"
         )
     _validate_model_params(model_kind, params)
+    if model_kind == "stacking":
+        _validate_stacking_model(model, target_mode=target_mode)
     execution = config.get("execution") or {"node_id": "local"}
     if not isinstance(execution, dict):
         raise PermanentJobError("execution必须是对象")
@@ -263,24 +279,77 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_stacking_model(model: dict[str, Any], *, target_mode: str) -> None:
+    base_models = model.get("base_models")
+    if (
+        not isinstance(base_models, list)
+        or not 2 <= len(base_models) <= 8
+        or any(not isinstance(item, dict) for item in base_models)
+    ):
+        raise PermanentJobError("Stacking必须配置2到8个基模型")
+    base_kinds = [str(item.get("kind") or "").strip().lower() for item in base_models]
+    if len(set(base_kinds)) != len(base_kinds):
+        raise PermanentJobError("Stacking不能重复配置同一个基模型")
+    kinds = set(base_kinds)
+    if not (
+        kinds and kinds <= CLASSICAL_STACKING_KINDS
+        or kinds and kinds <= DEEP_STACKING_KINDS
+    ):
+        raise PermanentJobError(
+            "Stacking只支持同一模型族；传统模型与深度学习模型不能混合集成"
+        )
+    expected_loss = "binary" if target_mode == "classification" else "mse"
+    expected_objective = "binary" if target_mode == "classification" else "regression"
+    for base_model in base_models:
+        kind = str(base_model.get("kind") or "").strip().lower()
+        if kind not in MODEL_PARAM_FIELDS or kind == "stacking":
+            raise PermanentJobError(f"Stacking基模型{kind or '--'}无效")
+        params = base_model.get("params") or {}
+        if not isinstance(params, dict):
+            raise PermanentJobError(f"Stacking基模型{kind}参数必须是对象")
+        unknown = sorted(set(params) - MODEL_PARAM_FIELDS[kind])
+        if unknown:
+            raise PermanentJobError(
+                f"Stacking基模型{kind}参数包含未允许字段: {', '.join(unknown)}"
+            )
+        _validate_model_params(kind, params)
+        if str(params.get("loss") or "mse").strip().lower() != expected_loss:
+            raise PermanentJobError(f"Stacking基模型{kind}损失与目标类型不一致")
+        if str(params.get("objective") or expected_objective).strip().lower() != expected_objective:
+            raise PermanentJobError(f"Stacking基模型{kind}Objective与目标类型不一致")
+
+
 def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
+    if kind == "stacking":
+        _integer(params.get("n_folds", 3), "n_folds", 2, 10)
+        _number(params.get("meta_alpha", 1.0), "meta_alpha", 0.01, 100.0)
+        return
     deep_kinds = {
         "mlp", "gru", "lstm", "alstm", "transformer", "tabnet", "tcn",
         "nativetft", "transformer_lstm",
     }
-    default_lr = 0.001 if kind in deep_kinds else 0.05
+    default_lr = 0.001 if kind in deep_kinds else 0.02
     _number(params.get("learning_rate", default_lr), "learning_rate", 0.000001, 1.0)
     if kind == "lightgbm":
         _integer(params.get("num_leaves", 31), "num_leaves", 2, 65536)
         _integer(params.get("max_depth", -1), "max_depth", -1, 128)
-        _integer(params.get("min_child_samples", 20), "min_child_samples", 1, 1_000_000)
+        _integer(params.get("min_data_in_leaf", 300), "min_data_in_leaf", 1, 1_000_000)
+        _integer(params.get("min_child_samples", 150), "min_child_samples", 1, 1_000_000)
+        _number(params.get("path_smooth", 1.0), "path_smooth", 0.0, 10.0)
+        _integer(params.get("bagging_freq", 5), "bagging_freq", 0, 100)
+        _number(params.get("lambda_l1", 0.5), "lambda_l1", 0.0, 1_000_000.0)
+        _number(params.get("lambda_l2", 1.0), "lambda_l2", 0.0, 1_000_000.0)
+        _number(params.get("feature_fraction", 0.7), "feature_fraction", 0.01, 1.0)
+        _number(params.get("bagging_fraction", 0.8), "bagging_fraction", 0.01, 1.0)
     elif kind == "xgboost":
         _integer(params.get("max_depth", 6), "max_depth", 1, 128)
         _number(params.get("min_child_weight", 1.0), "min_child_weight", 0.0, 1_000_000.0)
     elif kind == "catboost":
         _integer(params.get("depth", 6), "depth", 1, 16)
         _number(params.get("l2_leaf_reg", 3.0), "l2_leaf_reg", 0.0, 1_000_000.0)
-        _number(params.get("random_strength", 1.0), "random_strength", 0.0, 1_000_000.0)
+        _number(params.get("random_strength", 1.5), "random_strength", 0.0, 1_000_000.0)
+        _number(params.get("bagging_temperature", 0.8), "bagging_temperature", 0.0, 10.0)
+        _integer(params.get("od_wait", 100), "od_wait", 1, 1000)
     elif kind == "random_forest":
         _integer(params.get("n_estimators", 500), "n_estimators", 1, 100_000)
         _integer(params.get("max_depth", 0), "max_depth", 0, 128)

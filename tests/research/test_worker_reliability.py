@@ -26,8 +26,10 @@ class _Api:
         self.failure_messages: list[str] = []
         self.completed: list[str] = []
         self.artifacts: list[dict] = []
+        self.renewals: list[dict] = []
 
     def renew(self, *_args, **_kwargs):
+        self.renewals.append(dict(_kwargs))
         return {"ok": True}
 
     def control(self, *_args, **_kwargs):
@@ -209,6 +211,28 @@ def test_progress_state_survives_process_boundary(tmp_path: Path) -> None:
     assert saved is not None
     assert saved["phase"] == "loading_factors"
     assert saved["progress"]["percent"] == 22
+
+
+def test_progress_log_persists_upload_milestones_without_heartbeat_noise(
+    tmp_path: Path,
+) -> None:
+    worker = ResearchWorker(_settings(tmp_path))
+    api = _Api()
+    worker.control = api
+    job = valid_job()
+    cancellation = CancellationToken()
+
+    worker._report_progress(job, cancellation, "remote_preparing", 57, {})
+    worker._report_progress(job, cancellation, "remote_preparing", 58, {})
+    worker._report_progress(job, cancellation, "training_final_model", 70, {})
+    worker._report_progress(
+        job, cancellation, "remote_snapshot_uploaded", 60,
+        {"dataset_cache_hit": False},
+    )
+
+    assert [item["record_event"] for item in api.renewals] == [
+        True, False, False, True,
+    ]
 
 
 def test_acceptance_state_write_failure_does_not_leave_worker_busy(tmp_path: Path) -> None:

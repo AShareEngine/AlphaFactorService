@@ -2,6 +2,7 @@ from factor_service.model_validation import (
     assess_model_validation,
     assess_parameter_trial,
     assess_walk_forward_stability,
+    select_model_trial,
     select_parameter_trial,
 )
 
@@ -121,6 +122,31 @@ def test_parameter_selection_returns_no_finalist_when_gate_fails() -> None:
 
     assert result["status"] == "no_qualified_trials"
     assert result["selected_job_id"] == ""
+
+
+def test_model_selection_matches_quantmind_absolute_validation_icir() -> None:
+    result = select_model_trial([
+        _trial(1, rank_ic=0.07, ic_ir=0.25),
+        _trial(2, rank_ic=0.03, ic_ir=-0.72),
+        _trial(3, rank_ic=0.05, ic_ir=0.61),
+    ], complete=True)
+
+    assert result["status"] == "selected"
+    assert result["ranking_metric"] == "abs(validation.ic_ir)"
+    assert result["selected_job_id"] == "job-2"
+    assert result["selected_model_version"] == 2
+    assert result["best_observed_ic_ir"] == -0.72
+
+
+def test_model_selection_waits_for_every_model_to_finish() -> None:
+    result = select_model_trial([
+        _trial(1, rank_ic=0.04, ic_ir=0.40),
+        _trial(2, rank_ic=0.05, ic_ir=0.55, status="running"),
+    ], complete=False)
+
+    assert result["status"] == "evaluating"
+    assert result["selected_job_id"] == ""
+    assert result["best_observed_job_id"] == "job-1"
 
 
 def test_walk_forward_stability_requires_consistent_oos_windows() -> None:

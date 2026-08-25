@@ -957,9 +957,11 @@ def _cached_artifact_model_permutation_importance(
     from qlib.data.dataset import DataHandlerLP, DatasetH
 
     from factor_service.research.trainer import (
+        QlibStackingModel,
         SEQUENCE_MODEL_KINDS,
         _dataset_for_model,
         _metrics,
+        _predict_dataset,
     )
 
     segment_map = {name: (start, end) for name, start, end in segments}
@@ -972,7 +974,16 @@ def _cached_artifact_model_permutation_importance(
         raise ValueError("冻结数据集缺少解释特征: " + ", ".join(missing))
     evaluation_segments = dict(segment_map)
     sampled_test_days = None
-    if model_kind in SEQUENCE_MODEL_KINDS:
+    stacking_base_specs = (
+        list(model_params.get("base_models") or [])
+        if model_kind == "stacking" else []
+    )
+    contains_sequence_model = model_kind in SEQUENCE_MODEL_KINDS or any(
+        str(item.get("kind") or "") in SEQUENCE_MODEL_KINDS
+        for item in stacking_base_specs
+        if isinstance(item, dict)
+    )
+    if contains_sequence_model:
         import torch
 
         torch.set_num_threads(1)
@@ -994,12 +1005,42 @@ def _cached_artifact_model_permutation_importance(
             )
             sampled_test_days = 10
     model = _load_artifact_model(bundle_path)
-    baseline_dataset = _dataset_for_model(
-        DataHandlerLP.from_df(frame), evaluation_segments, model_kind, model_params, DatasetH,
-    )
-    baseline_prediction = model.predict(baseline_dataset, segment="test")
+    if model_kind == "stacking" and not isinstance(model, QlibStackingModel):
+        raise ValueError("Stacking模型bundle类型无效")
+
+    def predict(target_frame: pd.DataFrame) -> pd.Series:
+        handler = DataHandlerLP.from_df(target_frame)
+        if model_kind != "stacking":
+            dataset = _dataset_for_model(
+                handler, evaluation_segments, model_kind, model_params, DatasetH,
+            )
+            return _predict_dataset(
+                model, model_kind, dataset, "test",
+                classification=bool(getattr(model, "classification", False)),
+            )
+        predictions: list[pd.Series] = []
+        for item in model.base_models:
+            kind = str(item.get("kind") or "")
+            params = dict(item.get("params") or {})
+            dataset = _dataset_for_model(
+                handler, evaluation_segments, kind, params, DatasetH,
+            )
+            predictions.append(_predict_dataset(
+                item.get("model"), kind, dataset, "test",
+                classification=model.classification,
+            ).rename(kind))
+        aligned = pd.concat(predictions, axis=1, join="inner").dropna()
+        if aligned.empty:
+            raise ValueError("Stacking基模型诊断预测没有共同有效样本")
+        values = model.combine([
+            aligned.iloc[:, index].to_numpy(dtype=float)
+            for index in range(len(predictions))
+        ])
+        return pd.Series(values, index=aligned.index, name="prediction")
+
+    baseline_prediction = predict(frame)
     baseline = _metrics(baseline_prediction, frame, evaluation_segments["test"])
-    del baseline_dataset, baseline_prediction
+    del baseline_prediction
     gc.collect()
     rows = []
     for index, feature in enumerate(feature_names):
@@ -1011,10 +1052,7 @@ def _cached_artifact_model_permutation_importance(
             rng.shuffle(permuted)
             values.iloc[positions] = permuted
         shuffled[("feature", feature)] = values
-        dataset = _dataset_for_model(
-            DataHandlerLP.from_df(shuffled), evaluation_segments, model_kind, model_params, DatasetH,
-        )
-        prediction = model.predict(dataset, segment="test")
+        prediction = predict(shuffled)
         metrics = _metrics(prediction, shuffled, evaluation_segments["test"])
         rows.append({
             "factor": feature,
@@ -1024,7 +1062,7 @@ def _cached_artifact_model_permutation_importance(
             "rank_ic_drop": float(baseline["rank_ic"] - metrics["rank_ic"]),
             "permutation_ic_ir": metrics["ic_ir"],
         })
-        del dataset, prediction, shuffled, values
+        del prediction, shuffled, values
         gc.collect()
     rows.sort(key=lambda item: (-float(item["rank_ic_drop"]), item["factor"]))
     positive = sum(float(item["rank_ic_drop"]) > 0 for item in rows)

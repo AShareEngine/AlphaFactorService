@@ -9,19 +9,146 @@ import numpy as np
 import pandas as pd
 
 from factor_service.research.dataset import PreparedDataset
+from factor_service.research.models import _validation_indices
 from factor_service.research.trainer import (
+    QlibStackingModel,
     _create_model,
     _feature_importance,
+    _fit_stacking,
     _fit_model,
     _incremental_prepared_dataset,
     _metrics,
     _predict_dataset,
+    _predict_training_dataset,
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
     _walk_forward_frame,
     predict_feature_frame,
 )
+
+
+def test_stacking_bundle_combines_base_predictions_and_round_trips() -> None:
+    from sklearn.linear_model import Ridge
+
+    meta = Ridge(alpha=1.0).fit(
+        np.asarray([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]),
+        np.asarray([0.25, 0.75, 1.0]),
+    )
+    model = QlibStackingModel(
+        base_models=[
+            {"kind": "lightgbm", "params": {}, "model": object()},
+            {"kind": "linear", "params": {}, "model": object()},
+        ],
+        meta_model=meta,
+    )
+    expected = model.combine([
+        np.asarray([0.2, 0.8]), np.asarray([0.6, 0.4]),
+    ])
+    restored = pickle.loads(pickle.dumps(model))
+
+    assert np.allclose(restored.combine([
+        np.asarray([0.2, 0.8]), np.asarray([0.6, 0.4]),
+    ]), expected)
+
+
+def test_remote_runtime_overrides_default_threads_and_enables_lgb_gpu(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ALPHA_EFFECTIVE_NUM_THREADS", "24")
+    monkeypatch.setenv("ALPHA_MODEL_ACCELERATOR", "cuda")
+
+    params = _qlib_lgb_params({"num_threads": 4})
+
+    assert params["num_threads"] == 24
+    assert params["device_type"] == "gpu"
+    assert params["gpu_use_dp"] is False
+
+
+def test_validation_sampling_is_deterministic_and_spans_full_period() -> None:
+    selected = _validation_indices(1_000, 100)
+
+    assert len(selected) == 100
+    assert selected[0] == 0
+    assert selected[-1] == 999
+    assert selected == _validation_indices(1_000, 100)
+
+
+def test_remote_sequence_train_metrics_use_deterministic_sample(monkeypatch) -> None:
+    class _SequenceModel:
+        @staticmethod
+        def predict_sampled(dataset, segment, *, max_rows):
+            assert dataset == "dataset"
+            assert segment == "train"
+            assert max_rows == 200_000
+            return pd.Series([0.1, 0.2])
+
+    monkeypatch.setenv("ALPHA_TRAIN_METRIC_SAMPLE_ROWS", "200000")
+
+    prediction = _predict_training_dataset(
+        _SequenceModel(), "lstm", "dataset", "train", classification=False,
+    )
+
+    assert prediction.tolist() == [0.1, 0.2]
+
+
+def test_stacking_fits_time_ordered_oof_and_returns_one_model() -> None:
+    from qlib.data.dataset import DataHandlerLP, DatasetH
+
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    index = pd.MultiIndex.from_product(
+        [dates, [f"stock-{i}" for i in range(6)]],
+        names=["datetime", "instrument"],
+    )
+    f1 = rng.normal(size=len(index))
+    f2 = rng.normal(size=len(index))
+    label = 0.7 * f1 - 0.2 * f2 + rng.normal(scale=0.05, size=len(index))
+    frame = pd.DataFrame(
+        np.column_stack([f1, f2, label]),
+        index=index,
+        columns=pd.MultiIndex.from_tuples([
+            ("feature", "f1"), ("feature", "f2"), ("label", "LABEL0"),
+        ]),
+    )
+    prepared = PreparedDataset(
+        frame=frame,
+        segments={
+            "train": (dates[0].date().isoformat(), dates[43].date().isoformat()),
+            "valid": (dates[44].date().isoformat(), dates[51].date().isoformat()),
+            "test": (dates[52].date().isoformat(), dates[-1].date().isoformat()),
+        },
+        feature_names=["f1", "f2"],
+        coverage={},
+        medians={"f1": 0.0, "f2": 0.0},
+        manifest={},
+    )
+    result = _fit_stacking(
+        prepared,
+        model_spec={
+            "kind": "stacking",
+            "params": {"n_folds": 2, "meta_alpha": 1.0},
+            "base_models": [
+                {"kind": "linear", "params": {"alpha": 1.0}},
+                {"kind": "random_forest", "params": {
+                    "n_estimators": 5, "max_depth": 3, "num_threads": 1,
+                }},
+            ],
+        },
+        DataHandlerLP=DataHandlerLP,
+        DatasetH=DatasetH,
+        classification=False,
+        cancellation=None,
+        progress=None,
+    )
+
+    assert isinstance(result["model"], QlibStackingModel)
+    assert result["model_params"]["oof_rows"] >= 100
+    assert list(item["kind"] for item in result["model"].base_models) == [
+        "linear", "random_forest",
+    ]
+    assert not result["valid_prediction"].empty
+    assert not result["test_prediction"].empty
 
 
 def test_qlib_column_feature_importance_maps_back_to_frozen_factor_names() -> None:
@@ -128,6 +255,20 @@ def test_lightgbm_parameters_are_deterministic() -> None:
     binary = _qlib_lgb_params({"loss": "binary", "metric": "binary_logloss"})
     assert binary["loss"] == "binary"
     assert binary["metric"] == "binary_logloss"
+
+
+def test_lightgbm_parameters_match_quantmind_defaults() -> None:
+    params = _qlib_lgb_params({})
+
+    assert params["learning_rate"] == 0.02
+    assert params["min_data_in_leaf"] == 300
+    assert params["min_child_samples"] == 150
+    assert params["path_smooth"] == 1.0
+    assert params["bagging_freq"] == 5
+    assert params["lambda_l1"] == 0.5
+    assert params["lambda_l2"] == 1.0
+    assert params["feature_fraction"] == 0.7
+    assert params["bagging_fraction"] == 0.8
 
 
 def test_classification_metrics_use_probability_outputs() -> None:
@@ -237,11 +378,13 @@ def test_lightgbm_incremental_fit_appends_trees_to_source_booster() -> None:
         })
         source, _ = _create_model("lightgbm", {
             "n_estimators": 5, "early_stopping_rounds": 2, "num_threads": 1,
+            "min_data_in_leaf": 2, "min_child_samples": 2,
         }, 1)
         _fit_model("lightgbm", source, dataset, {}, cancellation=None, progress=None)
         source_trees = source.model.num_trees()
         updated, _ = _create_model("lightgbm", {
             "n_estimators": 3, "early_stopping_rounds": 2, "num_threads": 1,
+            "min_data_in_leaf": 2, "min_child_samples": 2,
         }, 1)
         _fit_model(
             "lightgbm", updated, dataset, {}, cancellation=None, progress=None,

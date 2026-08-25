@@ -9,9 +9,14 @@ import pytest
 from factor_service.research.config import Settings
 from factor_service.research.remote import (
     RemoteTransport,
+    _effective_remote_thread_count,
     _load_remote_result,
+    _requested_job_threads,
+    _remote_result_is_complete,
+    _source_fingerprint,
     load_remote_nodes,
 )
+from factor_service.research.remote_runner import _scoped_path
 from factor_service.research.trainer import QlibTrainer
 
 
@@ -146,11 +151,55 @@ def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     transport.push(source, "/root/alphablocks-research/dataset.parquet")
 
     assert captured[0] == "rsync"
+    assert "-z" not in captured
+    assert "-az" not in captured
     assert "--protect-args" not in captured
     assert captured[-2] == str(source)
     assert captured[-1] == (
         "root@gpu.example.test:/root/alphablocks-research/dataset.parquet"
     )
+
+
+def test_remote_resource_planner_uses_large_node_without_oversubscription() -> None:
+    assert _effective_remote_thread_count(96, 4) == 32
+    assert _effective_remote_thread_count(8, 4) == 4
+    assert _effective_remote_thread_count(6, 16) == 6
+    assert _requested_job_threads({
+        "config_json": {"model": {
+            "kind": "stacking",
+            "params": {},
+            "base_models": [
+                {"kind": "lstm", "params": {"num_threads": 4}},
+                {"kind": "gru", "params": {"num_threads": 12}},
+            ],
+        }},
+    }) == 12
+
+
+def test_source_fingerprint_changes_with_training_code(tmp_path: Path) -> None:
+    source = tmp_path / "factor_service"
+    source.mkdir()
+    module = source / "trainer.py"
+    module.write_text("VERSION = 1\n", encoding="utf-8")
+    first = _source_fingerprint(source)
+
+    module.write_text("VERSION = 2\n", encoding="utf-8")
+
+    assert len(first) == 24
+    assert _source_fingerprint(source) != first
+
+
+def test_nonzero_remote_cleanup_exit_accepts_atomic_packaged_result() -> None:
+    class _Transport:
+        @staticmethod
+        def ssh(command, *, timeout, cancellation):
+            assert "test -s" in command
+            assert "remote_packaged" in command
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    assert _remote_result_is_complete(
+        _Transport(), "/root/run", cancellation=None,
+    ) is True
 
 
 def test_remote_result_rejects_path_traversal(tmp_path: Path) -> None:
@@ -168,6 +217,31 @@ def test_remote_result_rejects_path_traversal(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="路径无效"):
         _load_remote_result(result, work, artifacts)
+
+
+def test_remote_result_scope_preserves_shared_dataset_symlink(tmp_path: Path) -> None:
+    work = tmp_path / "run" / "work"
+    artifacts = tmp_path / "run" / "artifacts"
+    cache = tmp_path / "cache" / "dataset-hash"
+    work.mkdir(parents=True)
+    artifacts.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    (cache / "dataset.parquet").write_bytes(b"parquet")
+    (artifacts / "datasets").mkdir()
+    (artifacts / "datasets" / "dataset-hash").symlink_to(
+        cache, target_is_directory=True,
+    )
+
+    scoped = _scoped_path(
+        artifacts / "datasets" / "dataset-hash" / "dataset.parquet",
+        work,
+        artifacts,
+    )
+
+    assert scoped == {
+        "scope": "artifact_root",
+        "path": "datasets/dataset-hash/dataset.parquet",
+    }
 
 
 def test_qlib_trainer_does_not_connect_to_clickhouse_during_init(tmp_path: Path) -> None:

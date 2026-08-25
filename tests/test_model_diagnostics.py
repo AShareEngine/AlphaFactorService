@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from factor_service.research.trainer import QlibStackingModel
+
 from factor_service.model_diagnostics import (
     _ks_statistic,
     _population_stability_index,
@@ -42,6 +44,12 @@ class _LinearDatasetModel:
             segment, col_set="feature", data_key=DataHandlerLP.DK_I,
         )
         return pd.Series(features.iloc[:, 0].to_numpy(), index=features.index)
+
+
+class _AverageMetaModel:
+    @staticmethod
+    def predict(values):
+        return np.asarray(values, dtype=float).mean(axis=1)
 
 
 class _FakeLightGBMBooster:
@@ -451,6 +459,62 @@ def test_permutation_importance_uses_independent_test_cross_sections(
     assert by_factor["signal"]["rank_ic_drop"] > 0.5
     assert by_factor["noise"]["rank_ic_drop"] == pytest.approx(0.0)
     assert result["method"]["causal_constraint"].startswith("每个交易日内")
+
+
+def test_stacking_permutation_importance_uses_all_base_models(
+    tmp_path: Path,
+) -> None:
+    dates = pd.date_range("2024-01-01", periods=10)
+    instruments = [f"S{index:02d}" for index in range(10)]
+    index = pd.MultiIndex.from_product(
+        [dates, instruments], names=["datetime", "instrument"],
+    )
+    signal = np.tile(np.linspace(-1, 1, len(instruments)), len(dates))
+    frame = pd.DataFrame(
+        np.column_stack((signal, signal)),
+        index=index,
+        columns=pd.MultiIndex.from_tuples([
+            ("feature", "signal"), ("label", "LABEL0"),
+        ]),
+    )
+    dataset_path = tmp_path / "dataset.parquet"
+    frame.to_parquet(dataset_path)
+    model = QlibStackingModel(
+        base_models=[
+            {"kind": "linear", "params": {}, "model": _LinearDatasetModel()},
+            {
+                "kind": "random_forest", "params": {},
+                "model": _LinearDatasetModel(),
+            },
+        ],
+        meta_model=_AverageMetaModel(),
+    )
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(pickle.dumps(model))
+    bundle_path = tmp_path / "bundle.tar.gz"
+    with tarfile.open(bundle_path, "w:gz") as archive:
+        archive.add(model_path, arcname="model.pkl")
+
+    result = artifact_model_permutation_importance(
+        bundle_path,
+        dataset_path,
+        model_kind="stacking",
+        segments={
+            "train": ["2024-01-01", "2024-01-04"],
+            "valid": ["2024-01-05", "2024-01-06"],
+            "test": ["2024-01-07", "2024-01-10"],
+        },
+        model_params={
+            "base_models": [
+                {"kind": "linear", "params": {}},
+                {"kind": "random_forest", "params": {}},
+            ],
+        },
+        feature_names=["signal"],
+    )
+
+    assert result["baseline"]["rank_ic"] == pytest.approx(1.0)
+    assert result["features"][0]["rank_ic_drop"] > 0.5
 
 
 def test_deep_permutation_diagnostics_use_short_lived_process(

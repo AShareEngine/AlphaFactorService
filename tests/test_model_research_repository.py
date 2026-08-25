@@ -1246,6 +1246,83 @@ def test_horizon_search_normalizes_supported_unique_values() -> None:
         _horizon_search_values({"horizons": [1, 20]})
 
 
+def test_canceled_experiment_restart_clones_frozen_trials_into_new_experiment() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    source_experiment_id = "model_experiment_failed"
+    source_jobs = [
+        {
+            "job_id": f"failed-job-{index}",
+            "model_id": "shared-model",
+            "model_kind": kind,
+            "title": f"模型对比 · {index}/2 · {kind}",
+            "status": status,
+            "dataset_hash": "a" * 64,
+            "dataset_spec": _source(),
+            "requested_at": f"2026-08-25T01:0{index}:00+00:00",
+            "updated_at": f"2026-08-25T01:0{index}:00+00:00",
+            "config_json": {
+                "model": {"kind": kind, "params": {"seed": 42}},
+                "walk_forward": {"enabled": True},
+                "execution": {"node_id": "autodl-pro-test-01"},
+                "experiment": {
+                    "experiment_id": source_experiment_id,
+                    "title": "模型对比",
+                    "strategy": "model_ensemble",
+                    "trial_index": index,
+                    "trial_count": 2,
+                    "search_params": {"model_kind": kind},
+                    "auto_dispatch": True,
+                },
+            },
+        }
+        for index, (kind, status) in enumerate(
+            (("lightgbm", "canceled"), ("lstm", "canceled")), start=1,
+        )
+    ]
+    repository.get_training_experiment = lambda experiment_id: {
+        "experiment_id": experiment_id,
+        "title": "模型对比",
+        "model_id": "shared-model",
+        "jobs": source_jobs,
+    }
+    captured = []
+
+    def create_job(payload):
+        captured.append(payload)
+        index = len(captured)
+        return {
+            "job_id": f"retried-job-{index}",
+            "model_id": payload["model_id"],
+            "model_kind": payload["model"]["kind"],
+            "title": payload["title"],
+            "status": "queued",
+            "dataset_hash": "a" * 64,
+            "dataset_spec": payload["dataset"],
+            "requested_at": f"2026-08-25T02:0{index}:00+00:00",
+            "updated_at": f"2026-08-25T02:0{index}:00+00:00",
+            "config_json": {
+                "model": payload["model"],
+                "execution": payload["execution"],
+                "experiment": payload["experiment"],
+            },
+        }
+
+    repository.create_training_job = create_job
+
+    restarted = repository.restart_training_experiment(source_experiment_id)
+
+    assert restarted["experiment_id"] != source_experiment_id
+    assert restarted["restarted_from_experiment_id"] == source_experiment_id
+    assert restarted["statuses"] == {"queued": 2}
+    assert [item["model"]["kind"] for item in captured] == ["lightgbm", "lstm"]
+    assert all(
+        item["experiment"]["experiment_id"] == restarted["experiment_id"]
+        and item["experiment"]["auto_dispatch"] is True
+        for item in captured
+    )
+    assert all(item["dataset"] == _source() for item in captured)
+
+
 def test_horizon_experiment_creates_separate_frozen_datasets() -> None:
     repository = object.__new__(ModelResearchRepository)
     captured = []
@@ -1447,7 +1524,7 @@ def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
     assert result["dataset_count"] == 1
     assert result["trial_count"] == 3
     assert result["search_parameters"] == ["model_kind"]
-    assert result["selection"]["policy"] == "alphablocks.model-ensemble-selection.v1"
+    assert result["selection"]["policy"] == "alphablocks.model-ensemble-selection.v2"
     assert result["selection"]["selection_unit"] == "model_kind"
     assert [
         item["model"]["kind"] for item in captured
@@ -1461,6 +1538,154 @@ def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
     assert all(
         item["dataset"] == _dataset_spec(_source()) for item in captured
     )
+
+
+def test_model_ensemble_summary_selects_only_best_absolute_validation_icir() -> None:
+    def job(index: int, kind: str, *, rank_ic: float, ic_ir: float) -> dict:
+        return {
+            "job_id": f"ensemble-job-{index}",
+            "model_id": "ensemble-model",
+            "model_version": index,
+            "model_kind": kind,
+            "status": "succeeded",
+            "dataset_hash": "0" * 64,
+            "dataset_spec": _dataset_spec(_source()),
+            "requested_at": f"2026-08-15T04:0{index}:00+00:00",
+            "updated_at": f"2026-08-15T05:0{index}:00+00:00",
+            "config_json": {"experiment": {
+                "experiment_id": "model_experiment_ensemble",
+                "title": "多模型对比",
+                "strategy": "model_ensemble",
+                "trial_index": index,
+                "trial_count": 3,
+                "search_params": {"model_kind": kind},
+            }},
+            "result_json": {"metrics": {"validation": {
+                "days": 60,
+                "rank_ic": rank_ic,
+                "ic_ir": ic_ir,
+                "rmse": 0.7,
+            }}},
+        }
+
+    result = _experiment_summary("model_experiment_ensemble", [
+        job(1, "lightgbm", rank_ic=0.07, ic_ir=0.25),
+        job(2, "xgboost", rank_ic=0.03, ic_ir=-0.72),
+        job(3, "mlp", rank_ic=0.05, ic_ir=0.61),
+    ])
+
+    assert result["selection"]["selected_job_id"] == "ensemble-job-2"
+    assert result["selection"]["selected_model_kind"] == "xgboost"
+    assert result["comparison"]["selection_metric"] == "abs(validation.ic_ir)"
+    assert [
+        item["job_id"] for item in result["comparison"]["trials"]
+        if item["is_selected"]
+    ] == ["ensemble-job-2"]
+
+
+def test_model_ensemble_stacking_creates_one_composite_trial() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    captured = []
+
+    def create_job(payload):
+        captured.append(payload)
+        return {
+            "job_id": "stacking-job-1",
+            "model_id": payload["model_id"],
+            "model_kind": payload["model"]["kind"],
+            "status": "queued",
+            "dataset_hash": "0" * 64,
+            "dataset_spec": payload["dataset"],
+            "requested_at": "2026-08-15T04:01:00+00:00",
+            "updated_at": "2026-08-15T04:01:00+00:00",
+            "config_json": {"experiment": payload["experiment"]},
+        }
+
+    repository.create_training_job = create_job
+    result = repository.create_training_experiment({
+        "title": "树模型 Stacking",
+        "model_id": "stacking-model",
+        "dataset": _source(),
+        "model": {"kind": "lightgbm", "params": {}},
+        "search": {
+            "strategy": "model_ensemble",
+            "model_kinds": ["lightgbm", "xgboost", "linear"],
+            "model_params_by_kind": {
+                "lightgbm": {"num_leaves": 15},
+                "xgboost": {"max_depth": 4},
+                "linear": {"alpha": 3.0},
+            },
+            "ensemble_method": "stacking",
+            "n_folds": 4,
+            "meta_alpha": 2.5,
+        },
+    })
+
+    assert result["trial_count"] == 1
+    assert len(captured) == 1
+    model = captured[0]["model"]
+    assert model["kind"] == "stacking"
+    assert model["params"]["n_folds"] == 4
+    assert model["params"]["meta_alpha"] == 2.5
+    assert model["ensemble"]["family"] == "classical"
+    assert [item["kind"] for item in model["base_models"]] == [
+        "lightgbm", "xgboost", "linear",
+    ]
+    assert captured[0]["experiment"]["search_params"]["ensemble_method"] == "stacking"
+
+
+def test_model_ensemble_stacking_inherits_classification_target() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    captured = []
+
+    def create_job(payload):
+        captured.append(payload)
+        return {
+            "job_id": "classification-stacking-job",
+            "model_id": payload["model_id"],
+            "model_kind": payload["model"]["kind"],
+            "status": "queued",
+            "dataset_hash": "0" * 64,
+            "dataset_spec": payload["dataset"],
+            "requested_at": "2026-08-15T04:01:00+00:00",
+            "updated_at": "2026-08-15T04:01:00+00:00",
+            "config_json": {"experiment": payload["experiment"]},
+        }
+
+    repository.create_training_job = create_job
+    repository.create_training_experiment({
+        "dataset": {**_source(), "target_mode": "classification"},
+        "search": {
+            "strategy": "model_ensemble",
+            "model_kinds": ["lightgbm", "xgboost"],
+            "model_params_by_kind": {"lightgbm": {}, "xgboost": {}},
+            "ensemble_method": "stacking",
+        },
+    })
+
+    model = captured[0]["model"]
+    assert model["params"]["loss"] == "binary"
+    assert model["params"]["objective"] == "binary"
+    assert model["params"]["metric"] == "auc"
+    assert all(
+        item["params"]["loss"] == "binary" for item in model["base_models"]
+    )
+
+
+def test_model_ensemble_stacking_rejects_cross_family_selection() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    repository.create_training_job = lambda _payload: None
+
+    with pytest.raises(ModelResearchError, match="同一模型族"):
+        repository.create_training_experiment({
+            "dataset": _source(),
+            "search": {
+                "strategy": "model_ensemble",
+                "model_kinds": ["lightgbm", "lstm"],
+                "model_params_by_kind": {"lightgbm": {}, "lstm": {}},
+                "ensemble_method": "stacking",
+            },
+        })
 
 
 def test_model_ensemble_rejects_too_few_or_unknown_kinds() -> None:
@@ -1512,6 +1737,66 @@ def test_model_spec_supports_all_available_model_kinds() -> None:
         assert spec["params"]["num_threads"] == 4
     with pytest.raises(ModelResearchError, match="只允许"):
         _model_spec({"kind": "unknown_model", "params": {}})
+
+
+def test_model_spec_matches_quantmind_hyperparameter_contract() -> None:
+    lightgbm = _model_spec({"kind": "lightgbm", "params": {}})["params"]
+    assert lightgbm["learning_rate"] == 0.02
+    assert lightgbm["n_estimators"] == 2000
+    assert lightgbm["min_data_in_leaf"] == 300
+    assert lightgbm["min_child_samples"] == 150
+    assert lightgbm["path_smooth"] == 1.0
+    assert lightgbm["bagging_freq"] == 5
+    assert lightgbm["lambda_l1"] == 0.5
+    assert lightgbm["lambda_l2"] == 1.0
+    assert lightgbm["feature_fraction"] == 0.7
+    assert lightgbm["bagging_fraction"] == 0.8
+
+    xgboost = _model_spec({"kind": "xgboost", "params": {}})["params"]
+    assert xgboost["max_depth"] == 4
+    assert xgboost["subsample"] == 0.7
+    assert xgboost["colsample_bytree"] == 0.65
+    assert xgboost["reg_alpha"] == 0.5
+    assert xgboost["reg_lambda"] == 2.0
+    assert xgboost["min_child_weight"] == 100.0
+
+    catboost = _model_spec({"kind": "catboost", "params": {}})["params"]
+    assert catboost["random_strength"] == 1.5
+    assert catboost["bagging_temperature"] == 0.8
+    assert catboost["od_wait"] == 100
+
+    assert _model_spec({"kind": "linear", "params": {}})["params"]["alpha"] == 3.0
+    mlp = _model_spec({
+        "kind": "mlp", "params": {"hidden_size": 128, "layer_count": 3},
+    })["params"]
+    assert mlp["hidden_size"] == 128
+    assert mlp["layer_count"] == 3
+
+    gru = _model_spec({"kind": "gru", "params": {}})["params"]
+    expected_gru = {
+        "learning_rate": 0.001,
+        "lookback_window": 20,
+        "hidden_size": 64,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "max_steps": 200,
+        "batch_size": 4000,
+    }
+    assert {key: gru[key] for key in expected_gru} == expected_gru
+    transformer = _model_spec({"kind": "transformer", "params": {}})["params"]
+    assert transformer["learning_rate"] == 0.0001
+    assert transformer["lookback_window"] == 20
+    assert transformer["batch_size"] == 4000
+    assert _model_spec({"kind": "tabnet", "params": {}})["params"][
+        "learning_rate"
+    ] == 0.005
+    tcn = _model_spec({"kind": "tcn", "params": {}})["params"]
+    assert tcn["hidden_size"] == 128
+    assert tcn["num_layers"] == 2
+    assert tcn["dropout"] == 0.2
+    assert _model_spec({"kind": "nativetft", "params": {}})["params"][
+        "learning_rate"
+    ] == 0.0005
 
 
 def test_next_ablation_inherits_selected_parent_and_freezes_lineage_budget() -> None:

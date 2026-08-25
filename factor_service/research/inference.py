@@ -17,6 +17,7 @@ from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.research.trainer import (
+    QlibStackingModel,
     SEQUENCE_MODEL_KINDS,
     TrainingResult,
     predict_feature_frame,
@@ -85,10 +86,17 @@ class DailyInferenceRunner:
             "csi300": "沪深300", "csi500": "中证500", "csi800": "中证800",
             "csi1000": "中证1000", "all_a": "全A",
         }.get(universe_id, universe_id)
-        if model_kind in {"lstm", "transformer_lstm"}:
-            lookback_window = int(
-                dict(training_manifest.get("model_params") or {}).get("lookback_window") or 60
-            )
+        if model_kind in SEQUENCE_MODEL_KINDS or model_kind == "stacking":
+            model_params = dict(training_manifest.get("model_params") or {})
+            if model_kind == "stacking":
+                lookback_window = max([
+                    int(dict(item.get("params") or {}).get("lookback_window") or 1)
+                    for item in model_params.get("base_models") or []
+                    if str(item.get("kind") or "") in SEQUENCE_MODEL_KINDS
+                ] or [1])
+            else:
+                lookback_window = int(model_params.get("lookback_window") or 60)
+        if lookback_window > 1:
             try:
                 sequence_dates = self.dataset_builder.trading_dates_ending_at(
                     trade_date, lookback_window,
@@ -160,7 +168,30 @@ class DailyInferenceRunner:
         _progress(progress, "inferencing", 68, {"row_count": len(features)})
         sequence_coverage: float | None = None
         try:
-            if model_kind in SEQUENCE_MODEL_KINDS:
+            if model_kind == "stacking":
+                if not isinstance(model, QlibStackingModel):
+                    raise ValueError("Stacking模型产物类型无效")
+                predictions = _predict_stacking(
+                    model,
+                    features=features,
+                    feature_names=expected_names,
+                    trade_date=trade_date,
+                )
+                raw = predictions["raw_prediction"].to_numpy(dtype=float)
+                target_count = (
+                    2 if research_target == "market_style"
+                    else int(features.loc[
+                        features["trade_date"] == pd.Timestamp(trade_date),
+                        "instrument",
+                    ].nunique()) if research_target == "industry_rotation"
+                    else max(1, target_membership["instrument"].nunique())
+                )
+                sequence_coverage = len(predictions) / target_count
+                if sequence_coverage < minimum:
+                    raise ValueError(
+                        f"Stacking共同预测覆盖率{sequence_coverage:.2%}低于阈值"
+                    )
+            elif model_kind in SEQUENCE_MODEL_KINDS:
                 from qlib.data.dataset import DataHandlerLP, TSDatasetH
 
                 sequence_frame = features.set_index(["trade_date", "instrument"])[expected_names]
@@ -280,6 +311,70 @@ class DailyInferenceRunner:
             artifacts=[("inference_predictions", predictions_path), ("inference_manifest", manifest_path)],
             predictions_path=predictions_path,
         )
+
+
+def _predict_stacking(
+    model: QlibStackingModel,
+    *,
+    features: pd.DataFrame,
+    feature_names: list[str],
+    trade_date: str,
+) -> pd.DataFrame:
+    from qlib.data.dataset import DataHandlerLP, TSDatasetH
+
+    target_date = pd.Timestamp(trade_date)
+    date_values = pd.to_datetime(features["trade_date"])
+    target = features.loc[date_values == target_date].copy()
+    if target.empty:
+        raise ValueError(f"{trade_date}没有可用于Stacking推理的目标截面")
+    target_index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(target["trade_date"]),
+            target["instrument"].astype(str),
+        ],
+        names=["datetime", "instrument"],
+    )
+    base_predictions: dict[str, pd.Series] = {}
+    sequence_frame: pd.DataFrame | None = None
+    for item in model.base_models:
+        kind = str(item.get("kind") or "").strip().lower()
+        base_model = item.get("model")
+        params = dict(item.get("params") or {})
+        if kind in SEQUENCE_MODEL_KINDS:
+            if sequence_frame is None:
+                sequence_frame = features.set_index(
+                    ["trade_date", "instrument"],
+                )[feature_names]
+                sequence_frame.index.names = ["datetime", "instrument"]
+                sequence_frame.columns = pd.MultiIndex.from_tuples(
+                    [("feature", name) for name in feature_names]
+                )
+            dataset = TSDatasetH(
+                handler=DataHandlerLP.from_df(sequence_frame),
+                segments={"infer": (trade_date, trade_date)},
+                step_len=int(params.get("lookback_window") or 60),
+            )
+            base_predictions[kind] = base_model.predict(
+                dataset, segment="infer",
+            ).rename(kind)
+        else:
+            values = predict_feature_frame(
+                base_model, kind, target[feature_names],
+            )
+            base_predictions[kind] = pd.Series(
+                np.asarray(values, dtype=float).reshape(-1),
+                index=target_index,
+                name=kind,
+            )
+    aligned = pd.concat(base_predictions, axis=1, join="inner").dropna()
+    if aligned.empty:
+        raise ValueError("Stacking基模型没有共同有效的当日预测")
+    raw = model.combine([
+        aligned[item["kind"]].to_numpy(dtype=float) for item in model.base_models
+    ])
+    result = pd.Series(raw, index=aligned.index, name="raw_prediction").reset_index()
+    result.rename(columns={"instrument": "entity_code"}, inplace=True)
+    return result
 
 
 def _load_bundle(path: Path) -> tuple[Any, dict[str, Any]]:
