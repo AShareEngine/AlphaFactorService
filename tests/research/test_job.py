@@ -21,6 +21,7 @@ from factor_service.research.job import (
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
+from factor_service.research.preprocessing import normalize_feature_preprocessing
 from factor_service.research.state import JobStateStore
 from tests.research.utils import valid_inference_job, valid_job
 
@@ -82,6 +83,45 @@ def test_job_validation_accepts_and_validates_sample_filters() -> None:
         _canonical_json(source["dataset_spec"]).encode("utf-8")
     ).hexdigest()
     with pytest.raises(PermanentJobError, match="exclude_st必须是布尔值"):
+        validate_job(source)
+
+
+def test_job_validation_requires_normalized_preprocessing_for_v6() -> None:
+    source = valid_job()
+    preprocessing = normalize_feature_preprocessing(
+        {"enabled": True}, default_enabled=False,
+    )
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["pipeline_version"] = "alphablocks.dataset-pipeline.v6"
+        target["preprocessing"] = deepcopy(preprocessing)
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    validated = validate_job(source)
+
+    assert validated["dataset_spec"]["preprocessing"] == preprocessing
+
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target.pop("preprocessing")
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="v6数据集缺少"):
+        validate_job(source)
+
+
+def test_job_validation_rejects_partial_preprocessing_contract() -> None:
+    source = valid_job()
+    partial = {"enabled": True}
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["pipeline_version"] = "alphablocks.dataset-pipeline.v6"
+        target["preprocessing"] = deepcopy(partial)
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(PermanentJobError, match="不是规范化冻结规格"):
         validate_job(source)
 
 

@@ -22,7 +22,6 @@ class _Repository:
         self.registry_payload = None
         self.deleted_payload = None
         self.architectures = {}
-        self.research_templates = {}
 
     def list_jobs(
         self, *, status, experiment_id="", kind="", model_id="",
@@ -81,41 +80,6 @@ class _Repository:
         }
         self.architectures[architecture["architecture_id"]] = architecture
         return dict(architecture)
-
-    def create_research_template(self, payload):
-        template = {
-            **payload,
-            "template_id": "research-template-created",
-            "state": "active",
-            "revision": 1,
-            "config_hash": "frozen-config-hash",
-        }
-        self.research_templates[template["template_id"]] = template
-        return dict(template)
-
-    def list_research_templates(self, *, state, limit):
-        templates = list(self.research_templates.values())
-        if state != "all":
-            templates = [item for item in templates if item["state"] == state]
-        return templates[:limit]
-
-    def get_research_template(self, template_id):
-        return dict(self.research_templates[template_id])
-
-    def update_research_template(self, template_id, payload):
-        template = {
-            **self.research_templates[template_id],
-            **payload,
-            "template_id": template_id,
-            "revision": int(self.research_templates[template_id]["revision"]) + 1,
-        }
-        self.research_templates[template_id] = template
-        return dict(template)
-
-    def archive_research_template(self, template_id):
-        self.research_templates[template_id]["state"] = "archived"
-        self.research_templates[template_id]["revision"] += 1
-        return dict(self.research_templates[template_id])
 
     def list_model_architectures(self, *, limit):
         return list(self.architectures.values())[:limit]
@@ -726,44 +690,22 @@ def test_removed_page_only_experiment_and_scheduler_endpoints_return_404(
     ).status_code == 404
 
 
-def test_research_template_crud_routes(monkeypatch) -> None:
-    repository = _Repository()
-    client = _client(monkeypatch, repository, _Scheduler())
-    payload = {
-        "name": "中证500 LGBM 基线",
-        "description": "冻结研究配置",
-        "training": {
-            "title": "中证500 LGBM",
-            "dataset": {"factors": [{"factor_id": "mom_20"}]},
-            "model": {"kind": "lightgbm", "params": {}},
-            "research_design": {"mode": "single", "search": {}},
-        },
-    }
+def test_removed_research_template_routes_return_404(monkeypatch) -> None:
+    client = _client(monkeypatch, _Repository(), _Scheduler())
 
-    created = client.post("/model-research/research-templates", json=payload)
-    assert created.status_code == 201
-    template_id = created.json()["template"]["template_id"]
-
-    listed = client.get("/model-research/research-templates")
-    assert listed.status_code == 200
-    assert listed.json()["templates"][0]["template_id"] == template_id
-
-    loaded = client.get(f"/model-research/research-templates/{template_id}")
-    assert loaded.status_code == 200
-    assert loaded.json()["template"]["config_hash"] == "frozen-config-hash"
-
-    updated = client.put(
-        f"/model-research/research-templates/{template_id}",
-        json={**payload, "name": "中证500 LGBM 基线 v2", "revision": 1},
-    )
-    assert updated.status_code == 200
-    assert updated.json()["template"]["revision"] == 2
-
-    archived = client.post(
-        f"/model-research/research-templates/{template_id}/archive",
-    )
-    assert archived.status_code == 200
-    assert archived.json()["template"]["state"] == "archived"
+    assert client.get("/model-research/research-templates").status_code == 404
+    assert client.post(
+        "/model-research/research-templates", json={"name": "已删除"},
+    ).status_code == 404
+    assert client.get(
+        "/model-research/research-templates/template-1",
+    ).status_code == 404
+    assert client.put(
+        "/model-research/research-templates/template-1", json={"name": "已删除"},
+    ).status_code == 404
+    assert client.post(
+        "/model-research/research-templates/template-1/archive",
+    ).status_code == 404
 
 
 def test_incremental_training_precheck_route_is_server_authoritative(monkeypatch) -> None:

@@ -21,6 +21,11 @@ from factor_service.entity_field_feature import (
 from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.preprocessing import (
+    LEGACY_DATASET_PIPELINE_VERSIONS,
+    normalize_feature_preprocessing,
+    preprocess_feature_panel,
+)
 from factor_service.research.sample_filter_formula import (
     compile_sample_filter_formula,
     normalize_custom_sample_filters,
@@ -217,7 +222,16 @@ class DatasetBuilder:
             raise ValueError("data_cutoff不得早于训练结束日收盘时间")
         feature_frames: list[pd.DataFrame] = []
         feature_names: list[str] = []
+        preprocessing_excluded_features: list[str] = []
         coverage: dict[str, float] = {}
+        preprocessing = normalize_feature_preprocessing(
+            spec.get("preprocessing"), default_enabled=False,
+        )
+        legacy_labeled_panel_medians = (
+            spec.get("preprocessing") is None
+            and str(spec.get("pipeline_version") or "")
+            in LEGACY_DATASET_PIPELINE_VERSIONS
+        )
         _checkpoint(cancellation)
         _progress(progress, "building_membership", 6, {})
         universe_id = str(spec.get("universe_id") or "csi500")
@@ -236,9 +250,11 @@ class DatasetBuilder:
             _progress(progress, "loading_factors", 8 + int(26 * (index - 1) / len(factors)), {
                 "factor_id": name, "factor_index": index, "factor_count": len(factors),
             })
+            factor = self._factor_definition(item)
             frame = self._factor_values(
                 item, cutoff_for_clickhouse, date_start, date_end,
                 cancellation=cancellation,
+                resolved_factor=factor,
             )
             frame = frame.merge(expected, on=["trade_date", "instrument"], how="inner")
             actual_coverage = frame[["trade_date", "instrument"]].drop_duplicates().shape[0] / expected_count
@@ -247,6 +263,10 @@ class DatasetBuilder:
                 raise ValueError(f"因子{name}覆盖率{actual_coverage:.2%}低于80%")
             feature_name = _feature_name(item)
             feature_names.append(feature_name)
+            if str(factor.output_type or "").strip().lower() in {
+                "boolean", "category",
+            }:
+                preprocessing_excluded_features.append(feature_name)
             feature_frames.append(frame.rename(columns={"value": feature_name}))
         _checkpoint(cancellation)
         features = expected.copy()
@@ -275,9 +295,6 @@ class DatasetBuilder:
                 prices, style_membership, horizon=horizon,
                 classification=classification,
             )
-            panel = features.merge(
-                labels, on=["trade_date", "instrument"], how="inner",
-            )
             target_contract = {
                 "research_target": "market_style",
                 "prediction_scope": "market_style",
@@ -302,9 +319,6 @@ class DatasetBuilder:
                 prices, industry_membership, horizon=horizon,
                 classification=classification,
             )
-            panel = features.merge(
-                labels, on=["trade_date", "instrument"], how="inner",
-            )
             target_contract = {
                 "research_target": "industry_rotation",
                 "prediction_scope": "industry",
@@ -324,9 +338,6 @@ class DatasetBuilder:
                 if classification
                 else _future_rank_label(prices, horizon=horizon)
             )
-            panel = features.merge(
-                labels, on=["trade_date", "instrument"], how="inner",
-            )
             target_contract = {
                 "research_target": "stock_selection",
                 "prediction_scope": "stock",
@@ -340,8 +351,16 @@ class DatasetBuilder:
             }
         else:
             raise ValueError(f"训练目标{research_target}尚不可用")
-        panel.sort_values(["trade_date", "instrument"], inplace=True)
-        trading_dates = pd.Index(sorted(panel["trade_date"].unique()))
+        # Labels only determine which rows can train the model.  They must not
+        # determine the daily feature cross-section: whether T+N is available
+        # is future information and inference sees the complete signal-date
+        # universe.  Split dates are derived from trainable rows, while all
+        # preprocessing statistics below are fitted on the feature universe.
+        raw_panel = features.merge(
+            labels, on=["trade_date", "instrument"], how="inner",
+        )
+        raw_panel.sort_values(["trade_date", "instrument"], inplace=True)
+        trading_dates = pd.Index(sorted(raw_panel["trade_date"].unique()))
         split_config = dict(spec.get("split") or {})
         segments = split_trading_dates(
             trading_dates,
@@ -351,10 +370,21 @@ class DatasetBuilder:
         )
         _progress(progress, "splitting_dataset", 52, {"segments": segments})
         train_start, train_end = segments["train"]
-        train_mask = panel["trade_date"].between(pd.Timestamp(train_start), pd.Timestamp(train_end))
+        median_source = raw_panel if legacy_labeled_panel_medians else features
+        train_mask = median_source["trade_date"].between(
+            pd.Timestamp(train_start), pd.Timestamp(train_end),
+        )
         if classification:
             train_classes = set(
-                pd.to_numeric(panel.loc[train_mask, "LABEL0"], errors="coerce")
+                pd.to_numeric(
+                    raw_panel.loc[
+                        raw_panel["trade_date"].between(
+                            pd.Timestamp(train_start), pd.Timestamp(train_end),
+                        ),
+                        "LABEL0",
+                    ],
+                    errors="coerce",
+                )
                 .dropna()
                 .astype(int)
                 .unique()
@@ -363,22 +393,39 @@ class DatasetBuilder:
             if train_classes != {0, 1}:
                 raise ValueError("分类目标训练段必须同时包含上涨和下跌样本")
         medians = {
-            name: float(pd.to_numeric(panel.loc[train_mask, name], errors="coerce").median())
+            name: float(
+                pd.to_numeric(median_source.loc[train_mask, name], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .median()
+            )
             for name in feature_names
         }
         if any(not np.isfinite(value) for value in medians.values()):
             missing = [name for name, value in medians.items() if not np.isfinite(value)]
             raise ValueError("训练段无法计算因子中位数: " + ", ".join(missing))
         _checkpoint(cancellation)
-        raw_indexed = panel.set_index(["trade_date", "instrument"])
+        processed_features = preprocess_feature_panel(
+            features,
+            feature_names,
+            preprocessing,
+            fallback_values=medians,
+            excluded_features=preprocessing_excluded_features,
+        )
+        panel = processed_features.merge(
+            labels, on=["trade_date", "instrument"], how="inner",
+        )
+        panel.sort_values(["trade_date", "instrument"], inplace=True)
+        raw_indexed = raw_panel.set_index(["trade_date", "instrument"])
         raw_indexed.index.names = ["datetime", "instrument"]
         raw_indexed = raw_indexed[feature_names + ["LABEL0"]]
         raw_indexed.columns = pd.MultiIndex.from_tuples(
             [("feature", name) for name in feature_names] + [("label", "LABEL0")]
         )
-        indexed = raw_indexed.copy()
-        indexed.loc[:, pd.IndexSlice["feature", :]] = (
-            indexed.loc[:, pd.IndexSlice["feature", :]].fillna(medians)
+        indexed = panel.set_index(["trade_date", "instrument"])
+        indexed.index.names = ["datetime", "instrument"]
+        indexed = indexed[feature_names + ["LABEL0"]]
+        indexed.columns = pd.MultiIndex.from_tuples(
+            [("feature", name) for name in feature_names] + [("label", "LABEL0")]
         )
         future_function_guards = [
             "factor definitions and parameters frozen before materialization",
@@ -386,8 +433,24 @@ class DatasetBuilder:
             "data_cutoff >= final signal date close",
             "historical index membership",
             "five session split embargo",
-            "preprocessors fitted on train only",
         ]
+        if preprocessing["enabled"]:
+            future_function_guards.append(
+                "same-date cross-sectional median, 1/99 winsorization and z-score only"
+            )
+            future_function_guards.append(
+                "feature cross-sections frozen before future labels are joined"
+            )
+            if preprocessing_excluded_features:
+                future_function_guards.append(
+                    "boolean/category features excluded from cross-sectional scaling and filled by train medians"
+                )
+        else:
+            future_function_guards.append("missing values filled by train-only medians")
+            if legacy_labeled_panel_medians:
+                future_function_guards.append(
+                    "legacy v1-v5 train medians fitted on label-available rows for hash-compatible rebuild"
+                )
         sample_filters = dict(spec.get("sample_filters") or {})
         if sample_filters:
             future_function_guards.append(
@@ -413,6 +476,15 @@ class DatasetBuilder:
             "feature_names": feature_names,
             "coverage": coverage,
             "medians": medians,
+            "preprocessing": preprocessing,
+            "preprocessing_stage": "training_universe_after_factor_score",
+            "preprocessing_compatibility": (
+                "legacy_labeled_panel_train_medians"
+                if legacy_labeled_panel_medians else "current"
+            ),
+            "preprocessing_excluded_features": sorted(
+                preprocessing_excluded_features,
+            ),
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "target_contract": target_contract,
@@ -877,6 +949,7 @@ class DatasetBuilder:
         date_end: str,
         *,
         cancellation: CancellationToken | None = None,
+        resolved_factor: FactorOut | None = None,
     ) -> pd.DataFrame:
         signal_close = datetime.combine(
             pd.Timestamp(date_end).date(), datetime.min.time(),
@@ -884,16 +957,7 @@ class DatasetBuilder:
         if cutoff < signal_close:
             raise ValueError(f"因子{item['factor_id']}的数据截止时间早于信号日收盘")
         entity_field = is_entity_field_feature(item)
-        if entity_field:
-            factor = virtual_entity_field_factor(item)
-        else:
-            factor = factor_repository.get_factor(
-                str(item["factor_id"]), version=int(item["factor_version"]),
-            )
-            if factor is None:
-                raise ValueError(
-                    f"冻结因子不存在: {item['factor_id']} v{item['factor_version']}"
-                )
+        factor = resolved_factor or self._factor_definition(item)
         params = item.get("params")
         if not isinstance(params, dict):
             raise ValueError(f"冻结因子{item['factor_id']}缺少params")
@@ -950,6 +1014,19 @@ class DatasetBuilder:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
             frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
         return frame
+
+    @staticmethod
+    def _factor_definition(item: dict[str, Any]) -> FactorOut:
+        if is_entity_field_feature(item):
+            return virtual_entity_field_factor(item)
+        factor = factor_repository.get_factor(
+            str(item["factor_id"]), version=int(item["factor_version"]),
+        )
+        if factor is None:
+            raise ValueError(
+                f"冻结因子不存在: {item['factor_id']} v{item['factor_version']}"
+            )
+        return factor
 
     def _adjusted_close(self, instruments: list[str], date_start: str, date_end: str) -> pd.DataFrame:
         rows = self.client.query(

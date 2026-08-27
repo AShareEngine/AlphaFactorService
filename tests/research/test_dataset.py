@@ -332,6 +332,85 @@ def test_dataset_build_checks_cancellation_before_clickhouse_query() -> None:
         builder.build(valid_job(), cancellation=cancellation)
 
 
+def test_feature_cross_section_is_independent_of_future_label_availability(
+    monkeypatch,
+) -> None:
+    dates = pd.date_range("2024-01-02", periods=100, freq="B")
+    instruments = [f"S{index:02d}" for index in range(10)]
+    membership = pd.DataFrame([
+        {"trade_date": day, "instrument": code}
+        for day in dates
+        for code in instruments
+    ])
+    factor_values = membership.copy()
+    factor_values["value"] = [float(index) for index in range(len(membership))]
+    factor_values.loc[
+        (factor_values["trade_date"] == dates[20])
+        & (factor_values["instrument"] == instruments[0]),
+        "value",
+    ] = float("nan")
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace()
+    builder._membership = lambda *_args, **_kwargs: membership.copy()
+    builder._factor_definition = lambda _item: SimpleNamespace(output_type="number")
+    builder._factor_values = lambda *_args, **_kwargs: factor_values.copy()
+    builder._adjusted_close = lambda *_args, **_kwargs: pd.DataFrame()
+    missing_label = {"enabled": False}
+    affected_date = dates[10]
+
+    def fake_labels(_prices, *, horizon):
+        assert horizon == 5
+        labels = membership.copy()
+        labels["LABEL0"] = 0.0
+        if missing_label["enabled"]:
+            labels = labels.loc[~(
+                (labels["trade_date"] == affected_date)
+                & (labels["instrument"] == instruments[-1])
+            )]
+        return labels
+
+    monkeypatch.setattr(dataset_module, "_future_rank_label", fake_labels)
+    job = valid_job()
+    job["dataset_spec"].update({
+        "date_start": dates[0].date().isoformat(),
+        "date_end": dates[-1].date().isoformat(),
+        "preprocessing": {"enabled": True},
+        "target_mode": "return",
+        "research_target": "stock_selection",
+    })
+
+    complete = builder.build(job)
+    missing_label["enabled"] = True
+    incomplete = builder.build(job)
+
+    feature = complete.feature_names[0]
+    common_index = (affected_date, instruments[0])
+    assert incomplete.frame.loc[common_index, ("feature", feature)] == pytest.approx(
+        complete.frame.loc[common_index, ("feature", feature)],
+    )
+    assert len(complete.frame) == len(incomplete.frame) + 1
+
+    # Rebuilding an old hash must retain its original labeled-panel median
+    # semantics, even though v6 fixes that historical limitation.
+    legacy_job = valid_job()
+    legacy_job["dataset_spec"].update({
+        "pipeline_version": "alphablocks.dataset-pipeline.v5",
+        "date_start": dates[0].date().isoformat(),
+        "date_end": dates[-1].date().isoformat(),
+        "target_mode": "return",
+        "research_target": "stock_selection",
+    })
+    missing_label["enabled"] = False
+    legacy_complete = builder.build(legacy_job)
+    missing_label["enabled"] = True
+    legacy_incomplete = builder.build(legacy_job)
+
+    assert legacy_complete.manifest["preprocessing_compatibility"] == (
+        "legacy_labeled_panel_train_medians"
+    )
+    assert legacy_complete.medians[feature] != legacy_incomplete.medians[feature]
+
+
 def test_sample_filters_apply_listing_age_and_daily_stock_status() -> None:
     class _Client:
         def query(self, query, parameters):

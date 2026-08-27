@@ -20,6 +20,10 @@ from factor_service.research.errors import (
     TrainingTimeout,
     WorkerShutdown,
 )
+from factor_service.research.preprocessing import (
+    DATASET_PIPELINE_VERSION,
+    normalize_feature_preprocessing,
+)
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
@@ -186,6 +190,23 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
                 raise PermanentJobError(
                     "sample_filters.custom_formulas不是规范化冻结规格"
                 )
+    preprocessing = spec.get("preprocessing")
+    pipeline_version = str(spec.get("pipeline_version") or "")
+    if preprocessing is None:
+        if pipeline_version == DATASET_PIPELINE_VERSION:
+            raise PermanentJobError("v6数据集缺少冻结的preprocessing规格")
+    else:
+        if not isinstance(preprocessing, dict):
+            raise PermanentJobError("dataset_spec.preprocessing必须是对象")
+        try:
+            normalized_preprocessing = normalize_feature_preprocessing(
+                preprocessing,
+                default_enabled=False,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+        if normalized_preprocessing != preprocessing:
+            raise PermanentJobError("dataset_spec.preprocessing不是规范化冻结规格")
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")

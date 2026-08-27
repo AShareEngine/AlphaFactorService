@@ -25,6 +25,10 @@ from factor_service.research.dataset import (
     walk_forward_segments,
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.preprocessing import (
+    normalize_feature_preprocessing,
+    preprocess_qlib_frame,
+)
 from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.training_diagnostics import build_training_diagnostics
 
@@ -680,7 +684,11 @@ def _walk_forward_frame(
         pd.IndexSlice[train_start:train_end, :], pd.IndexSlice["feature", :]
     ]
     medians = {
-        name: float(pd.to_numeric(train_features[("feature", name)], errors="coerce").median())
+        name: float(
+            pd.to_numeric(train_features[("feature", name)], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .median()
+        )
         for name in prepared.feature_names
     }
     missing = [name for name, value in medians.items() if not np.isfinite(value)]
@@ -688,9 +696,25 @@ def _walk_forward_frame(
         raise ValueError("Walk-Forward训练段无法计算因子中位数: " + ", ".join(missing))
     window_start = segments["train"][0]
     window_end = segments["test"][1]
-    frame = raw_frame.loc[pd.IndexSlice[window_start:window_end, :], :].copy()
-    for name, value in medians.items():
-        frame[("feature", name)] = frame[("feature", name)].fillna(value)
+    window_raw = raw_frame.loc[
+        pd.IndexSlice[window_start:window_end, :], :
+    ].copy()
+    manifest = dict(getattr(prepared, "manifest", {}) or {})
+    preprocessing = normalize_feature_preprocessing(
+        manifest.get("preprocessing"), default_enabled=False,
+    )
+    frozen_frame = getattr(prepared, "frame", raw_frame)
+    processed_frame = frozen_frame.loc[
+        pd.IndexSlice[window_start:window_end, :], :
+    ].copy()
+    frame = _training_frame_for_preprocessing_contract(
+        window_raw,
+        processed_frame,
+        prepared.feature_names,
+        preprocessing,
+        fallback_values=medians,
+        excluded_features=manifest.get("preprocessing_excluded_features") or [],
+    )
     return frame, medians
 
 
@@ -762,6 +786,29 @@ def _incremental_prepared_dataset(
         raise ValueError(
             "增量训练来源模型缺少训练段中位数: " + ", ".join(missing_medians)
         )
+    source_preprocessing = normalize_feature_preprocessing(
+        source_manifest.get("preprocessing"), default_enabled=False,
+    )
+    candidate_manifest = dict(prepared.manifest or {})
+    candidate_preprocessing = normalize_feature_preprocessing(
+        candidate_manifest.get("preprocessing"), default_enabled=False,
+    )
+    source_excluded = sorted(
+        str(name)
+        for name in source_manifest.get("preprocessing_excluded_features") or []
+    )
+    candidate_excluded = sorted(
+        str(name)
+        for name in candidate_manifest.get("preprocessing_excluded_features") or []
+    )
+    if (
+        source_preprocessing != candidate_preprocessing
+        or (
+            source_preprocessing["enabled"] is True
+            and source_excluded != candidate_excluded
+        )
+    ):
+        raise ValueError("增量训练来源模型与新数据集的特征预处理口径不一致")
     source_end = pd.Timestamp(str(contract.get("source_date_end") or ""))
     dates = pd.to_datetime(raw_frame.index.get_level_values("datetime"))
     new_raw = raw_frame.loc[dates > source_end].copy()
@@ -774,15 +821,24 @@ def _incremental_prepared_dataset(
             f"增量训练新增有效交易日不足{minimum}天，当前只有{len(new_dates)}天"
         )
     segments = split_trading_dates(new_dates, embargo_days=max(1, int(horizon)))
-    frame = new_raw.copy()
-    for name in expected_features:
-        frame[("feature", name)] = frame[("feature", name)].fillna(
-            float(source_medians[name])
-        )
+    prepared_dates = pd.to_datetime(
+        prepared.frame.index.get_level_values("datetime"),
+    )
+    new_processed = prepared.frame.loc[prepared_dates > source_end].copy()
+    frame = _training_frame_for_preprocessing_contract(
+        new_raw,
+        new_processed,
+        expected_features,
+        source_preprocessing,
+        fallback_values=source_medians,
+        excluded_features=source_excluded,
+    )
     manifest = {
         **prepared.manifest,
         "segments": segments,
         "medians": {name: float(source_medians[name]) for name in expected_features},
+        "preprocessing": source_preprocessing,
+        "preprocessing_excluded_features": source_excluded,
         "incremental_training": {
             "mode": contract.get("mode"),
             "source_model_id": contract.get("source_model_id"),
@@ -790,7 +846,7 @@ def _incremental_prepared_dataset(
             "source_date_end": contract.get("source_date_end"),
             "new_trading_sessions": len(new_dates),
             "segments": segments,
-            "preprocessing": "reuse_source_train_medians",
+            "preprocessing": "reuse_source_preprocessing_contract",
         },
     }
     return PreparedDataset(
@@ -802,6 +858,52 @@ def _incremental_prepared_dataset(
         manifest=manifest,
         raw_frame=new_raw,
     )
+
+
+def _training_frame_for_preprocessing_contract(
+    raw_frame: pd.DataFrame,
+    processed_frame: pd.DataFrame,
+    feature_names: list[str],
+    preprocessing: dict[str, Any],
+    *,
+    fallback_values: dict[str, Any],
+    excluded_features: list[str],
+) -> pd.DataFrame:
+    """Build a training slice without recomputing numeric daily sections.
+
+    Enabled numeric features were transformed before labels were joined in the
+    immutable dataset snapshot. Recomputing them from ``raw_frame`` would let
+    future-label availability change the cross-section. Disabled preprocessing
+    remains the legacy train-median transform. Non-scaled categorical/boolean
+    features are refilled from the current training window/source contract.
+    """
+    if preprocessing["enabled"] is not True:
+        return preprocess_qlib_frame(
+            raw_frame,
+            feature_names,
+            preprocessing,
+            fallback_values=fallback_values,
+            excluded_features=excluded_features,
+        )
+    if not raw_frame.index.equals(processed_frame.index):
+        raise ValueError("冻结数据集的原始帧与预处理帧索引不一致")
+    frame = processed_frame.copy()
+    for name in excluded_features:
+        key = ("feature", name)
+        if key not in raw_frame.columns:
+            raise ValueError(f"冻结数据集缺少非缩放特征{name}")
+        values = pd.to_numeric(raw_frame[key], errors="coerce").astype(float)
+        values = values.where(np.isfinite(values), np.nan)
+        fallback = float(fallback_values.get(name, 0.0))
+        if not np.isfinite(fallback):
+            fallback = 0.0
+        frame[key] = values.fillna(fallback).to_numpy(dtype=np.float64)
+    matrix = frame.loc[:, pd.IndexSlice["feature", feature_names]].to_numpy(
+        dtype=np.float64,
+    )
+    if not np.isfinite(matrix).all():
+        raise ValueError("冻结数据集预处理切片仍包含非有限值")
+    return frame
 
 
 def _tree_count(model: Any | None) -> int:

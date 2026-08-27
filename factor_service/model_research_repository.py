@@ -21,6 +21,11 @@ from factor_service.entity_field_feature import (
 )
 from factor_service.model_validation import select_model_trial, select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
+from factor_service.research.preprocessing import (
+    DATASET_PIPELINE_VERSION,
+    LEGACY_DATASET_PIPELINE_VERSIONS,
+    normalize_feature_preprocessing,
+)
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
@@ -117,12 +122,36 @@ class ModelResearchConflict(ModelResearchError):
     pass
 
 
+def _training_dataset_source(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Read the dataset contract and bridge the retired context-only switch.
+
+    Preprocessing changes the immutable dataset contents, so new clients freeze
+    it below ``dataset``.  This one-way bridge keeps requests from the previous
+    training page working while ensuring the persisted config has one source of
+    truth and participates in ``dataset_hash``.
+    """
+    raw_dataset = payload.get("dataset") or {}
+    if not isinstance(raw_dataset, Mapping):
+        raise ModelResearchError("dataset必须是对象")
+    source = dict(raw_dataset)
+    if "preprocessing" in source:
+        return source
+    context = payload.get("context") or {}
+    if not isinstance(context, Mapping) or "preprocessing_enabled" not in context:
+        return source
+    enabled = context.get("preprocessing_enabled")
+    if not isinstance(enabled, bool):
+        raise ModelResearchError("context.preprocessing_enabled必须是布尔值")
+    source["preprocessing"] = {"enabled": enabled}
+    return source
+
+
 class ModelResearchRepository:
     def __init__(self, database: ControlDatabase | None = None) -> None:
         self.database = database or get_control_database()
 
     def create_training_job(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        spec = _dataset_spec(payload.get("dataset") or {})
+        spec = _dataset_spec(_training_dataset_source(payload))
         model = _model_spec(
             payload.get("model") or {}, target_mode=spec["target_mode"],
         )
@@ -252,7 +281,7 @@ class ModelResearchRepository:
     def incremental_training_precheck(
         self, model_id: str, version: int, payload: Mapping[str, Any],
     ) -> dict[str, Any]:
-        dataset = _dataset_spec(payload.get("dataset") or {})
+        dataset = _dataset_spec(_training_dataset_source(payload))
         model = _model_spec(
             payload.get("model") or {}, target_mode=dataset["target_mode"],
         )
@@ -385,7 +414,7 @@ class ModelResearchRepository:
         self, payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Create a parameter, label-horizon, or frozen-factor ablation study."""
-        dataset_source = dict(payload.get("dataset") or {})
+        dataset_source = _training_dataset_source(payload)
         walk_forward = _walk_forward_spec(payload.get("walk_forward") or {})
         model_source = dict(payload.get("model") or {})
         search = dict(payload.get("search") or {})
@@ -445,7 +474,9 @@ class ModelResearchRepository:
                 )
             if model_id != str(parent_job.get("model_id") or ""):
                 raise ModelResearchConflict("下一轮实验必须沿用父任务的model_id")
-            parent_dataset = _dataset_spec(parent_job.get("dataset_spec") or {})
+            parent_dataset = _historical_dataset_spec(
+                parent_job.get("dataset_spec") or {},
+            )
             child_dataset = _dataset_spec(dataset_source)
             if _canonical_json(child_dataset) != _canonical_json(parent_dataset):
                 raise ModelResearchConflict(
@@ -2225,141 +2256,6 @@ class ModelResearchRepository:
                 )
         return self.get_model_architecture(architecture_id)
 
-    def create_research_template(
-        self, payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        spec = _research_template_spec(payload)
-        template_id = _clean_identifier(
-            str(payload.get("template_id") or ""),
-            default=f"research_template_{uuid4().hex[:16]}",
-        )
-        config_hash = sha256(
-            _canonical_json(spec["training"]).encode("utf-8")
-        ).hexdigest()
-        now = _utcnow()
-        with self.database.connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO model_research_templates(
-                    template_id, name, description, state, revision,
-                    config_hash, config_json, created_at, updated_at
-                ) VALUES (%s, %s, %s, 'active', 1, %s, %s, %s, %s)
-                """,
-                (
-                    template_id, spec["name"], spec["description"],
-                    config_hash, Jsonb(spec), now, now,
-                ),
-            )
-        return self.get_research_template(template_id)
-
-    def list_research_templates(
-        self, *, state: str = "active", limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        normalized_state = str(state or "active").strip().lower()
-        if normalized_state not in {"active", "archived", "all"}:
-            raise ModelResearchError("研究模板state只支持active、archived或all")
-        conditions = []
-        values: list[Any] = []
-        if normalized_state != "all":
-            conditions.append("state = %s")
-            values.append(normalized_state)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        values.append(max(1, min(int(limit), 200)))
-        with self.database.connection() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT template_id
-                FROM model_research_templates
-                {where}
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                tuple(values),
-            ).fetchall()
-        return [
-            self.get_research_template(str(row["template_id"]))
-            for row in rows
-        ]
-
-    def get_research_template(self, template_id: str) -> dict[str, Any]:
-        with self.database.connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM model_research_templates WHERE template_id = %s",
-                (template_id,),
-            ).fetchone()
-        if not row:
-            raise ModelResearchNotFound("研究模板不存在")
-        config = dict(row.get("config_json") or {})
-        return _json_ready_mapping({
-            **config,
-            "template_id": str(row["template_id"]),
-            "name": str(row["name"]),
-            "description": str(row["description"]),
-            "state": str(row["state"]),
-            "revision": int(row["revision"]),
-            "config_hash": str(row["config_hash"]),
-            "created_at": row.get("created_at"),
-            "updated_at": row.get("updated_at"),
-        })
-
-    def update_research_template(
-        self, template_id: str, payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        spec = _research_template_spec(payload)
-        expected_revision = int(payload.get("revision") or 0)
-        if expected_revision <= 0:
-            raise ModelResearchError("更新研究模板必须提供revision")
-        config_hash = sha256(
-            _canonical_json(spec["training"]).encode("utf-8")
-        ).hexdigest()
-        now = _utcnow()
-        with self.database.connection() as conn:
-            with conn.transaction():
-                row = conn.execute(
-                    """
-                    SELECT state, revision
-                    FROM model_research_templates
-                    WHERE template_id = %s
-                    FOR UPDATE
-                    """,
-                    (template_id,),
-                ).fetchone()
-                if not row:
-                    raise ModelResearchNotFound("研究模板不存在")
-                if str(row["state"]) != "active":
-                    raise ModelResearchConflict("已归档研究模板不能修改")
-                if expected_revision != int(row["revision"]):
-                    raise ModelResearchConflict("研究模板已被其他请求修改，请刷新后重试")
-                conn.execute(
-                    """
-                    UPDATE model_research_templates
-                    SET name = %s, description = %s, revision = revision + 1,
-                        config_hash = %s, config_json = %s, updated_at = %s
-                    WHERE template_id = %s
-                    """,
-                    (
-                        spec["name"], spec["description"], config_hash,
-                        Jsonb(spec), now, template_id,
-                    ),
-                )
-        return self.get_research_template(template_id)
-
-    def archive_research_template(self, template_id: str) -> dict[str, Any]:
-        now = _utcnow()
-        with self.database.connection() as conn:
-            row = conn.execute(
-                """
-                UPDATE model_research_templates
-                SET state = 'archived', revision = revision + 1, updated_at = %s
-                WHERE template_id = %s AND state = 'active'
-                RETURNING template_id
-                """,
-                (now, template_id),
-            ).fetchone()
-        if not row:
-            raise ModelResearchNotFound("研究模板不存在或已归档")
-        return self.get_research_template(template_id)
-
     def list_model_architectures(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.database.connection() as conn:
             rows = conn.execute(
@@ -4090,6 +3986,14 @@ def _json_ready_mapping(source: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _historical_dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a persisted dataset without applying new-request defaults."""
+    historical = dict(source)
+    if historical.get("preprocessing") is None:
+        historical["preprocessing"] = {"enabled": False}
+    return _dataset_spec(historical)
+
+
 def _research_origin_spec(
     source: Mapping[str, Any],
     *,
@@ -4103,7 +4007,10 @@ def _research_origin_spec(
     walk_forward: Mapping[str, Any],
 ) -> dict[str, Any]:
     source_config = dict(source_job.get("config_json") or {})
-    source_dataset = _dataset_spec(source_job.get("dataset_spec") or {})
+    raw_source_dataset = dict(source_job.get("dataset_spec") or {})
+    source_dataset = _historical_dataset_spec(
+        raw_source_dataset,
+    )
     source_model = _model_spec(source_config.get("model") or {})
     source_walk_forward = _walk_forward_spec(
         source_config.get("walk_forward") or {}
@@ -4117,6 +4024,12 @@ def _research_origin_spec(
         name for name, (current, historical) in comparisons.items()
         if _canonical_json(current) != _canonical_json(historical)
     ]
+    if (
+        str(raw_source_dataset.get("pipeline_version") or "")
+        != str(dataset.get("pipeline_version") or DATASET_PIPELINE_VERSION)
+        and "dataset" not in changed_sections
+    ):
+        changed_sections.append("dataset")
     declared = source.get("declared_changes") or []
     if declared and not isinstance(declared, list):
         raise ModelResearchError("research_origin.declared_changes必须是数组")
@@ -4165,7 +4078,9 @@ def _incremental_training_assessment(
     model: Mapping[str, Any],
     walk_forward: Mapping[str, Any],
 ) -> dict[str, Any]:
-    source_dataset = _dataset_spec(source_model.get("dataset_spec") or {})
+    source_dataset = _historical_dataset_spec(
+        source_model.get("dataset_spec") or {},
+    )
     source_config = dict(source_model.get("job_config_json") or {})
     source_model_spec = _model_spec(source_config.get("model") or {})
     source_walk_forward = _walk_forward_spec(
@@ -4232,11 +4147,12 @@ def _incremental_training_assessment(
         },
         {
             "key": "target_contract",
-            "label": "股票池、样本过滤、研究目标和标签周期完全一致",
+            "label": "股票池、样本过滤、预处理、研究目标和标签周期完全一致",
             "passed": (
                 source_dataset.get("universe_id") == dataset.get("universe_id")
                 and source_dataset.get("index_code") == dataset.get("index_code")
                 and source_dataset.get("sample_filters") == dataset.get("sample_filters")
+                and source_dataset.get("preprocessing") == dataset.get("preprocessing")
                 and source_dataset.get("research_target") == dataset.get("research_target")
                 and source_dataset.get("prediction_scope") == dataset.get("prediction_scope")
                 and source_label == candidate_label
@@ -4302,87 +4218,6 @@ def _incremental_training_assessment(
         "failed_checks": failed,
         "checks": checks,
         "contract": contract,
-    }
-
-
-def _research_template_spec(source: Mapping[str, Any]) -> dict[str, Any]:
-    name = str(source.get("name") or "").strip()[:120]
-    if not name:
-        raise ModelResearchError("研究模板名称不能为空")
-    training_source = source.get("training")
-    if not isinstance(training_source, Mapping):
-        raise ModelResearchError("研究模板缺少training配置")
-    dataset = _dataset_spec(training_source.get("dataset") or {})
-    model = _model_spec(training_source.get("model") or {})
-    walk_forward = _walk_forward_spec(training_source.get("walk_forward") or {})
-    execution = _execution_spec(training_source.get("execution") or {})
-    design_source = training_source.get("research_design") or {}
-    if not isinstance(design_source, Mapping):
-        raise ModelResearchError("research_design必须是对象")
-    mode = str(design_source.get("mode") or "single").strip().lower()
-    if mode not in {"single", "grid", "horizon_grid", "factor_ablation"}:
-        raise ModelResearchError(
-            "研究模板mode只支持single、grid、horizon_grid或factor_ablation"
-        )
-    search_source = design_source.get("search") or {}
-    if not isinstance(search_source, Mapping):
-        raise ModelResearchError("research_design.search必须是对象")
-    if mode == "single":
-        search: dict[str, Any] = {}
-    elif mode == "grid":
-        normalized_parameters = {
-            str(key): list(values) if isinstance(values, list) else values
-            for key, values in sorted(
-                dict(search_source.get("parameters") or {}).items(),
-                key=lambda item: str(item[0]),
-            )
-        }
-        search = {
-            "strategy": "grid",
-            "parameters": normalized_parameters,
-            "max_trials": max(
-                1,
-                min(
-                    int(search_source.get("max_trials") or MAX_EXPERIMENT_TRIALS),
-                    MAX_EXPERIMENT_TRIALS,
-                ),
-            ),
-        }
-        _grid_search_trials(model, search)
-    elif mode == "horizon_grid":
-        horizons = _horizon_search_values(search_source)
-        search = {
-            "strategy": "horizon_grid",
-            "horizons": horizons,
-            "max_trials": len(horizons),
-        }
-    else:
-        trials = _factor_ablation_trials(dataset, search_source)
-        factor_ids = [
-            str(item["search_params"]["removed_factor_id"])
-            for item in trials[1:]
-        ]
-        search = {
-            "strategy": "factor_ablation",
-            "factor_ids": factor_ids,
-            "max_trials": len(factor_ids) + 1,
-        }
-    model_id = _clean_identifier(str(training_source.get("model_id") or ""))
-    training = {
-        "schema_version": "alphablocks.model-training-template.v1",
-        "title": str(training_source.get("title") or name).strip()[:160],
-        "model_id": model_id,
-        "dataset": dataset,
-        "model": model,
-        "walk_forward": walk_forward,
-        "execution": execution,
-        "research_design": {"mode": mode, "search": search},
-    }
-    return {
-        "schema_version": "alphablocks.research-template.v1",
-        "name": name,
-        "description": str(source.get("description") or "").strip()[:1000],
-        "training": training,
     }
 
 
@@ -4592,16 +4427,34 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "custom_formulas": custom_formulas,
     }
+    raw_preprocessing = source.get("preprocessing")
+    legacy_without_preprocessing = (
+        raw_preprocessing is None
+        and str(source.get("pipeline_version") or "")
+        in LEGACY_DATASET_PIPELINE_VERSIONS
+    )
+    if raw_preprocessing is None:
+        raw_preprocessing = {}
+    if not isinstance(raw_preprocessing, Mapping):
+        raise ModelResearchError("preprocessing必须是对象")
+    try:
+        preprocessing = normalize_feature_preprocessing(
+            raw_preprocessing,
+            default_enabled=not legacy_without_preprocessing,
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
     return {
         # Part of the immutable dataset identity. Bump this whenever label or
         # feature materialization semantics change so an older canonical
         # snapshot can never be silently reused by a newly created job.
-        "pipeline_version": "alphablocks.dataset-pipeline.v5",
+        "pipeline_version": DATASET_PIPELINE_VERSION,
         "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
         "universe_id": universe_id,
         "index_code": index_code,
         "benchmark_code": benchmark_code,
         "sample_filters": sample_filters,
+        "preprocessing": preprocessing,
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,

@@ -16,6 +16,10 @@ from factor_service.research.config import Settings
 from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.preprocessing import (
+    normalize_feature_preprocessing,
+    preprocess_feature_panel,
+)
 from factor_service.research.trainer import (
     QlibStackingModel,
     SEQUENCE_MODEL_KINDS,
@@ -73,6 +77,28 @@ class DailyInferenceRunner:
             raise PermanentJobError(f"训练目标{research_target}尚不支持每日推理")
         expected_names = list(training_manifest.get("feature_names") or [])
         medians = dict(training_manifest.get("medians") or {})
+        preprocessing = normalize_feature_preprocessing(
+            training_manifest.get("preprocessing"), default_enabled=False,
+        )
+        preprocessing_excluded_features = [
+            str(name)
+            for name in training_manifest.get(
+                "preprocessing_excluded_features",
+            ) or []
+        ]
+        unknown_exclusions = sorted(
+            set(preprocessing_excluded_features) - set(expected_names)
+        )
+        if unknown_exclusions:
+            raise PermanentJobError(
+                "模型产物包含未知的非缩放特征: " + ", ".join(unknown_exclusions)
+            )
+        if dataset_spec.get("preprocessing") is not None:
+            requested_preprocessing = normalize_feature_preprocessing(
+                dataset_spec.get("preprocessing"), default_enabled=False,
+            )
+            if requested_preprocessing != preprocessing:
+                raise PermanentJobError("每日推理数据集与训练模型的特征预处理口径不一致")
         factors = list(job["dataset_spec"]["factors"])
         actual_names = [_feature_name(item) for item in factors]
         if actual_names != expected_names or any(name not in medians for name in expected_names):
@@ -161,9 +187,18 @@ class DailyInferenceRunner:
                 )
             except ValueError as exc:
                 raise PermanentJobError(str(exc)) from exc
-        features[expected_names] = features[expected_names].fillna({
-            name: float(medians[name]) for name in expected_names
-        })
+        try:
+            features = preprocess_feature_panel(
+                features,
+                expected_names,
+                preprocessing,
+                fallback_values={
+                    name: float(medians[name]) for name in expected_names
+                },
+                excluded_features=preprocessing_excluded_features,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
         if features[expected_names].isna().any().any():
             raise PermanentJobError("每日推理特征填充后仍有缺失值")
 
@@ -263,8 +298,13 @@ class DailyInferenceRunner:
             "inference data_cutoff >= signal date close",
             "historical index membership",
             "causal per-instrument history ending at signal date",
-            "training-fitted medians only",
         ]
+        if preprocessing["enabled"]:
+            future_function_guards.append(
+                "training-identical same-date cross-sectional median, 1/99 winsorization and z-score"
+            )
+        else:
+            future_function_guards.append("training-fitted medians only")
         if research_target == "industry_rotation":
             future_function_guards.append(
                 "exact-date SW2021 industry snapshots no earlier than 2021-12-13"
@@ -288,6 +328,12 @@ class DailyInferenceRunner:
             "coverage": coverages,
             "sequence_coverage": sequence_coverage,
             "medians_source": "training_manifest",
+            "preprocessing": preprocessing,
+            "preprocessing_stage": str(
+                training_manifest.get("preprocessing_stage")
+                or "training_universe_after_factor_score"
+            ),
+            "preprocessing_excluded_features": preprocessing_excluded_features,
             "row_count": len(predictions),
             "future_function_guards": future_function_guards,
             "created_at": computed_at.isoformat(),

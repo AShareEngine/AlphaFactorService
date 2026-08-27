@@ -10,6 +10,7 @@ import pandas as pd
 
 from factor_service.research.dataset import PreparedDataset
 from factor_service.research.models import _validation_indices
+from factor_service.research.preprocessing import normalize_feature_preprocessing
 from factor_service.research.trainer import (
     QlibStackingModel,
     _create_model,
@@ -358,7 +359,12 @@ def test_incremental_dataset_uses_only_new_dates_and_source_medians() -> None:
         feature_names=["factor__v1__hash"],
         coverage={"factor": 0.9},
         medians={"factor__v1__hash": 9.0},
-        manifest={"schema_version": "dataset"},
+        manifest={
+            "schema_version": "dataset",
+            # Exclusion metadata was introduced after legacy disabled models;
+            # it has no numerical effect while preprocessing is off.
+            "preprocessing_excluded_features": ["factor__v1__hash"],
+        },
         raw_frame=raw,
     )
 
@@ -736,6 +742,48 @@ def test_walk_forward_imputation_is_fitted_on_window_train_only() -> None:
 
     assert medians["factor"] == 1.0
     assert frame.loc[(dates[-1], "A"), ("feature", "factor")] == 1.0
+
+
+def test_walk_forward_reuses_prelabel_daily_cross_section() -> None:
+    dates = pd.date_range("2024-01-02", periods=12, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["A", "B"]], names=["datetime", "instrument"],
+    )
+    raw = pd.DataFrame(
+        {
+            ("feature", "factor"): np.tile([0.0, 100.0], len(dates)),
+            ("label", "LABEL0"): 0.0,
+        },
+        index=index,
+    )
+    frozen = raw.copy()
+    frozen[("feature", "factor")] = np.tile([-1.0, 1.0], len(dates))
+    prepared = PreparedDataset(
+        frame=frozen,
+        segments={},
+        feature_names=["factor"],
+        coverage={},
+        medians={"factor": 50.0},
+        manifest={
+            "preprocessing": normalize_feature_preprocessing(
+                {"enabled": True}, default_enabled=False,
+            ),
+            "preprocessing_excluded_features": [],
+        },
+        raw_frame=raw,
+    )
+    segments = {
+        "train": (dates[0].date().isoformat(), dates[4].date().isoformat()),
+        "valid": (dates[6].date().isoformat(), dates[7].date().isoformat()),
+        "test": (dates[9].date().isoformat(), dates[-1].date().isoformat()),
+    }
+
+    frame, _medians = _walk_forward_frame(prepared, segments)
+
+    pd.testing.assert_series_equal(
+        frame[("feature", "factor")],
+        frozen.loc[pd.IndexSlice[dates[0]:dates[-1], :], ("feature", "factor")],
+    )
 
 
 def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:

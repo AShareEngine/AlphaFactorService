@@ -16,12 +16,13 @@ from factor_service.model_research_repository import (
     _factor_ablation_trials,
     _grid_search_trials,
     _horizon_search_values,
+    _historical_dataset_spec,
     _incremental_training_assessment,
     _job_row,
     _model_spec,
     _model_payload_references,
     _research_origin_spec,
-    _research_template_spec,
+    _training_dataset_source,
     _walk_forward_spec,
 )
 
@@ -150,12 +151,31 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
-    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v5"
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v6"
     assert spec["sample_filters"] == {
         "minimum_listing_trading_days": 60,
         "exclude_st": True,
         "exclude_delisting": True,
         "custom_formulas": [],
+    }
+    assert spec["preprocessing"] == {
+        "schema_version": "alphablocks.cross-sectional-feature-preprocessing.v1",
+        "enabled": True,
+        "missing": {
+            "method": "cross_sectional_median",
+            "all_missing_value": 0.0,
+        },
+        "winsorize": {
+            "method": "quantile",
+            "lower": 0.01,
+            "upper": 0.99,
+            "minimum_observations": 10,
+        },
+        "standardize": {
+            "method": "zscore",
+            "ddof": 0,
+            "constant_value": 0.0,
+        },
     }
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
@@ -174,6 +194,50 @@ def test_dataset_contract_preserves_legacy_unfiltered_replay() -> None:
         "exclude_delisting": False,
         "custom_formulas": [],
     }
+    assert spec["preprocessing"]["enabled"] is False
+
+
+def test_dataset_contract_freezes_preprocessing_and_changes_identity() -> None:
+    enabled = _dataset_spec({
+        **_source(),
+        "preprocessing": {"enabled": True},
+    })
+    disabled = _dataset_spec({
+        **_source(),
+        "preprocessing": {"enabled": False},
+    })
+
+    assert enabled["preprocessing"]["enabled"] is True
+    assert disabled["preprocessing"]["enabled"] is False
+    assert enabled != disabled
+
+    with pytest.raises(ModelResearchError, match="enabled必须是布尔值"):
+        _dataset_spec({
+            **_source(),
+            "preprocessing": {"enabled": 1},
+        })
+
+
+def test_legacy_context_preprocessing_switch_is_moved_into_dataset() -> None:
+    source = _training_dataset_source({
+        "dataset": _source(),
+        "context": {"preprocessing_enabled": False},
+    })
+
+    assert source["preprocessing"] == {"enabled": False}
+    assert "preprocessing" not in _source()
+
+    explicit = _training_dataset_source({
+        "dataset": {**_source(), "preprocessing": {"enabled": True}},
+        "context": {"preprocessing_enabled": False},
+    })
+    assert explicit["preprocessing"] == {"enabled": True}
+
+
+def test_persisted_dataset_without_preprocessing_uses_legacy_disabled_mode() -> None:
+    historical = _historical_dataset_spec(_source())
+
+    assert historical["preprocessing"]["enabled"] is False
 
 
 def test_dataset_contract_validates_sample_filters() -> None:
@@ -523,66 +587,6 @@ def test_dataset_spec_rejects_invalid_split_ratios() -> None:
         _dataset_spec({**_source(), "split": {"valid": "high", "test": 0.2}})
 
 
-def test_research_template_freezes_complete_single_training_contract() -> None:
-    spec = _research_template_spec({
-        "name": "LGBM 基线",
-        "description": "固定因子和训练边界",
-        "training": {
-            "title": "中证500基线",
-            "model_id": "stock-ranker",
-            "dataset": _source(),
-            "model": {"kind": "lightgbm", "params": {"num_leaves": 31}},
-            "walk_forward": {"enabled": True, "strategy": "expanding"},
-            "research_design": {"mode": "single"},
-        },
-    })
-
-    assert spec["schema_version"] == "alphablocks.research-template.v1"
-    training = spec["training"]
-    assert training["dataset"]["factors"][0]["params_hash"] == "a" * 64
-    assert training["dataset"]["materialization"]["format"] == "parquet"
-    assert training["model"]["params"]["seed"] == 42
-    assert training["walk_forward"]["strategy"] == "expanding"
-    assert training["research_design"] == {"mode": "single", "search": {}}
-
-
-def test_research_template_validates_and_normalizes_research_design() -> None:
-    spec = _research_template_spec({
-        "name": "参数研究",
-        "training": {
-            "dataset": _source(),
-            "model": {"kind": "lightgbm", "params": {}},
-            "research_design": {
-                "mode": "grid",
-                "search": {
-                    "parameters": {
-                        "num_leaves": [15, 31],
-                        "learning_rate": [0.03, 0.05],
-                    },
-                    "max_trials": 6,
-                },
-            },
-        },
-    })
-
-    design = spec["training"]["research_design"]
-    assert design["mode"] == "grid"
-    assert list(design["search"]["parameters"]) == [
-        "learning_rate", "num_leaves",
-    ]
-    assert design["search"]["max_trials"] == 6
-
-    with pytest.raises(ModelResearchError, match="mode只支持"):
-        _research_template_spec({
-            "name": "非法模板",
-            "training": {
-                "dataset": _source(),
-                "model": {"kind": "lightgbm", "params": {}},
-                "research_design": {"mode": "bayesian"},
-            },
-        })
-
-
 def test_incremental_training_requires_exact_lightgbm_feature_contract() -> None:
     source = _trained_model(
         "stock-model", 1, validation_icir=0.5, model_kind="lightgbm",
@@ -631,6 +635,42 @@ def test_incremental_training_requires_exact_lightgbm_feature_contract() -> None
     )
     assert blocked["passed"] is False
     assert "feature_identity" in blocked["failed_checks"]
+
+
+def test_incremental_training_accepts_legacy_v5_disabled_preprocessing() -> None:
+    source = _trained_model(
+        "legacy-stock-model", 1, validation_icir=0.5, model_kind="lightgbm",
+    )
+    source.update({
+        "job_id": "model_job_legacy_source",
+        "state": "validated",
+        "dataset_hash": "e" * 64,
+    })
+    source["dataset_spec"] = {
+        **source["dataset_spec"],
+        "pipeline_version": "alphablocks.dataset-pipeline.v5",
+    }
+    source["dataset_spec"].pop("preprocessing")
+    candidate_dataset = _dataset_spec({
+        **_source(),
+        "date_end": "2025-01-02",
+        "data_cutoff": "2025-01-02T15:00:00+08:00",
+        "preprocessing": {"enabled": False},
+    })
+    assessment = _incremental_training_assessment(
+        source,
+        {
+            "artifact_id": "artifact-bundle",
+            "relative_path": "jobs/source/bundle.tar.gz",
+            "sha256": "b" * 64,
+            "file_name": "bundle.tar.gz",
+        },
+        dataset=candidate_dataset,
+        model=_model_spec({"kind": "lightgbm", "params": {}}),
+        walk_forward=_walk_forward_spec({}),
+    )
+
+    assert assessment["passed"] is True
 
 
 def test_dataset_contract_freezes_label_horizon_and_matching_embargo() -> None:
@@ -780,6 +820,32 @@ def test_research_origin_marks_identical_configuration_as_exact_replay() -> None
     assert result["changed_sections"] == []
     assert result["source_dataset_hash"] == "f" * 64
     assert len(result["source_config_hash"]) == 64
+
+
+def test_research_origin_does_not_call_legacy_pipeline_an_exact_replay() -> None:
+    source_job = _origin_source_job()
+    source_job["dataset_spec"] = {
+        **source_job["dataset_spec"],
+        "pipeline_version": "alphablocks.dataset-pipeline.v5",
+    }
+    source_job["dataset_spec"].pop("preprocessing")
+    candidate = _dataset_spec({
+        **_source(),
+        "preprocessing": {"enabled": False},
+    })
+
+    with pytest.raises(ModelResearchConflict, match="dataset"):
+        _research_origin_spec(
+            {"requested_mode": "exact_replay"},
+            source_type="model_version",
+            source_id="source-model.v2",
+            source_job=source_job,
+            source_model_id="source-model",
+            source_model_version=2,
+            dataset=candidate,
+            model=source_job["config_json"]["model"],
+            walk_forward=source_job["config_json"]["walk_forward"],
+        )
 
 
 def test_research_origin_rejects_changed_configuration_claiming_exact_replay() -> None:
