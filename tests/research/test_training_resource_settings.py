@@ -21,8 +21,8 @@ from factor_service.research.training_resource_settings import (
 def _configured_binding() -> dict:
     return {
         "enabled": True,
-        "source_type": "entity_asset",
-        "source_id": "asset_industry_membership",
+        "source_type": "node",
+        "source_id": "industry_membership_weight_real",
         "source_label": "行业成分与权重",
         "provider_node_id": "industry_membership_weight_real",
         "field_bindings": {
@@ -35,6 +35,14 @@ def _configured_binding() -> dict:
         },
         "industry_level_value": "1",
         "catalog_updated_at": "2026-08-27T00:00:00Z",
+    }
+
+
+def _legacy_entity_asset_binding() -> dict:
+    return {
+        **_configured_binding(),
+        "source_type": "entity_asset",
+        "source_id": "asset_industry_membership",
     }
 
 
@@ -85,10 +93,40 @@ def test_industry_binding_is_normalized_fingerprinted_and_frozen() -> None:
     assert normalize_frozen_training_data_binding(frozen) == frozen
 
 
+def test_legacy_active_entity_asset_binding_is_upgraded_to_provider_node() -> None:
+    settings = normalize_training_resource_settings({
+        "schema_version": "alphablocks.model-training-data-bindings.v2",
+        "bindings": {
+            INDUSTRY_FEATURE_BINDING_ID: _legacy_entity_asset_binding(),
+        },
+    })
+    binding = settings["bindings"][INDUSTRY_FEATURE_BINDING_ID]
+
+    assert settings["schema_version"] == TRAINING_DATA_BINDING_SCHEMA_VERSION
+    assert binding["source_type"] == "node"
+    assert binding["source_id"] == "industry_membership_weight_real"
+    assert binding["provider_node_id"] == binding["source_id"]
+
+
+def test_historical_frozen_entity_asset_binding_remains_readable() -> None:
+    frozen = normalize_frozen_training_data_binding({
+        **_legacy_entity_asset_binding(),
+        "binding_id": INDUSTRY_FEATURE_BINDING_ID,
+        "settings_revision": 6,
+    })
+
+    assert frozen["source_type"] == "entity_asset"
+    assert frozen["source_id"] == "asset_industry_membership"
+    assert frozen["provider_node_id"] == "industry_membership_weight_real"
+
+
 @pytest.mark.parametrize("source", [
     {"bindings": {"unknown": {}}},
     {"bindings": {INDUSTRY_FEATURE_BINDING_ID: {
         **_configured_binding(), "source_type": "execution_node",
+    }}},
+    {"bindings": {INDUSTRY_FEATURE_BINDING_ID: {
+        **_configured_binding(), "source_type": "entity_asset",
     }}},
     {"bindings": {INDUSTRY_FEATURE_BINDING_ID: {
         **_configured_binding(), "provider_node_id": "",
@@ -135,7 +173,7 @@ def test_all_configured_bindings_freeze_under_one_revision() -> None:
         bindings[binding_id] = {
             "enabled": True,
             "source_type": "node",
-            "source_id": f"{binding_id}_source",
+            "source_id": f"{binding_id}_node",
             "source_label": binding_id,
             "provider_node_id": f"{binding_id}_node",
             "field_bindings": {

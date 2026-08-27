@@ -14,8 +14,11 @@ from factor_service.control_database import ControlDatabase, get_control_databas
 LEGACY_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
     "alphablocks.model-training-data-bindings.v1"
 )
-TRAINING_DATA_BINDING_SCHEMA_VERSION = (
+PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
     "alphablocks.model-training-data-bindings.v2"
+)
+TRAINING_DATA_BINDING_SCHEMA_VERSION = (
+    "alphablocks.model-training-data-bindings.v3"
 )
 FROZEN_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
     "alphablocks.frozen-model-training-data-bindings.v1"
@@ -29,7 +32,8 @@ TRADING_CALENDAR_BINDING_ID = "trading_calendar"
 STOCK_STATUS_BINDING_ID = "stock_status"
 INDUSTRY_FEATURE_BINDING_ID = "stock_industry_one_hot"
 
-SOURCE_TYPES = {"node", "entity_asset"}
+SOURCE_TYPES = {"node"}
+LEGACY_FROZEN_SOURCE_TYPES = {"node", "entity_asset"}
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -208,6 +212,7 @@ def normalize_training_resource_settings(
     ).strip()
     if schema_version not in {
         LEGACY_TRAINING_DATA_BINDING_SCHEMA_VERSION,
+        PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION,
         TRAINING_DATA_BINDING_SCHEMA_VERSION,
     }:
         raise ValueError("模型训练数据绑定schema_version不受支持")
@@ -224,7 +229,11 @@ def normalize_training_resource_settings(
         "schema_version": TRAINING_DATA_BINDING_SCHEMA_VERSION,
         "bindings": {
             binding_id: _normalize_binding(
-                binding_id, bindings_source.get(binding_id),
+                binding_id,
+                _upgrade_legacy_binding(
+                    bindings_source.get(binding_id),
+                    schema_version=schema_version,
+                ),
             )
             for binding_id in BINDING_DEFINITIONS
         },
@@ -245,17 +254,27 @@ def training_data_binding(
 def training_data_binding_ready(
     binding: Mapping[str, Any] | None,
     binding_id: str = INDUSTRY_FEATURE_BINDING_ID,
+    *,
+    allow_legacy_source: bool = False,
 ) -> bool:
     definition = BINDING_DEFINITIONS.get(str(binding_id or ""))
     if not definition or not isinstance(binding, Mapping):
         return False
     if binding.get("enabled") is not True:
         return False
-    if str(binding.get("source_type") or "") not in SOURCE_TYPES:
+    source_type = str(binding.get("source_type") or "")
+    source_types = (
+        LEGACY_FROZEN_SOURCE_TYPES if allow_legacy_source else SOURCE_TYPES
+    )
+    if source_type not in source_types:
         return False
-    if not str(binding.get("source_id") or "").strip():
+    source_id = str(binding.get("source_id") or "").strip()
+    provider_node_id = str(binding.get("provider_node_id") or "").strip()
+    if not source_id:
         return False
-    if not str(binding.get("provider_node_id") or "").strip():
+    if not provider_node_id:
+        return False
+    if not allow_legacy_source and source_id != provider_node_id:
         return False
     fields = binding.get("field_bindings")
     required = {
@@ -353,8 +372,12 @@ def normalize_frozen_training_data_binding(
     revision = raw.pop("settings_revision", None)
     if type(revision) is not int or revision < 1:
         raise ValueError("模型训练数据绑定settings_revision无效")
-    binding = _normalize_binding(binding_id, raw)
-    if not training_data_binding_ready(binding, binding_id):
+    binding = _normalize_binding(
+        binding_id, raw, allow_legacy_source=True,
+    )
+    if not training_data_binding_ready(
+        binding, binding_id, allow_legacy_source=True,
+    ):
         raise ValueError(
             f"{BINDING_DEFINITIONS[binding_id]['label']}数据绑定尚未配置完整"
         )
@@ -507,7 +530,12 @@ def get_training_resource_settings() -> dict[str, Any]:
     return TrainingResourceSettingsRepository().get()
 
 
-def _normalize_binding(binding_id: str, source: Any) -> dict[str, Any]:
+def _normalize_binding(
+    binding_id: str,
+    source: Any,
+    *,
+    allow_legacy_source: bool = False,
+) -> dict[str, Any]:
     definition = BINDING_DEFINITIONS[binding_id]
     label = str(definition["label"])
     raw = dict(source or {}) if isinstance(source, Mapping) else {}
@@ -534,13 +562,22 @@ def _normalize_binding(binding_id: str, source: Any) -> dict[str, Any]:
     if not isinstance(enabled, bool):
         raise ValueError(f"{label}数据绑定enabled必须是布尔值")
     source_type = str(raw.get("source_type") or "node").strip()
-    if source_type not in SOURCE_TYPES:
-        raise ValueError(f"{label}数据来源只允许节点或实体资产")
+    source_types = (
+        LEGACY_FROZEN_SOURCE_TYPES if allow_legacy_source else SOURCE_TYPES
+    )
+    if source_type not in source_types:
+        raise ValueError(f"{label}数据来源只允许数据节点")
     source_id = _text(raw.get("source_id"), "source_id", 180, label)
     source_label = _text(raw.get("source_label"), "source_label", 180, label)
     provider_node_id = _text(
         raw.get("provider_node_id"), "provider_node_id", 180, label,
     )
+    if (
+        not allow_legacy_source
+        and (source_id or provider_node_id)
+        and source_id != provider_node_id
+    ):
+        raise ValueError(f"{label}数据来源必须与实际节点一致")
     role_ids = {str(role["id"]) for role in definition["roles"]}
     required_roles = {
         str(role["id"])
@@ -609,6 +646,28 @@ def _configuration_payload(
         for key in ("schema_version", "bindings")
         if key in raw
     }
+
+
+def _upgrade_legacy_binding(
+    source: Any,
+    *,
+    schema_version: str,
+) -> Any:
+    if (
+        schema_version == TRAINING_DATA_BINDING_SCHEMA_VERSION
+        or not isinstance(source, Mapping)
+    ):
+        return source
+    binding = dict(source)
+    provider_node_id = str(binding.get("provider_node_id") or "").strip()
+    if provider_node_id and (
+        str(binding.get("source_type") or "") != "node"
+        or str(binding.get("source_id") or "").strip() != provider_node_id
+    ):
+        binding["source_type"] = "node"
+        binding["source_id"] = provider_node_id
+        binding.pop("fingerprint", None)
+    return binding
 
 
 def _without_retired_bindings(

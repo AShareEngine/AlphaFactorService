@@ -412,7 +412,8 @@ def test_training_job_freezes_configured_database_binding(monkeypatch) -> None:
     assert accepted.status_code == 201
     frozen = repository.created_payload["dataset"]["industry_feature"]
     assert frozen["schema_version"] == "alphablocks.stock-industry-one-hot.v2"
-    assert frozen["data_binding"]["source_id"] == "asset_industry_membership"
+    assert frozen["data_binding"]["source_type"] == "node"
+    assert frozen["data_binding"]["source_id"] == "industry_membership_weight_real"
     assert frozen["data_binding"]["provider_node_id"] == "industry_membership_weight_real"
     assert frozen["data_binding"]["settings_revision"] == 2
 
