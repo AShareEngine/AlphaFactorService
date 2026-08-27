@@ -137,7 +137,6 @@ def test_architecture_union_uses_each_engine_top_n_and_deduplicates() -> None:
 
 def test_hierarchical_architecture_gates_before_stock_ranking() -> None:
     scores = {
-        ("style", "A"): 0.8, ("style", "B"): -0.2, ("style", "C"): 0.9,
         ("industry", "A"): 0.6, ("industry", "B"): 0.7,
         ("industry", "C"): -0.1,
         ("stock", "A"): 0.7, ("stock", "B"): 0.9, ("stock", "C"): 0.8,
@@ -151,20 +150,14 @@ def test_hierarchical_architecture_gates_before_stock_ranking() -> None:
     ])
     engines = [
         {
-            "engine_key": "style", "role": "market_style",
-            "model_id": "style", "model_version": 1, "priority": 1,
-            "enabled": True, "weight": 1.0, "score_threshold": 0.0,
-            "top_n": 20,
-        },
-        {
             "engine_key": "industry", "role": "industry_rotation",
-            "model_id": "industry", "model_version": 1, "priority": 2,
+            "model_id": "industry", "model_version": 1, "priority": 1,
             "enabled": True, "weight": 1.0, "score_threshold": 0.0,
             "top_n": 20,
         },
         {
             "engine_key": "stock", "role": "stock_selection",
-            "model_id": "stock", "model_version": 1, "priority": 3,
+            "model_id": "stock", "model_version": 1, "priority": 2,
             "enabled": True, "weight": 1.0, "score_threshold": 0.0,
             "top_n": 1,
         },
@@ -175,26 +168,19 @@ def test_hierarchical_architecture_gates_before_stock_ranking() -> None:
         pipeline_mode="hierarchical",
     )
 
-    assert result[["code", "score"]].to_dict("records") == [{
-        "code": "A", "score": pytest.approx(0.7),
-    }]
+    assert result[["code", "score"]].to_dict("records") == [
+        {"code": "B", "score": pytest.approx(0.9)},
+        {"code": "A", "score": pytest.approx(0.7)},
+    ]
     audit = result.attrs["architecture_gate_audit"]
     assert audit["pipeline_mode"] == "hierarchical"
     assert [item["average_count"] for item in audit["stages"]] == [
-        3.0, 2.0, 1.0, 1.0,
+        3.0, 2.0, 2.0,
     ]
 
 
-@pytest.mark.parametrize(
-    ("gate_role", "gate_scores", "expected_codes", "expected_stage"),
-    [
-        ("market_style", {"A": 0.8, "B": -0.2, "C": 0.9}, ["C", "A"], "style_gate"),
-        ("industry_rotation", {"A": 0.6, "B": 0.7, "C": -0.1}, ["B", "A"], "industry_gate"),
-    ],
-)
-def test_hierarchical_ablation_allows_one_optional_gate(
-    gate_role, gate_scores, expected_codes, expected_stage,
-) -> None:
+def test_hierarchical_ablation_allows_industry_gate() -> None:
+    gate_scores = {"A": 0.6, "B": 0.7, "C": -0.1}
     predictions = pd.DataFrame([
         {
             "signal_date": pd.Timestamp("2024-01-02"), "code": code,
@@ -210,7 +196,7 @@ def test_hierarchical_ablation_allows_one_optional_gate(
     ])
     engines = [
         {
-            "engine_key": "gate", "role": gate_role,
+            "engine_key": "gate", "role": "industry_rotation",
             "model_id": "gate", "model_version": 1, "priority": 1,
             "enabled": True, "weight": 1.0, "score_threshold": 0.0,
             "top_n": 20,
@@ -228,67 +214,10 @@ def test_hierarchical_ablation_allows_one_optional_gate(
         pipeline_mode="hierarchical",
     )
 
-    assert result["code"].tolist() == expected_codes
+    assert result["code"].tolist() == ["B", "A"]
     stages = result.attrs["architecture_gate_audit"]["stages"]
     assert [item["key"] for item in stages] == [
-        "input", expected_stage, "stock_rank",
-    ]
-
-
-def test_market_style_prediction_is_broadcast_to_signal_day_members(monkeypatch) -> None:
-    predictions = pd.DataFrame([
-        {
-            "signal_date": pd.Timestamp("2024-01-02"),
-            "entity_type": "market_style", "code": "STYLE_SMALL",
-            "model_id": "style", "model_version": 1, "score": 0.8,
-        },
-        {
-            "signal_date": pd.Timestamp("2024-01-02"),
-            "entity_type": "market_style", "code": "STYLE_LARGE",
-            "model_id": "style", "model_version": 1, "score": -0.8,
-        },
-        {
-            "signal_date": pd.Timestamp("2024-01-02"),
-            "entity_type": "stock", "code": "A",
-            "model_id": "stock", "model_version": 1, "score": 0.3,
-        },
-    ])
-    monkeypatch.setattr(
-        "factor_service.model_backtest._market_style_membership_for_backtest",
-        lambda *_args: pd.DataFrame([
-            {
-                "signal_date": pd.Timestamp("2024-01-02"),
-                "style_entity": "STYLE_SMALL", "code": "A",
-            },
-            {
-                "signal_date": pd.Timestamp("2024-01-02"),
-                "style_entity": "STYLE_LARGE", "code": "B",
-            },
-        ]),
-    )
-    engines = [
-        {
-            "engine_key": "style", "role": "market_style",
-            "prediction_scope": "market_style", "model_id": "style",
-            "model_version": 1, "enabled": True,
-        },
-        {
-            "engine_key": "stock", "role": "stock_selection",
-            "prediction_scope": "stock", "model_id": "stock",
-            "model_version": 1, "enabled": True,
-        },
-    ]
-
-    expanded = _expand_architecture_prediction_scopes(
-        predictions, engines,
-        date_start=pd.Timestamp("2024-01-02").date(),
-        date_end=pd.Timestamp("2024-01-02").date(),
-    )
-
-    style_rows = expanded[expanded["model_id"] == "style"].sort_values("code")
-    assert style_rows[["code", "score"]].to_dict("records") == [
-        {"code": "A", "score": 0.8},
-        {"code": "B", "score": -0.8},
+        "input", "industry_gate", "stock_rank",
     ]
 
 

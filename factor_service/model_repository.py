@@ -34,19 +34,14 @@ ARCHITECTURE_ABLATION_PROFILES: dict[str, dict[str, Any]] = {
         "stages": {"stock_rank"},
         "pipeline_mode": "flat",
     },
-    "style_stock": {
-        "label": "风格 + 个股",
-        "stages": {"style_gate", "stock_rank"},
-        "pipeline_mode": "hierarchical",
-    },
     "industry_stock": {
         "label": "行业 + 个股",
         "stages": {"industry_gate", "stock_rank"},
         "pipeline_mode": "hierarchical",
     },
     "full": {
-        "label": "三级全开",
-        "stages": {"style_gate", "industry_gate", "risk_gate", "stock_rank"},
+        "label": "分层全开",
+        "stages": {"industry_gate", "risk_gate", "stock_rank"},
         "pipeline_mode": "hierarchical",
     },
 }
@@ -3685,14 +3680,13 @@ def create_architecture_backtest_job(
         raise ValueError("不支持的架构消融方案")
     architecture_pipeline = str(architecture.get("pipeline_mode") or "flat")
     if profile_key != "full" and architecture_pipeline != "hierarchical":
-        raise ValueError("只有三级门控架构支持分层消融回测")
+        raise ValueError("只有分层门控架构支持分层消融回测")
 
     def engine_stage(item: Mapping[str, Any]) -> str:
         frozen = str(item.get("stage") or "").strip()
         if frozen:
             return frozen
         return {
-            "market_style": "style_gate",
             "industry_rotation": "industry_gate",
             "risk_filter": "risk_gate",
         }.get(str(item.get("role") or "stock_selection"), "stock_rank")
@@ -3707,12 +3701,10 @@ def create_architecture_backtest_job(
     )
     stage_counts = {
         stage: sum(engine_stage(item) == stage for item in engines)
-        for stage in ("style_gate", "industry_gate", "stock_rank")
+        for stage in ("industry_gate", "stock_rank")
     }
     if stage_counts["stock_rank"] < 1:
         raise ValueError("消融回测至少需要一个个股排序引擎")
-    if profile_key == "style_stock" and stage_counts["style_gate"] != 1:
-        raise ValueError("风格消融缺少市场风格引擎")
     if profile_key == "industry_stock" and stage_counts["industry_gate"] < 1:
         raise ValueError("行业消融缺少行业轮动引擎")
     universe_id = str(architecture.get("universe_id") or "")

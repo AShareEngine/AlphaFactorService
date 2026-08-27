@@ -55,6 +55,14 @@ from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
 from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
+from factor_service.research.training_resource_settings import (
+    TrainingResourceRevisionConflict,
+    TrainingResourceSettingsRepository,
+    frozen_training_data_bindings,
+    get_training_resource_settings,
+    required_training_data_binding_ids,
+    training_data_binding_catalog,
+)
 from factor_service.schemas import ModelBacktestJobCreate
 
 
@@ -299,6 +307,45 @@ def _validate_execution_node(payload: dict[str, Any]) -> None:
         )
 
 
+def _freeze_training_data_bindings(payload: dict[str, Any]) -> None:
+    dataset = payload.get("dataset")
+    if not isinstance(dataset, dict):
+        return
+    settings = get_training_resource_settings()
+    if str(settings.get("schema_version") or "").endswith(".v1"):
+        feature = dataset.get("industry_feature") or {}
+        if not isinstance(feature, dict) or feature.get("enabled") is not True:
+            return
+        try:
+            binding = frozen_training_data_bindings(
+                settings, ["stock_industry_one_hot"],
+            )["bindings"]["stock_industry_one_hot"]
+        except ValueError as exc:
+            raise ModelResearchConflict(str(exc)) from exc
+        dataset["industry_feature"] = {
+            **feature,
+            "schema_version": "alphablocks.stock-industry-one-hot.v2",
+            "data_binding": binding,
+        }
+        return
+    try:
+        frozen = frozen_training_data_bindings(
+            settings, required_training_data_binding_ids(dataset),
+        )
+    except ValueError as exc:
+        raise ModelResearchConflict(str(exc)) from exc
+    dataset["data_bindings"] = frozen
+    feature = dataset.get("industry_feature") or {}
+    if isinstance(feature, dict) and feature.get("enabled") is True:
+        dataset["industry_feature"] = {
+            **feature,
+            "schema_version": "alphablocks.stock-industry-one-hot.v2",
+            "data_binding": frozen["bindings"].get(
+                "stock_industry_one_hot"
+            ),
+        }
+
+
 @router.get("/jobs")
 def list_jobs(
     status: str = Query(default=""),
@@ -329,6 +376,45 @@ def get_training_targets() -> dict[str, Any]:
             "ok": True,
             "targets": DatasetBuilder(load_research_settings()).target_capabilities(),
         }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/training-data-bindings")
+def get_model_training_resource_settings() -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "storage": "postgresql",
+            "capabilities": training_data_binding_catalog(),
+            "settings": get_training_resource_settings(),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.put("/training-data-bindings")
+def update_model_training_resource_settings(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    try:
+        source = payload.get("settings")
+        if not isinstance(source, dict):
+            raise ModelResearchError("settings必须是对象")
+        expected_revision = payload.get("expected_revision")
+        if not isinstance(expected_revision, int):
+            raise ModelResearchError("expected_revision必须是整数")
+        settings = TrainingResourceSettingsRepository().update(
+            source, expected_revision=expected_revision,
+        )
+        return {
+            "ok": True,
+            "storage": "postgresql",
+            "capabilities": training_data_binding_catalog(),
+            "settings": settings,
+        }
+    except TrainingResourceRevisionConflict as exc:
+        _raise(ModelResearchConflict(str(exc)))
     except Exception as exc:
         _raise(exc)
 
@@ -521,7 +607,8 @@ def test_execution_node(node_id: str, request: Request) -> dict[str, Any]:
             status = _worker(request).status()
             return {
                 "ok": True, "success": bool(status.get("ready")),
-                "node_id": "local", "detail": "AlphaFactorService研究调度器可用",
+                "node_id": "local",
+                "detail": "AlphaFactorService研究调度器可用",
             }
         from factor_service.research.remote import (
             RemoteTransport,
@@ -710,6 +797,7 @@ def _assert_execution_node_idle(request: Request, node_id: str) -> None:
 def create_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
         _validate_execution_node(payload)
+        _freeze_training_data_bindings(payload)
         return {"ok": True, "job": repository.create_training_job(payload)}
     except Exception as exc:
         _raise(exc)
@@ -719,6 +807,7 @@ def create_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 def create_experiment(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     try:
         _validate_execution_node(payload)
+        _freeze_training_data_bindings(payload)
         return {
             "ok": True,
             "experiment": repository.create_training_experiment(payload),
@@ -1032,7 +1121,7 @@ def _architecture_attribution_findings(
             "severity": "danger",
             "title": "共同弱窗，不是单一门控故障",
             "detail": (
-                f"W{weak.get('window')}四组消融全部为负超额，{regime_text}；"
+                f"W{weak.get('window')}三组消融全部为负超额，{regime_text}；"
                 "门控只能缓解，无法单独修复底层选股信号。"
             ),
         })
@@ -1049,14 +1138,6 @@ def _architecture_attribution_findings(
                     "全新冻结WFA窗口验证，而不是在当前测试窗内调参。"
                 ),
             })
-    style_delta = weak.get("style_gate_delta")
-    if style_delta is not None and float(style_delta) < 0:
-        findings.append({
-            "key": "style_gate_negative",
-            "severity": "warning",
-            "title": "风格门控在弱窗产生负增量",
-            "detail": f"相对仅个股减少{abs(float(style_delta)):.2%}超额年化。",
-        })
     industry_delta = weak.get("industry_gate_delta")
     if industry_delta is not None and float(industry_delta) > 0:
         findings.append({
@@ -1227,7 +1308,7 @@ def create_architecture_ablation_backtests(
     try:
         architecture = repository.get_model_architecture(architecture_id)
         if str(architecture.get("pipeline_mode") or "flat") != "hierarchical":
-            raise ModelResearchConflict("只有三级门控架构支持分层消融回测")
+            raise ModelResearchConflict("只有分层门控架构支持分层消融回测")
         if (
             (architecture.get("readiness") or {}).get(
                 "research_backtest_ready"

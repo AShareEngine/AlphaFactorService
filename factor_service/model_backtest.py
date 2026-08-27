@@ -21,7 +21,7 @@ from factor_service.factor_backtest import (
 )
 from factor_service import model_repository
 from factor_service.research.config import load_settings as load_research_settings
-from factor_service.research.dataset import DatasetBuilder, _market_style_features
+from factor_service.research.dataset import DatasetBuilder
 from factor_service.schemas import ModelBacktestJobOut
 
 
@@ -461,8 +461,7 @@ def _expand_architecture_prediction_scopes(
 ) -> pd.DataFrame:
     """Convert non-stock engine predictions to a stock-level gate cross-section.
 
-    A market-style model predicts ``STYLE_SMALL`` and ``STYLE_LARGE``.  An
-    industry model predicts SW2021 L1 index codes.  The architecture engine
+    An industry model predicts SW2021 L1 index codes.  The architecture engine
     gates actual stocks by joining each score to the signal day's exact-date
     membership.  Industry history before the SW2021 cutover remains rejected.
     """
@@ -472,11 +471,6 @@ def _expand_architecture_prediction_scopes(
         (str(item.get("model_id") or ""), int(item.get("model_version") or 0)):
             dict(item)
         for item in engines if item.get("enabled") is True
-    }
-    style_keys = {
-        key for key, engine in engine_by_model.items()
-        if str(engine.get("prediction_scope") or "").lower() == "market_style"
-        or _architecture_engine_stage(engine) == "style_gate"
     }
     industry_keys = {
         key for key, engine in engine_by_model.items()
@@ -493,23 +487,10 @@ def _expand_architecture_prediction_scopes(
     frame["_model_key"] = list(zip(
         frame["model_id"].astype(str), frame["model_version"], strict=True,
     ))
-    style = frame[frame["_model_key"].isin(style_keys)].copy()
     industry = frame[frame["_model_key"].isin(industry_keys)].copy()
-    stock = frame[~frame["_model_key"].isin(style_keys | industry_keys)].copy()
+    stock = frame[~frame["_model_key"].isin(industry_keys)].copy()
     if not stock.empty and (stock["entity_type"].astype(str) != "stock").any():
         raise ValueError("个股选股引擎包含非股票预测实体")
-    if not style.empty:
-        if (style["entity_type"].astype(str) != "market_style").any():
-            raise ValueError("市场风格引擎必须引用market_style训练目标模型")
-        membership = _market_style_membership_for_backtest(date_start, date_end)
-        if membership.empty:
-            raise ValueError("回测区间无法重建大小盘PIT市值分组")
-        style.rename(columns={"code": "style_entity"}, inplace=True)
-        style = style.merge(
-            membership,
-            on=["signal_date", "style_entity"], how="inner",
-        )
-        style["entity_type"] = "stock"
     if not industry.empty:
         if (industry["entity_type"].astype(str) != "industry").any():
             raise ValueError("行业轮动引擎必须引用industry_rotation训练目标模型")
@@ -522,32 +503,12 @@ def _expand_architecture_prediction_scopes(
             on=["signal_date", "industry_entity"], how="inner",
         )
         industry["entity_type"] = "stock"
-    result = pd.concat([stock, style, industry], ignore_index=True)
+    result = pd.concat([stock, industry], ignore_index=True)
     return result.drop(
         columns=[
-            "entity_type", "_model_key", "style_entity", "industry_entity",
+            "entity_type", "_model_key", "industry_entity",
         ], errors="ignore",
     )
-
-
-def _market_style_membership_for_backtest(
-    date_start: date, date_end: date,
-) -> pd.DataFrame:
-    builder = DatasetBuilder(load_research_settings())
-    membership = builder._membership(str(date_start), str(date_end))
-    if membership.empty:
-        return pd.DataFrame(columns=["signal_date", "style_entity", "code"])
-    instruments = sorted(membership["instrument"].astype(str).unique())
-    market_caps = builder._historical_market_cap(
-        instruments, str(date_start), str(date_end),
-    )
-    dummy = membership.assign(_style_membership_marker=1.0)
-    _, grouped = _market_style_features(
-        dummy, market_caps, ["_style_membership_marker"],
-    )
-    return grouped.rename(columns={
-        "trade_date": "signal_date", "instrument": "code",
-    })[["signal_date", "style_entity", "code"]]
 
 
 def _industry_membership_for_backtest(
@@ -572,11 +533,10 @@ def _compose_architecture_signals(
     """Combine immutable engine predictions into one daily score cross-section.
 
     Flat mode combines every engine in parallel.  Hierarchical mode first
-    intersects market-style, industry-rotation and optional risk gates, then
+    intersects industry-rotation and optional risk gates, then
     applies the selected merge method only to stock-ranking engines.  Gate
-    models publish their native prediction entities; market-style scores are
-    expanded to the signal day's PIT market-cap members before this function,
-    while stock selectors already publish stock rows.  Every result remains in
+    models publish their native prediction entities, while stock selectors
+    already publish stock rows.  Every result remains in
     the shared ``[-1, 1]`` score contract.
     """
     columns = ["signal_date", "code", "score"]
@@ -595,13 +555,10 @@ def _compose_architecture_signals(
     if pipeline_mode == "hierarchical":
         stage_counts = {
             stage: sum(item["stage"] == stage for item in enabled)
-            for stage in ("style_gate", "industry_gate", "stock_rank")
+            for stage in ("industry_gate", "stock_rank")
         }
-        if (
-            stage_counts["style_gate"] > 1
-            or stage_counts["stock_rank"] < 1
-        ):
-            raise ValueError("分层回测快照最多包含1个风格引擎且必须包含个股引擎")
+        if stage_counts["stock_rank"] < 1:
+            raise ValueError("分层回测快照必须包含个股引擎")
     model_keys = {
         (str(item.get("model_id") or ""), int(item.get("model_version") or 0))
         for item in enabled
@@ -643,7 +600,6 @@ def _compose_architecture_signals(
         if pipeline_mode == "hierarchical":
             allowed = set(day["code"].astype(str))
             for stage, audit_key in (
-                ("style_gate", "style_gate"),
                 ("industry_gate", "industry_gate"),
                 ("risk_gate", "risk_gate"),
             ):
@@ -691,10 +647,9 @@ def _compose_architecture_signals(
 
 def _architecture_engine_stage(engine: Mapping[str, Any]) -> str:
     frozen = str(engine.get("stage") or "").strip()
-    if frozen in {"style_gate", "industry_gate", "risk_gate", "stock_rank"}:
+    if frozen in {"industry_gate", "risk_gate", "stock_rank"}:
         return frozen
     return {
-        "market_style": "style_gate",
         "industry_rotation": "industry_gate",
         "risk_filter": "risk_gate",
     }.get(str(engine.get("role") or "stock_selection"), "stock_rank")
@@ -769,7 +724,6 @@ def _architecture_gate_audit(
     stages = []
     for key, label in (
         ("input", "输入股票"),
-        ("style_gate", "市场风格门控"),
         ("industry_gate", "行业轮动门控"),
         ("risk_gate", "风险过滤"),
         ("stock_rank", "个股排序候选"),

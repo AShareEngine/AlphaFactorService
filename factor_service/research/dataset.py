@@ -21,6 +21,19 @@ from factor_service.entity_field_feature import (
 from factor_service.factor_backtest import UNIVERSES
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.industry_feature import (
+    INDUSTRY_FEATURE_SAFE_START,
+    append_industry_one_hot_features,
+    normalize_industry_feature,
+)
+from factor_service.research.data_binding_source import (
+    load_bound_index_membership,
+    load_bound_industry_membership,
+    load_bound_security_master,
+    load_bound_stock_daily,
+    load_bound_stock_status,
+    load_bound_trading_calendar,
+)
 from factor_service.research.preprocessing import (
     LEGACY_DATASET_PIPELINE_VERSIONS,
     normalize_feature_preprocessing,
@@ -30,6 +43,19 @@ from factor_service.research.sample_filter_formula import (
     compile_sample_filter_formula,
     normalize_custom_sample_filters,
 )
+from factor_service.research.training_resource_settings import (
+    INDEX_MEMBERSHIP_BINDING_ID,
+    INDUSTRY_FEATURE_BINDING_ID,
+    SECURITY_MASTER_BINDING_ID,
+    STOCK_DAILY_BINDING_ID,
+    STOCK_STATUS_BINDING_ID,
+    TRADING_CALENDAR_BINDING_ID,
+    frozen_data_binding,
+    get_training_resource_settings,
+    normalize_frozen_training_data_bindings,
+    training_data_binding,
+    training_data_binding_ready,
+)
 from factor_service.schemas import FactorOut
 from factor_service.worker import build_factor_query_plan, factor_query_source
 
@@ -38,7 +64,7 @@ FACTOR_COMPUTED_CUTOFF = "computed_at <= {cutoff:DateTime}"
 FACTOR_EVENT_CUTOFF = (
     "event_available_at <= toDateTime(trade_date, 'Asia/Shanghai') + INTERVAL 15 HOUR"
 )
-SW2021_INDUSTRY_SAFE_START = "2021-12-13"
+SW2021_INDUSTRY_SAFE_START = INDUSTRY_FEATURE_SAFE_START
 DEFAULT_FACTOR_QUERY_CHUNK_DAYS = 90
 LISTING_AGE_CALENDAR_CODE = "000001.SH"
 SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -93,75 +119,53 @@ class DatasetBuilder:
         }
 
     def target_capabilities(self) -> list[dict[str, Any]]:
-        rows = self.client.query(
-            """
-            SELECT table, groupArray(name)
-            FROM system.columns
-            WHERE database = {database:String}
-              AND table IN (
-                  'ad_equity_structure', 'ad_industry_weight',
-                  'ad_industry_base_info'
-              )
-            GROUP BY table
-            """,
-            parameters={"database": self.settings.source_database},
-        ).result_rows
-        columns = {str(table): {str(name) for name in names} for table, names in rows}
-        equity_required = {
-            "market_code", "ann_date", "change_date", "tot_share", "is_valid",
-        }
-        industry_weight_required = {
-            "index_code", "con_code", "trade_date", "weight",
-        }
-        industry_base_required = {
-            "index_code", "level_type", "level1_name",
-        }
-        equity_missing = sorted(
-            equity_required - columns.get("ad_equity_structure", set())
-        )
-        industry_missing = sorted(
-            {
-                *(f"ad_industry_weight.{name}" for name in (
-                    industry_weight_required
-                    - columns.get("ad_industry_weight", set())
-                )),
-                *(f"ad_industry_base_info.{name}" for name in (
-                    industry_base_required
-                    - columns.get("ad_industry_base_info", set())
-                )),
-            }
-        )
+        try:
+            configured = get_training_resource_settings()
+            configured_industry_binding = training_data_binding(
+                configured, INDUSTRY_FEATURE_BINDING_ID,
+            )
+            industry_feature_ready = training_data_binding_ready(
+                configured_industry_binding, INDUSTRY_FEATURE_BINDING_ID,
+            ) and bool(self.settings.data_sdk_api_base_url)
+            industry_feature_reason = (
+                "行业One-hot已绑定/database中的"
+                f"{configured_industry_binding.get('source_label') or configured_industry_binding.get('source_id')}。"
+                if industry_feature_ready
+                else "请先在设置中心为行业One-hot绑定/database数据节点。"
+            )
+        except Exception:
+            industry_feature_ready = False
+            industry_feature_reason = (
+                "请先在设置中心为行业One-hot绑定/database数据节点。"
+            )
         return [
             {
                 "target": "stock_selection",
                 "label": "个股选股",
                 "ready": True,
                 "prediction_scope": "stock",
+                "supports_industry_feature": True,
+                "industry_feature_ready": industry_feature_ready,
+                "industry_feature_minimum_date": INDUSTRY_FEATURE_SAFE_START,
+                "industry_feature_reason": industry_feature_reason,
                 "reason": "支持冻结T+1至T+30个股收益截面排名或涨跌方向标签。",
                 "missing_fields": [],
             },
             {
-                "target": "market_style",
-                "label": "大小盘市场风格",
-                "ready": not equity_missing,
-                "prediction_scope": "market_style",
-                "reason": (
-                    "按公告日与变更日可用的总股本重建每日市值，形成大小盘两组。"
-                    if not equity_missing else "缺少PIT市值重建字段。"
-                ),
-                "missing_fields": equity_missing,
-            },
-            {
                 "target": "industry_rotation",
                 "label": "申万一级行业轮动",
-                "ready": not industry_missing,
+                "ready": industry_feature_ready,
                 "prediction_scope": "industry",
+                "supports_industry_feature": False,
+                "industry_feature_ready": False,
                 "reason": (
                     "使用申万2021版日频行业权重；仅允许从2021-12-13起训练，禁止使用更早的回溯重分类。"
-                    if not industry_missing
-                    else "缺少申万2021版日频行业权重或分类字段。"
+                    if industry_feature_ready
+                    else "请先在设置中心绑定行业归属。"
                 ),
-                "missing_fields": industry_missing,
+                "missing_fields": [] if industry_feature_ready else [
+                    INDUSTRY_FEATURE_BINDING_ID,
+                ],
                 "minimum_date": SW2021_INDUSTRY_SAFE_START,
                 "source_contract": "sw2021_daily_weight_snapshot",
             },
@@ -207,6 +211,9 @@ class DatasetBuilder:
         progress: ProgressCallback | None = None,
     ) -> PreparedDataset:
         spec = dict(job.get("dataset_spec") or (job.get("config_json") or {}).get("dataset") or {})
+        data_bindings = normalize_frozen_training_data_bindings(
+            spec.get("data_bindings"), allow_empty=True,
+        )
         factors = list(spec["factors"])
         cutoff = datetime.fromisoformat(str(spec["data_cutoff"]).replace("Z", "+00:00"))
         if cutoff.tzinfo is not None:
@@ -227,6 +234,12 @@ class DatasetBuilder:
         preprocessing = normalize_feature_preprocessing(
             spec.get("preprocessing"), default_enabled=False,
         )
+        industry_feature = normalize_industry_feature(
+            spec.get("industry_feature"), default_enabled=False,
+        )
+        industry_feature_details: dict[str, Any] = {
+            "feature_names": [], "mapped_coverage": None,
+        }
         legacy_labeled_panel_medians = (
             spec.get("preprocessing") is None
             and str(spec.get("pipeline_version") or "")
@@ -239,11 +252,15 @@ class DatasetBuilder:
         membership = self._membership(
             date_start, date_end, universe_id=universe_id, index_code=index_code,
             sample_filters=spec.get("sample_filters"),
+            data_bindings=data_bindings,
         )
         if membership.empty:
             raise ValueError("历史股票池应用样本过滤后为空")
         expected = membership[["trade_date", "instrument"]].drop_duplicates()
         expected_count = max(1, len(expected))
+        minimum_coverage = float(
+            spec.get("minimum_factor_coverage") or 0.8
+        )
         for index, item in enumerate(factors, start=1):
             _checkpoint(cancellation)
             name = str(item["factor_id"])
@@ -259,8 +276,11 @@ class DatasetBuilder:
             frame = frame.merge(expected, on=["trade_date", "instrument"], how="inner")
             actual_coverage = frame[["trade_date", "instrument"]].drop_duplicates().shape[0] / expected_count
             coverage[name] = actual_coverage
-            if actual_coverage < float(spec.get("minimum_factor_coverage") or 0.8):
-                raise ValueError(f"因子{name}覆盖率{actual_coverage:.2%}低于80%")
+            if actual_coverage < minimum_coverage:
+                raise ValueError(
+                    f"因子{name}覆盖率{actual_coverage:.2%}低于"
+                    f"{minimum_coverage:.0%}"
+                )
             feature_name = _feature_name(item)
             feature_names.append(feature_name)
             if str(factor.output_type or "").strip().lower() in {
@@ -273,10 +293,51 @@ class DatasetBuilder:
         for frame in feature_frames:
             features = features.merge(frame, on=["trade_date", "instrument"], how="left")
         _progress(progress, "loading_prices", 38, {"instrument_count": int(features["instrument"].nunique())})
-        prices = self._adjusted_close(sorted(features["instrument"].unique()), date_start, date_end)
+        prices = self._adjusted_close(
+            sorted(features["instrument"].unique()), date_start, date_end,
+            data_bindings=data_bindings,
+        )
         _checkpoint(cancellation)
         _progress(progress, "building_labels", 46, {})
         research_target = str(spec.get("research_target") or "stock_selection")
+        if industry_feature["enabled"]:
+            if research_target != "stock_selection":
+                raise ValueError("行业编码特征仅支持个股选股训练目标")
+            if pd.Timestamp(date_start) < pd.Timestamp(INDUSTRY_FEATURE_SAFE_START):
+                raise ValueError(
+                    "行业编码特征仅支持2021-12-13及以后；"
+                    "更早历史包含申万2021版回溯重分类"
+                )
+            industry_membership = self._industry_membership(
+                expected, date_start, date_end,
+                industry_feature=industry_feature,
+                data_bindings=data_bindings,
+            )
+            industry_source_details = dict(
+                industry_membership.attrs.get("training_data_binding") or {}
+            )
+            features, industry_feature_details = (
+                append_industry_one_hot_features(
+                    features, industry_membership, industry_feature,
+                )
+            )
+            if industry_source_details:
+                industry_feature_details["data_binding"] = (
+                    industry_source_details
+                )
+            mapped_coverage = float(
+                industry_feature_details.get("mapped_coverage") or 0.0
+            )
+            if mapped_coverage < minimum_coverage:
+                raise ValueError(
+                    "申万一级行业One-hot映射覆盖率"
+                    f"{mapped_coverage:.2%}低于{minimum_coverage:.0%}"
+                )
+            industry_names = list(
+                industry_feature_details.get("feature_names") or []
+            )
+            feature_names.extend(industry_names)
+            preprocessing_excluded_features.extend(industry_names)
         label_spec = dict(spec.get("label") or {})
         horizon = int(label_spec.get("horizon_trading_days") or 5)
         target_mode = str(
@@ -284,33 +345,10 @@ class DatasetBuilder:
         ).strip().lower()
         classification = target_mode == "classification"
         target_contract: dict[str, Any]
-        if research_target == "market_style":
-            market_caps = self._historical_market_cap(
-                sorted(features["instrument"].unique()), date_start, date_end,
-            )
-            features, style_membership = _market_style_features(
-                features, market_caps, feature_names,
-            )
-            labels = _market_style_rank_label(
-                prices, style_membership, horizon=horizon,
-                classification=classification,
-            )
-            target_contract = {
-                "research_target": "market_style",
-                "prediction_scope": "market_style",
-                "entities": ["STYLE_SMALL", "STYLE_LARGE"],
-                "feature_aggregation": "daily_group_mean",
-                "membership": "daily_pit_market_cap_halves",
-                "target_mode": target_mode,
-                "label": (
-                    "future_group_return_direction"
-                    if classification
-                    else "future_group_return_cross_sectional_rank"
-                ),
-            }
-        elif research_target == "industry_rotation":
+        if research_target == "industry_rotation":
             industry_membership = self._industry_membership(
                 expected, date_start, date_end,
+                data_bindings=data_bindings,
             )
             features, industry_membership = _industry_features(
                 features, industry_membership, feature_names,
@@ -460,11 +498,13 @@ class DatasetBuilder:
             future_function_guards.append(
                 "custom sample formulas use allowlisted point-in-time fields and backward-only windows"
             )
-        if research_target == "market_style":
-            future_function_guards.append(
-                "market-style membership uses close-date market cap and shares available by signal date"
-            )
-        elif research_target == "industry_rotation":
+        if industry_feature["enabled"]:
+            future_function_guards.extend([
+                "stock industry uses exact-date SW2021 L1 snapshots no earlier than 2021-12-13",
+                "frozen 31-category one-hot vocabulary plus one unknown bucket",
+                "industry one-hot columns are already complete and excluded from winsorization and z-score transforms",
+            ])
+        if research_target == "industry_rotation":
             future_function_guards.append(
                 "industry membership uses exact-date SW2021 weight snapshots no earlier than 2021-12-13"
             )
@@ -485,6 +525,9 @@ class DatasetBuilder:
             "preprocessing_excluded_features": sorted(
                 preprocessing_excluded_features,
             ),
+            "industry_feature": industry_feature,
+            "data_bindings": data_bindings,
+            "industry_feature_details": industry_feature_details,
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "target_contract": target_contract,
@@ -513,11 +556,58 @@ class DatasetBuilder:
         universe_id: str = "csi500",
         index_code: str = "000905.SH",
         sample_filters: dict[str, Any] | None = None,
+        data_bindings: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         if universe_id not in UNIVERSES:
             raise ValueError(f"不支持的股票池: {universe_id}")
         if index_code not in {config["index_code"] for config in UNIVERSES.values()}:
             raise ValueError(f"不支持的基准指数: {index_code}")
+        calendar_binding = frozen_data_binding(
+            data_bindings, TRADING_CALENDAR_BINDING_ID,
+        )
+        if calendar_binding is not None:
+            calendar = load_bound_trading_calendar(
+                self.settings, calendar_binding, date_start, date_end,
+            )
+            if calendar.empty:
+                raise ValueError("设置中心绑定的交易日历在训练区间内为空")
+            if universe_id == "all_a":
+                master_binding = frozen_data_binding(
+                    data_bindings, SECURITY_MASTER_BINDING_ID,
+                )
+                if master_binding is None:
+                    raise ValueError("全A股票池缺少冻结的证券历史主数据绑定")
+                master = load_bound_security_master(
+                    self.settings, master_binding, date_start, date_end,
+                )
+                frame = _expand_membership_intervals(
+                    calendar,
+                    master.rename(columns={
+                        "listing_date": "in_date",
+                        "delisting_date": "out_date",
+                    }),
+                )
+            else:
+                membership_binding = frozen_data_binding(
+                    data_bindings, INDEX_MEMBERSHIP_BINDING_ID,
+                )
+                if membership_binding is None:
+                    raise ValueError("指数股票池缺少冻结的指数成分绑定")
+                intervals = load_bound_index_membership(
+                    self.settings, membership_binding,
+                    index_code=index_code, date_end=date_end,
+                )
+                frame = _expand_membership_intervals(calendar, intervals)
+            if not frame.empty:
+                frame = self._apply_sample_filters(
+                    frame,
+                    date_start=date_start,
+                    date_end=date_end,
+                    sample_filters=sample_filters,
+                    data_bindings=data_bindings,
+                )
+            return frame
+
         calendar_code = "000905.SH" if universe_id == "all_a" else index_code
         if universe_id == "all_a":
             rows = self.client.query(
@@ -573,6 +663,7 @@ class DatasetBuilder:
                 date_start=date_start,
                 date_end=date_end,
                 sample_filters=sample_filters,
+                data_bindings=data_bindings,
             )
         return frame
 
@@ -583,6 +674,7 @@ class DatasetBuilder:
         date_start: str,
         date_end: str,
         sample_filters: dict[str, Any] | None,
+        data_bindings: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         filters = dict(sample_filters or {})
         minimum_days = int(filters.get("minimum_listing_trading_days") or 0)
@@ -602,54 +694,145 @@ class DatasetBuilder:
         result = membership.copy()
         instruments = sorted(result["instrument"].astype(str).unique().tolist())
         if minimum_days > 0:
-            basic_rows = self.client.query(
-                """
-                SELECT code, toDateOrNull(ipo_date)
-                FROM baostock.bs_stock_basic
-                WHERE type = '1' AND code IN {codes:Array(String)}
-                """,
-                parameters={"codes": instruments},
-            ).result_rows
-            basics = pd.DataFrame(basic_rows, columns=["instrument", "ipo_date"])
-            basics["ipo_date"] = pd.to_datetime(
-                basics["ipo_date"], errors="coerce",
+            master_binding = frozen_data_binding(
+                data_bindings, SECURITY_MASTER_BINDING_ID,
             )
-            calendar_start = (
-                pd.Timestamp(date_start)
-                - timedelta(days=minimum_days * 3 + 30)
-            ).date().isoformat()
-            calendar_rows = self.client.query(
-                f"""
-                SELECT DISTINCT toDate(trade_time) AS trade_date
-                FROM {self.settings.source_database}.ad_market_kline_daily
-                WHERE code = {{calendar_code:String}}
-                  AND toDate(trade_time) >= {{calendar_start:Date}}
-                  AND toDate(trade_time) <= {{date_end:Date}}
-                ORDER BY trade_date
-                """,
-                parameters={
-                    "calendar_code": LISTING_AGE_CALENDAR_CODE,
-                    "calendar_start": calendar_start,
-                    "date_end": date_end,
-                },
-            ).result_rows
-            calendar = pd.DatetimeIndex(
-                pd.to_datetime([row[0] for row in calendar_rows]),
+            calendar_binding = frozen_data_binding(
+                data_bindings, TRADING_CALENDAR_BINDING_ID,
             )
-            if calendar.empty:
-                raise ValueError("缺少上市交易日过滤所需的A股交易日历")
-            result = result.merge(basics, on="instrument", how="left")
-            signal_positions = calendar.searchsorted(result["trade_date"])
-            ipo_positions = calendar.searchsorted(
-                result["ipo_date"].fillna(result["trade_date"]),
-            )
-            result["listing_trading_days"] = signal_positions - ipo_positions
-            result = result[
-                result["listing_trading_days"] >= minimum_days
-            ]
-
+            if master_binding is not None and calendar_binding is not None:
+                calendar_start = (
+                    pd.Timestamp(date_start)
+                    - timedelta(days=minimum_days * 3 + 30)
+                ).date().isoformat()
+                basics = load_bound_security_master(
+                    self.settings, master_binding, calendar_start, date_end,
+                )[["instrument", "listing_date"]].drop_duplicates()
+                calendar = load_bound_trading_calendar(
+                    self.settings, calendar_binding, calendar_start, date_end,
+                )
+                if calendar.empty:
+                    raise ValueError("缺少上市交易日过滤所需的交易日历")
+                result = result.merge(basics, on="instrument", how="left")
+                signal_positions = calendar.searchsorted(result["trade_date"])
+                ipo_positions = calendar.searchsorted(
+                    result["listing_date"].fillna(result["trade_date"]),
+                )
+                result["listing_trading_days"] = (
+                    signal_positions - ipo_positions
+                )
+                result = result[
+                    result["listing_trading_days"] >= minimum_days
+                ]
+            else:
+                result = self._apply_legacy_listing_age_filter(
+                    result, date_start, date_end, minimum_days, instruments,
+                )
+        
         if (exclude_st or exclude_delisting) and not result.empty:
-            status_rows = self.client.query(
+            status_binding = frozen_data_binding(
+                data_bindings, STOCK_STATUS_BINDING_ID,
+            )
+            if status_binding is not None:
+                statuses = load_bound_stock_status(
+                    self.settings, status_binding,
+                    result[["trade_date", "instrument"]],
+                )
+                result = result.merge(
+                    statuses,
+                    on=["trade_date", "instrument"],
+                    how="left",
+                )
+                result[["is_st", "is_delisting"]] = result[
+                    ["is_st", "is_delisting"]
+                ].fillna(0)
+                if exclude_st:
+                    result = result[result["is_st"] != 1]
+                if exclude_delisting:
+                    result = result[result["is_delisting"] != 1]
+            else:
+                result = self._apply_legacy_status_filter(
+                    result, date_start, date_end,
+                    exclude_st=exclude_st,
+                    exclude_delisting=exclude_delisting,
+                )
+
+        if custom_formulas and not result.empty:
+            result = self._apply_custom_formula_filters(
+                result,
+                date_start=date_start,
+                date_end=date_end,
+                formulas=custom_formulas,
+            )
+
+        return result[["trade_date", "instrument"]].drop_duplicates().sort_values(
+            ["trade_date", "instrument"], ignore_index=True,
+        )
+
+    def _apply_legacy_listing_age_filter(
+        self,
+        result: pd.DataFrame,
+        date_start: str,
+        date_end: str,
+        minimum_days: int,
+        instruments: list[str],
+    ) -> pd.DataFrame:
+        basic_rows = self.client.query(
+            """
+            SELECT code, toDateOrNull(ipo_date)
+            FROM baostock.bs_stock_basic
+            WHERE type = '1' AND code IN {codes:Array(String)}
+            """,
+            parameters={"codes": instruments},
+        ).result_rows
+        basics = pd.DataFrame(
+            basic_rows, columns=["instrument", "ipo_date"],
+        )
+        basics["ipo_date"] = pd.to_datetime(
+            basics["ipo_date"], errors="coerce",
+        )
+        calendar_start = (
+            pd.Timestamp(date_start)
+            - timedelta(days=minimum_days * 3 + 30)
+        ).date().isoformat()
+        calendar_rows = self.client.query(
+            f"""
+            SELECT DISTINCT toDate(trade_time) AS trade_date
+            FROM {self.settings.source_database}.ad_market_kline_daily
+            WHERE code = {{calendar_code:String}}
+              AND toDate(trade_time) >= {{calendar_start:Date}}
+              AND toDate(trade_time) <= {{date_end:Date}}
+            ORDER BY trade_date
+            """,
+            parameters={
+                "calendar_code": LISTING_AGE_CALENDAR_CODE,
+                "calendar_start": calendar_start,
+                "date_end": date_end,
+            },
+        ).result_rows
+        calendar = pd.DatetimeIndex(
+            pd.to_datetime([row[0] for row in calendar_rows]),
+        )
+        if calendar.empty:
+            raise ValueError("缺少上市交易日过滤所需的A股交易日历")
+        result = result.merge(basics, on="instrument", how="left")
+        signal_positions = calendar.searchsorted(result["trade_date"])
+        ipo_positions = calendar.searchsorted(
+            result["ipo_date"].fillna(result["trade_date"]),
+        )
+        result["listing_trading_days"] = signal_positions - ipo_positions
+        return result[result["listing_trading_days"] >= minimum_days]
+
+    def _apply_legacy_status_filter(
+        self,
+        result: pd.DataFrame,
+        date_start: str,
+        date_end: str,
+        *,
+        exclude_st: bool,
+        exclude_delisting: bool,
+    ) -> pd.DataFrame:
+        status_rows = self.client.query(
                 f"""
                 SELECT
                     toDate(trade_date) AS trade_date,
@@ -668,41 +851,30 @@ class DatasetBuilder:
                     "date_start": date_start,
                     "date_end": date_end,
                 },
-            ).result_rows
-            statuses = pd.DataFrame(
-                status_rows,
-                columns=["trade_date", "instrument", "is_st", "is_delisting"],
-            )
-            if not statuses.empty:
-                statuses["trade_date"] = pd.to_datetime(statuses["trade_date"])
-                statuses = statuses.drop_duplicates(
-                    ["trade_date", "instrument"], keep="last",
-                )
-                result = result.merge(
-                    statuses, on=["trade_date", "instrument"], how="left",
-                )
-            else:
-                result["is_st"] = 0
-                result["is_delisting"] = 0
-            result[["is_st", "is_delisting"]] = result[
-                ["is_st", "is_delisting"]
-            ].fillna(0)
-            if exclude_st:
-                result = result[result["is_st"] != 1]
-            if exclude_delisting:
-                result = result[result["is_delisting"] != 1]
-
-        if custom_formulas and not result.empty:
-            result = self._apply_custom_formula_filters(
-                result,
-                date_start=date_start,
-                date_end=date_end,
-                formulas=custom_formulas,
-            )
-
-        return result[["trade_date", "instrument"]].drop_duplicates().sort_values(
-            ["trade_date", "instrument"], ignore_index=True,
+        ).result_rows
+        statuses = pd.DataFrame(
+            status_rows,
+            columns=["trade_date", "instrument", "is_st", "is_delisting"],
         )
+        if not statuses.empty:
+            statuses["trade_date"] = pd.to_datetime(statuses["trade_date"])
+            statuses = statuses.drop_duplicates(
+                ["trade_date", "instrument"], keep="last",
+            )
+            result = result.merge(
+                statuses, on=["trade_date", "instrument"], how="left",
+            )
+        else:
+            result["is_st"] = 0
+            result["is_delisting"] = 0
+        result[["is_st", "is_delisting"]] = result[
+            ["is_st", "is_delisting"]
+        ].fillna(0)
+        if exclude_st:
+            result = result[result["is_st"] != 1]
+        if exclude_delisting:
+            result = result[result["is_delisting"] != 1]
+        return result
 
     def _apply_custom_formula_filters(
         self,
@@ -912,11 +1084,31 @@ class DatasetBuilder:
     def trading_dates_ending_at(
         self, trade_date: str, count: int, *,
         index_code: str = "000905.SH", universe_id: str = "csi500",
+        data_bindings: dict[str, Any] | None = None,
     ) -> list[str]:
         """Return the last ``count`` benchmark sessions without crossing signal time."""
         requested = int(count)
         if requested < 1:
             raise ValueError("交易日窗口必须大于0")
+        calendar_binding = frozen_data_binding(
+            data_bindings, TRADING_CALENDAR_BINDING_ID,
+        )
+        if calendar_binding is not None:
+            calendar_start = (
+                pd.Timestamp(trade_date) - timedelta(days=requested * 3 + 30)
+            ).date().isoformat()
+            calendar = load_bound_trading_calendar(
+                self.settings, calendar_binding, calendar_start, trade_date,
+            )
+            dates = [item.date().isoformat() for item in calendar[-requested:]]
+            if (
+                len(dates) < requested
+                or dates[-1] != pd.Timestamp(trade_date).date().isoformat()
+            ):
+                raise ValueError(
+                    f"{trade_date}之前没有足够的{requested}个交易日"
+                )
+            return dates
         calendar_code = "000905.SH" if universe_id == "all_a" else index_code
         rows = self.client.query(
             f"""
@@ -1028,7 +1220,23 @@ class DatasetBuilder:
             )
         return factor
 
-    def _adjusted_close(self, instruments: list[str], date_start: str, date_end: str) -> pd.DataFrame:
+    def _adjusted_close(
+        self,
+        instruments: list[str],
+        date_start: str,
+        date_end: str,
+        *,
+        data_bindings: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
+        daily_binding = frozen_data_binding(
+            data_bindings, STOCK_DAILY_BINDING_ID,
+        )
+        if daily_binding is not None:
+            return load_bound_stock_daily(
+                self.settings, daily_binding, instruments,
+                date_start,
+                (pd.Timestamp(date_end) + timedelta(days=10)).date().isoformat(),
+            )[["trade_date", "instrument", "adjusted_close"]]
         rows = self.client.query(
             f"""
             SELECT
@@ -1057,79 +1265,10 @@ class DatasetBuilder:
             frame["adjusted_close"] = pd.to_numeric(frame["adjusted_close"], errors="coerce")
         return frame
 
-    def _historical_market_cap(
-        self, instruments: list[str], date_start: str, date_end: str,
-    ) -> pd.DataFrame:
-        price_rows = self.client.query(
-            f"""
-            SELECT toDate(trade_time), code, toFloat64(close)
-            FROM {self.settings.source_database}.ad_market_kline_daily
-            WHERE code IN {{codes:Array(String)}}
-              AND toDate(trade_time) >= {{date_start:Date}}
-              AND toDate(trade_time) <= {{date_end:Date}}
-              AND close IS NOT NULL AND close > 0
-            ORDER BY code, trade_time
-            """,
-            parameters={
-                "codes": instruments, "date_start": date_start,
-                "date_end": date_end,
-            },
-        ).result_rows
-        share_rows = self.client.query(
-            f"""
-            SELECT market_code, ann_date, change_date, toFloat64(tot_share)
-            FROM {self.settings.source_database}.ad_equity_structure
-            WHERE market_code IN {{codes:Array(String)}}
-              AND is_valid = 1 AND tot_share IS NOT NULL AND tot_share > 0
-              AND ann_date <= {{date_end:Date}}
-              AND change_date <= {{date_end:Date}}
-            ORDER BY market_code, ann_date, change_date
-            """,
-            parameters={"codes": instruments, "date_end": date_end},
-        ).result_rows
-        prices = pd.DataFrame(
-            price_rows, columns=["trade_date", "instrument", "close"],
-        )
-        shares = pd.DataFrame(
-            share_rows,
-            columns=["instrument", "ann_date", "change_date", "total_share_10k"],
-        )
-        if prices.empty or shares.empty:
-            return pd.DataFrame(columns=["trade_date", "instrument", "market_cap"])
-        prices["trade_date"] = pd.to_datetime(prices["trade_date"], errors="coerce")
-        prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
-        shares["ann_date"] = pd.to_datetime(shares["ann_date"], errors="coerce")
-        shares["change_date"] = pd.to_datetime(shares["change_date"], errors="coerce")
-        shares["total_share_10k"] = pd.to_numeric(
-            shares["total_share_10k"], errors="coerce",
-        )
-        shares["available_date"] = shares[["ann_date", "change_date"]].max(axis=1)
-        shares = shares.dropna(subset=["available_date", "total_share_10k"])
-        parts: list[pd.DataFrame] = []
-        share_groups = {
-            str(code): group.sort_values("available_date")
-            for code, group in shares.groupby("instrument", sort=False)
-        }
-        for code, price_group in prices.groupby("instrument", sort=False):
-            available = share_groups.get(str(code))
-            if available is None or available.empty:
-                continue
-            parts.append(pd.merge_asof(
-                price_group.sort_values("trade_date"),
-                available[["available_date", "total_share_10k"]],
-                left_on="trade_date", right_on="available_date", direction="backward",
-            ))
-        if not parts:
-            return pd.DataFrame(columns=["trade_date", "instrument", "market_cap"])
-        result = pd.concat(parts, ignore_index=True).dropna(subset=["total_share_10k"])
-        result["market_cap"] = result["close"] * result["total_share_10k"] * 10_000.0
-        result = result.loc[
-            np.isfinite(result["market_cap"]) & (result["market_cap"] > 0)
-        ]
-        return result[["trade_date", "instrument", "market_cap"]]
-
     def _industry_membership(
         self, observations: pd.DataFrame, date_start: str, date_end: str,
+        *, industry_feature: dict[str, Any] | None = None,
+        data_bindings: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         """Return exact-date Shenwan 2021 L1 membership for observed stocks.
 
@@ -1149,6 +1288,19 @@ class DatasetBuilder:
             raise ValueError(
                 "申万一级行业轮动仅支持2021-12-13及以后；"
                 "更早历史包含申万2021版回溯重分类"
+            )
+        frozen_binding = (
+            industry_feature.get("data_binding")
+            if isinstance(industry_feature, dict)
+            else None
+        )
+        if not isinstance(frozen_binding, dict):
+            frozen_binding = frozen_data_binding(
+                data_bindings, INDUSTRY_FEATURE_BINDING_ID,
+            )
+        if isinstance(frozen_binding, dict):
+            return load_bound_industry_membership(
+                self.settings, observations, frozen_binding,
             )
         expected = observations[["trade_date", "instrument"]].drop_duplicates().copy()
         expected["trade_date"] = pd.to_datetime(expected["trade_date"], errors="coerce")
@@ -1203,30 +1355,53 @@ class DatasetBuilder:
             raise ValueError(f"申万一级行业日频映射覆盖率{coverage:.2%}低于80%")
         return mapped
 
-    def market_style_features(
-        self, features: pd.DataFrame, feature_names: list[str],
-        date_start: str, date_end: str,
-    ) -> pd.DataFrame:
-        market_caps = self._historical_market_cap(
-            sorted(features["instrument"].astype(str).unique()),
-            date_start, date_end,
-        )
-        result, _membership = _market_style_features(
-            features, market_caps, feature_names,
-        )
-        return result
-
     def industry_features(
         self, features: pd.DataFrame, feature_names: list[str],
         date_start: str, date_end: str,
+        *, data_bindings: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         membership = self._industry_membership(
             features[["trade_date", "instrument"]], date_start, date_end,
+            data_bindings=data_bindings,
         )
         result, _membership = _industry_features(
             features, membership, feature_names,
         )
         return result
+
+
+def _expand_membership_intervals(
+    calendar: pd.DatetimeIndex,
+    intervals: pd.DataFrame,
+) -> pd.DataFrame:
+    """Expand PIT membership intervals onto the configured trading calendar."""
+    empty = pd.DataFrame(columns=["trade_date", "instrument"])
+    if calendar.empty or intervals.empty:
+        return empty
+    source = intervals.copy()
+    source["in_date"] = pd.to_datetime(source["in_date"], errors="coerce")
+    if "out_date" not in source:
+        source["out_date"] = pd.NaT
+    source["out_date"] = pd.to_datetime(source["out_date"], errors="coerce")
+    source["instrument"] = source["instrument"].astype(str)
+    source = source.dropna(subset=["instrument", "in_date"])
+    parts: list[pd.DataFrame] = []
+    for row in source[["instrument", "in_date", "out_date"]].itertuples(
+        index=False,
+    ):
+        active = calendar[calendar >= row.in_date]
+        if pd.notna(row.out_date):
+            active = active[active <= row.out_date]
+        if len(active):
+            parts.append(pd.DataFrame({
+                "trade_date": active,
+                "instrument": str(row.instrument),
+            }))
+    if not parts:
+        return empty
+    return pd.concat(parts, ignore_index=True).drop_duplicates(
+        ["trade_date", "instrument"], keep="last",
+    ).sort_values(["trade_date", "instrument"], ignore_index=True)
 
 
 def _future_rank_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
@@ -1252,82 +1427,6 @@ def _future_direction_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:
         future_stack=True,
     ).dropna().astype(float).rename("LABEL0").reset_index()
     return labels
-
-
-def _market_style_features(
-    features: pd.DataFrame,
-    market_caps: pd.DataFrame,
-    feature_names: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if features.empty or market_caps.empty:
-        raise ValueError("大小盘风格训练缺少PIT市值数据")
-    source = features.merge(
-        market_caps, on=["trade_date", "instrument"], how="left",
-    )
-    coverage = source["market_cap"].notna().mean()
-    if not np.isfinite(coverage) or coverage < 0.8:
-        raise ValueError(f"大小盘风格PIT市值覆盖率{coverage:.2%}低于80%")
-    source = source.dropna(subset=["market_cap"]).sort_values(
-        ["trade_date", "market_cap", "instrument"],
-    )
-    source["_position"] = source.groupby("trade_date").cumcount()
-    source["_count"] = source.groupby("trade_date")["instrument"].transform("size")
-    source["style_entity"] = np.where(
-        source["_position"] < (source["_count"] / 2.0),
-        "STYLE_SMALL", "STYLE_LARGE",
-    )
-    group_counts = source.groupby("trade_date")["style_entity"].nunique()
-    complete_dates = set(group_counts[group_counts == 2].index)
-    source = source[source["trade_date"].isin(complete_dates)]
-    if source.empty:
-        raise ValueError("大小盘风格无法形成每日两个市值组")
-    membership = source[[
-        "trade_date", "instrument", "style_entity", "market_cap",
-    ]].copy()
-    aggregated = source.groupby(
-        ["trade_date", "style_entity"], as_index=False,
-    )[feature_names].mean()
-    aggregated.rename(columns={"style_entity": "instrument"}, inplace=True)
-    return aggregated, membership
-
-
-def _market_style_rank_label(
-    prices: pd.DataFrame,
-    membership: pd.DataFrame,
-    *,
-    horizon: int,
-    classification: bool = False,
-) -> pd.DataFrame:
-    if prices.empty or membership.empty:
-        raise ValueError("大小盘风格标签缺少价格或市值分组")
-    pivot = prices.drop_duplicates(
-        ["trade_date", "instrument"], keep="last",
-    ).pivot(
-        index="trade_date", columns="instrument", values="adjusted_close",
-    ).sort_index()
-    returns = pivot.shift(-int(horizon)).div(pivot).sub(1.0)
-    future = returns.stack(future_stack=True).dropna().rename(
-        "future_return",
-    ).reset_index()
-    grouped = membership.merge(
-        future, on=["trade_date", "instrument"], how="inner",
-    ).groupby(
-        ["trade_date", "style_entity"], as_index=False,
-    )["future_return"].mean()
-    grouped["_rank"] = grouped.groupby("trade_date")["future_return"].rank(
-        method="average", ascending=True,
-    )
-    grouped["_count"] = grouped.groupby("trade_date")["style_entity"].transform(
-        "size",
-    )
-    grouped = grouped[grouped["_count"] == 2].copy()
-    grouped["LABEL0"] = (
-        grouped["future_return"].gt(0.0).astype(float)
-        if classification
-        else 2.0 * (grouped["_rank"] - 1.0) / (grouped["_count"] - 1.0) - 1.0
-    )
-    grouped.rename(columns={"style_entity": "instrument"}, inplace=True)
-    return grouped[["trade_date", "instrument", "LABEL0"]]
 
 
 def _industry_features(

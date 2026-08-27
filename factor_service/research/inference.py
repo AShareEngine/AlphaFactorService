@@ -15,10 +15,18 @@ from factor_service.research.control import ResearchControl
 from factor_service.research.config import Settings
 from factor_service.research.dataset import DatasetBuilder, _feature_name
 from factor_service.research.errors import PermanentJobError
+from factor_service.research.industry_feature import (
+    append_industry_one_hot_features,
+    industry_feature_names,
+    normalize_industry_feature,
+)
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.research.preprocessing import (
     normalize_feature_preprocessing,
     preprocess_feature_panel,
+)
+from factor_service.research.training_resource_settings import (
+    normalize_frozen_training_data_bindings,
 )
 from factor_service.research.trainer import (
     QlibStackingModel,
@@ -60,19 +68,34 @@ class DailyInferenceRunner:
         )
         _checkpoint(cancellation)
         model, training_manifest = _load_bundle(bundle_path)
+        try:
+            data_bindings = normalize_frozen_training_data_bindings(
+                training_manifest.get("data_bindings"), allow_empty=True,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
         model_kind = str(training_manifest.get("model_kind") or "lightgbm")
         dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
+        requested_bindings = normalize_frozen_training_data_bindings(
+            dataset_spec.get("data_bindings"), allow_empty=True,
+        )
+        if (
+            requested_bindings.get("settings_revision", 0) > 0
+            and requested_bindings != data_bindings
+        ):
+            raise PermanentJobError(
+                "每日推理数据集与训练模型的数据能力绑定版本不一致"
+            )
         research_target = str(
             dataset_spec.get("research_target") or "stock_selection"
         ).strip().lower()
         prediction_scope = str(
             dataset_spec.get("prediction_scope")
-            or ("market_style" if research_target == "market_style"
-                else "industry" if research_target == "industry_rotation"
+            or ("industry" if research_target == "industry_rotation"
                 else "stock")
         ).strip().lower()
         if research_target not in {
-            "stock_selection", "market_style", "industry_rotation",
+            "stock_selection", "industry_rotation",
         }:
             raise PermanentJobError(f"训练目标{research_target}尚不支持每日推理")
         expected_names = list(training_manifest.get("feature_names") or [])
@@ -99,8 +122,19 @@ class DailyInferenceRunner:
             )
             if requested_preprocessing != preprocessing:
                 raise PermanentJobError("每日推理数据集与训练模型的特征预处理口径不一致")
+        industry_feature = normalize_industry_feature(
+            training_manifest.get("industry_feature"), default_enabled=False,
+        )
+        if dataset_spec.get("industry_feature") is not None:
+            requested_industry_feature = normalize_industry_feature(
+                dataset_spec.get("industry_feature"), default_enabled=False,
+            )
+            if requested_industry_feature != industry_feature:
+                raise PermanentJobError("每日推理数据集与训练模型的行业特征口径不一致")
         factors = list(job["dataset_spec"]["factors"])
-        actual_names = [_feature_name(item) for item in factors]
+        factor_feature_names = [_feature_name(item) for item in factors]
+        expected_industry_names = industry_feature_names(industry_feature)
+        actual_names = [*factor_feature_names, *expected_industry_names]
         if actual_names != expected_names or any(name not in medians for name in expected_names):
             raise PermanentJobError("模型产物中的特征顺序或训练中位数与冻结因子不一致")
 
@@ -128,6 +162,7 @@ class DailyInferenceRunner:
                 sequence_dates = self.dataset_builder.trading_dates_ending_at(
                     trade_date, lookback_window,
                     index_code=index_code, universe_id=universe_id,
+                    data_bindings=data_bindings,
                 )
             except ValueError as exc:
                 raise PermanentJobError(str(exc)) from exc
@@ -137,6 +172,7 @@ class DailyInferenceRunner:
         target_membership = self.dataset_builder._membership(
             trade_date, trade_date, universe_id=universe_id, index_code=index_code,
             sample_filters=sample_filters,
+            data_bindings=data_bindings,
         )
         if target_membership.empty:
             raise PermanentJobError(f"{trade_date}不是{universe_label}可推理交易日")
@@ -144,11 +180,14 @@ class DailyInferenceRunner:
             feature_date_start, trade_date,
             universe_id=universe_id, index_code=index_code,
             sample_filters=sample_filters,
+            data_bindings=data_bindings,
         )
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}
         expected_count = max(1, len(features))
-        for index, (factor, feature_name) in enumerate(zip(factors, expected_names), start=1):
+        for index, (factor, feature_name) in enumerate(
+            zip(factors, factor_feature_names), start=1,
+        ):
             _checkpoint(cancellation)
             _progress(progress, "loading_inference_factors", 35 + int(25 * (index - 1) / len(factors)), {
                 "factor_id": factor["factor_id"],
@@ -173,17 +212,51 @@ class DailyInferenceRunner:
         low = [name for name, coverage in coverages.items() if coverage < minimum]
         if low:
             raise PermanentJobError("每日推理因子覆盖率低于阈值: " + ", ".join(low))
-        if research_target == "market_style":
+        industry_feature_details: dict[str, Any] = {
+            "feature_names": [], "mapped_coverage": None,
+        }
+        if industry_feature["enabled"]:
+            if research_target != "stock_selection":
+                raise PermanentJobError("行业编码特征仅支持个股选股每日推理")
             try:
-                features = self.dataset_builder.market_style_features(
-                    features, expected_names, feature_date_start, trade_date,
+                industry_membership = self.dataset_builder._industry_membership(
+                    features[["trade_date", "instrument"]],
+                    feature_date_start,
+                    trade_date,
+                    industry_feature=industry_feature,
+                    data_bindings=data_bindings,
                 )
+                industry_source_details = dict(
+                    industry_membership.attrs.get("training_data_binding") or {}
+                )
+                features, industry_feature_details = (
+                    append_industry_one_hot_features(
+                        features, industry_membership, industry_feature,
+                    )
+                )
+                if industry_source_details:
+                    industry_feature_details["data_binding"] = (
+                        industry_source_details
+                    )
             except ValueError as exc:
                 raise PermanentJobError(str(exc)) from exc
-        elif research_target == "industry_rotation":
+            if (
+                list(industry_feature_details.get("feature_names") or [])
+                != expected_industry_names
+            ):
+                raise PermanentJobError("每日推理行业One-hot特征顺序与训练模型不一致")
+            mapped_coverage = float(
+                industry_feature_details.get("mapped_coverage") or 0.0
+            )
+            if mapped_coverage < minimum:
+                raise PermanentJobError(
+                    f"每日推理行业映射覆盖率{mapped_coverage:.2%}低于阈值"
+                )
+        if research_target == "industry_rotation":
             try:
                 features = self.dataset_builder.industry_features(
                     features, expected_names, feature_date_start, trade_date,
+                    data_bindings=data_bindings,
                 )
             except ValueError as exc:
                 raise PermanentJobError(str(exc)) from exc
@@ -217,8 +290,7 @@ class DailyInferenceRunner:
                 )
                 raw = predictions["raw_prediction"].to_numpy(dtype=float)
                 target_count = (
-                    2 if research_target == "market_style"
-                    else int(features.loc[
+                    int(features.loc[
                         features["trade_date"] == pd.Timestamp(trade_date),
                         "instrument",
                     ].nunique()) if research_target == "industry_rotation"
@@ -249,8 +321,7 @@ class DailyInferenceRunner:
                     inplace=True,
                 )
                 target_count = (
-                    2 if research_target == "market_style"
-                    else int(features.loc[
+                    int(features.loc[
                         features["trade_date"] == pd.Timestamp(trade_date),
                         "instrument",
                     ].nunique()) if research_target == "industry_rotation"
@@ -275,7 +346,7 @@ class DailyInferenceRunner:
         grouped = predictions.groupby("trade_date")["raw_prediction"]
         predictions["rank_value"] = grouped.rank(method="first", ascending=False).astype(int)
         predictions["percentile"] = grouped.rank(method="average", pct=True)
-        if prediction_scope in {"market_style", "industry"}:
+        if prediction_scope == "industry":
             counts = grouped.transform("size")
             predictions["score"] = np.where(
                 counts > 1,
@@ -309,6 +380,11 @@ class DailyInferenceRunner:
             future_function_guards.append(
                 "exact-date SW2021 industry snapshots no earlier than 2021-12-13"
             )
+        if industry_feature["enabled"]:
+            future_function_guards.extend([
+                "training-identical exact-date SW2021 L1 stock industry mapping",
+                "training-identical frozen one-hot vocabulary and unknown bucket",
+            ])
         manifest = {
             "schema_version": "alphablocks.qlib-inference.v1",
             "job_id": job["job_id"],
@@ -334,6 +410,9 @@ class DailyInferenceRunner:
                 or "training_universe_after_factor_score"
             ),
             "preprocessing_excluded_features": preprocessing_excluded_features,
+            "industry_feature": industry_feature,
+            "industry_feature_details": industry_feature_details,
+            "data_bindings": data_bindings,
             "row_count": len(predictions),
             "future_function_guards": future_function_guards,
             "created_at": computed_at.isoformat(),

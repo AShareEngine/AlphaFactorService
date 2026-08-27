@@ -26,6 +26,9 @@ class Settings:
     experiment_worker_enabled: bool = True
     factor_query_chunk_days: int = 90
     stock_daily_table: str = "stock_daily_factor_source"
+    data_sdk_api_base_url: str = ""
+    data_sdk_query_timeout_seconds: float = 120.0
+    data_sdk_query_concurrency: int = 4
 
 
 def load_settings() -> Settings:
@@ -62,5 +65,18 @@ def load_settings() -> Settings:
             factor_source.get("stock_daily_table")
             or "stock_daily_factor_source"
         ).strip(),
+        data_sdk_api_base_url=str(
+            factor_source.get("entity_asset_api_base_url") or ""
+        ).strip().rstrip("/"),
+        data_sdk_query_timeout_seconds=max(
+            1.0,
+            float(
+                factor_source.get("entity_asset_query_timeout_seconds") or 120
+            ),
+        ),
+        data_sdk_query_concurrency=max(
+            1,
+            int(factor_source.get("entity_asset_query_concurrency") or 4),
+        ),
     )
     return result

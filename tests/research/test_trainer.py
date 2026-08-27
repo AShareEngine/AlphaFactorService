@@ -674,29 +674,6 @@ def test_prediction_rank_one_is_the_highest_score() -> None:
     assert str(ranked.loc["HIGH", "computed_at"].tz) == "Asia/Shanghai"
 
 
-def test_market_style_prediction_uses_full_minus_one_to_one_range() -> None:
-    index = pd.MultiIndex.from_tuples(
-        [
-            (pd.Timestamp("2024-01-02"), "STYLE_SMALL"),
-            (pd.Timestamp("2024-01-02"), "STYLE_LARGE"),
-        ],
-        names=["datetime", "instrument"],
-    )
-    prediction = pd.Series([0.9, 0.1], index=index)
-    job = {
-        "job_id": "style-job",
-        "dataset_spec": {"prediction_scope": "market_style"},
-    }
-
-    ranked = _prediction_frame(
-        prediction, SimpleNamespace(), job,
-    ).set_index("entity_code")
-
-    assert ranked.loc["STYLE_SMALL", "rank_value"] == 1
-    assert ranked.loc["STYLE_SMALL", "score"] == 1.0
-    assert ranked.loc["STYLE_LARGE", "score"] == -1.0
-
-
 def test_industry_prediction_uses_full_minus_one_to_one_range() -> None:
     index = pd.MultiIndex.from_tuples(
         [

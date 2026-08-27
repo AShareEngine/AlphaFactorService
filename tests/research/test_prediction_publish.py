@@ -97,34 +97,3 @@ def test_daily_inference_publish_replaces_only_target_date(monkeypatch, tmp_path
     assert "trade_date IN" in query
     assert parameters["trade_dates"] == [pd.Timestamp("2024-12-31").date()]
 
-
-def test_market_style_predictions_publish_with_style_entity_type(monkeypatch, tmp_path: Path) -> None:
-    settings = Settings(
-        clickhouse_host="localhost", clickhouse_port=8123,
-        clickhouse_user="default", clickhouse_password="",
-        factor_database="ab_factor", model_database="ab_model",
-        source_database="starlight", work_root=tmp_path,
-        model_artifacts_root=tmp_path / "artifacts",
-    )
-    trainer = QlibTrainer.__new__(QlibTrainer)
-    trainer.settings = settings
-    client = _ClickHouse()
-    monkeypatch.setattr(
-        "factor_service.research.trainer.clickhouse_connect.get_client",
-        lambda **_kwargs: client,
-    )
-    path = tmp_path / "style.parquet"
-    pd.DataFrame([{
-        "trade_date": pd.Timestamp("2024-12-31"),
-        "entity_code": "STYLE_SMALL", "raw_prediction": 0.2,
-        "rank_value": 1, "percentile": 1.0, "score": 1.0,
-        "feature_cutoff_at": pd.Timestamp("2024-12-31 15:00:00", tz="Asia/Shanghai"),
-        "computed_at": pd.Timestamp("2024-12-31 16:00:00", tz="Asia/Shanghai"),
-        "source_vintage": "style-test",
-    }]).to_parquet(path, index=False)
-    job = valid_job()
-    job["dataset_spec"]["research_target"] = "market_style"
-    job["dataset_spec"]["prediction_scope"] = "market_style"
-
-    assert trainer.publish_predictions(path, job) == 1
-    assert client.inserts[0][1][0][1] == "market_style"

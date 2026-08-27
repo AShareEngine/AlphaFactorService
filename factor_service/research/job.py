@@ -20,12 +20,21 @@ from factor_service.research.errors import (
     TrainingTimeout,
     WorkerShutdown,
 )
+from factor_service.research.industry_feature import (
+    INDUSTRY_FEATURE_SAFE_START,
+    normalize_industry_feature,
+)
 from factor_service.research.preprocessing import (
     DATASET_PIPELINE_VERSION,
     normalize_feature_preprocessing,
 )
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
+)
+from factor_service.research.training_resource_settings import (
+    frozen_data_binding,
+    normalize_frozen_training_data_bindings,
+    required_training_data_binding_ids,
 )
 
 
@@ -193,8 +202,13 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     preprocessing = spec.get("preprocessing")
     pipeline_version = str(spec.get("pipeline_version") or "")
     if preprocessing is None:
-        if pipeline_version == DATASET_PIPELINE_VERSION:
-            raise PermanentJobError("v6数据集缺少冻结的preprocessing规格")
+        if pipeline_version in {
+            "alphablocks.dataset-pipeline.v6", DATASET_PIPELINE_VERSION,
+        }:
+            version_label = pipeline_version.rsplit(".", 1)[-1]
+            raise PermanentJobError(
+                f"{version_label}数据集缺少冻结的preprocessing规格"
+            )
     else:
         if not isinstance(preprocessing, dict):
             raise PermanentJobError("dataset_spec.preprocessing必须是对象")
@@ -207,6 +221,26 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             raise PermanentJobError(str(exc)) from exc
         if normalized_preprocessing != preprocessing:
             raise PermanentJobError("dataset_spec.preprocessing不是规范化冻结规格")
+    industry_feature = spec.get("industry_feature")
+    if industry_feature is None:
+        if pipeline_version == DATASET_PIPELINE_VERSION:
+            raise PermanentJobError("v8数据集缺少冻结的industry_feature规格")
+        normalized_industry_feature = normalize_industry_feature(
+            None, default_enabled=False,
+        )
+    else:
+        if not isinstance(industry_feature, dict):
+            raise PermanentJobError("dataset_spec.industry_feature必须是对象")
+        try:
+            normalized_industry_feature = normalize_industry_feature(
+                industry_feature, default_enabled=False,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+        if normalized_industry_feature != industry_feature:
+            raise PermanentJobError(
+                "dataset_spec.industry_feature不是规范化冻结规格"
+            )
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")
@@ -214,6 +248,31 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     end = _date(spec.get("date_end"), "date_end")
     if start >= end:
         raise PermanentJobError("训练开始日期必须早于结束日期")
+    if normalized_industry_feature["enabled"]:
+        if str(spec.get("research_target") or "stock_selection") != "stock_selection":
+            raise PermanentJobError("行业编码特征仅支持个股选股训练目标")
+        if start < _date(INDUSTRY_FEATURE_SAFE_START, "industry_feature.safe_start"):
+            raise PermanentJobError(
+                "行业编码特征仅支持2021-12-13及以后；"
+                "更早历史包含申万2021版回溯重分类"
+            )
+    if pipeline_version == DATASET_PIPELINE_VERSION:
+        try:
+            data_bindings = normalize_frozen_training_data_bindings(
+                spec.get("data_bindings"),
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+        missing_bindings = [
+            binding_id
+            for binding_id in required_training_data_binding_ids(spec)
+            if frozen_data_binding(data_bindings, binding_id) is None
+        ]
+        if missing_bindings:
+            raise PermanentJobError(
+                "dataset_spec.data_bindings缺少冻结绑定: "
+                + ", ".join(missing_bindings)
+            )
     cutoff = _datetime(spec.get("data_cutoff"), "data_cutoff")
     factors = spec.get("factors")
     if not isinstance(factors, list) or not 1 <= len(factors) <= 100:

@@ -25,6 +25,7 @@ from factor_service.research.dataset import (
     walk_forward_segments,
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.industry_feature import normalize_industry_feature
 from factor_service.research.preprocessing import (
     normalize_feature_preprocessing,
     preprocess_qlib_frame,
@@ -478,7 +479,7 @@ class QlibTrainer:
         prediction_scope = str(
             dataset_spec.get("prediction_scope") or "stock"
         ).strip().lower()
-        if prediction_scope not in {"stock", "market_style", "industry"}:
+        if prediction_scope not in {"stock", "industry"}:
             raise ValueError(f"不支持的预测实体类型: {prediction_scope}")
         client = clickhouse_connect.get_client(
             host=self.settings.clickhouse_host,
@@ -793,6 +794,14 @@ def _incremental_prepared_dataset(
     candidate_preprocessing = normalize_feature_preprocessing(
         candidate_manifest.get("preprocessing"), default_enabled=False,
     )
+    source_industry_feature = normalize_industry_feature(
+        source_manifest.get("industry_feature"), default_enabled=False,
+    )
+    candidate_industry_feature = normalize_industry_feature(
+        candidate_manifest.get("industry_feature"), default_enabled=False,
+    )
+    if source_industry_feature != candidate_industry_feature:
+        raise ValueError("增量训练来源模型与新数据集的行业特征口径不一致")
     source_excluded = sorted(
         str(name)
         for name in source_manifest.get("preprocessing_excluded_features") or []
@@ -1907,8 +1916,8 @@ def _prediction_frame(prediction: pd.Series, prepared: PreparedDataset, job: dic
     prediction_scope = str(
         dataset_spec.get("prediction_scope") or "stock"
     ).strip().lower()
-    if prediction_scope in {"market_style", "industry"}:
-        # 风格与行业截面实体较少，使用完整区间映射，保证首尾为+1/-1，
+    if prediction_scope == "industry":
+        # 行业截面实体较少，使用完整区间映射，保证首尾为+1/-1，
         # 而不是普通pct rank在N个样本时只能覆盖(-1, 1]。
         counts = grouped.transform("size")
         frame["score"] = np.where(

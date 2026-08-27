@@ -9,6 +9,10 @@ import pytest
 
 from factor_service.research.errors import PermanentJobError
 from factor_service.research.inference import DailyInferenceRunner
+from factor_service.research.industry_feature import (
+    industry_feature_names,
+    normalize_industry_feature,
+)
 from factor_service.research.preprocessing import normalize_feature_preprocessing
 from tests.research.utils import valid_inference_job
 
@@ -23,9 +27,15 @@ class _Control:
 
 
 class _DatasetBuilder:
-    def __init__(self, values: list[float]) -> None:
+    def __init__(
+        self,
+        values: list[float],
+        industry_entities: list[str | None] | None = None,
+    ) -> None:
         self.values = values
+        self.industry_entities = industry_entities
         self.membership_calls = 0
+        self.industry_calls = 0
 
     def _membership(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
         self.membership_calls += 1
@@ -41,28 +51,52 @@ class _DatasetBuilder:
             "value": self.values,
         })
 
+    def _industry_membership(
+        self, observations: pd.DataFrame, *_args: Any, **_kwargs: Any,
+    ) -> pd.DataFrame:
+        self.industry_calls += 1
+        if self.industry_entities is None:
+            raise AssertionError("industry membership must not be requested")
+        result = observations[["trade_date", "instrument"]].copy()
+        result["industry_entity"] = self.industry_entities
+        return result
 
-def _runner(values: list[float]) -> DailyInferenceRunner:
+
+def _runner(
+    values: list[float],
+    industry_entities: list[str | None] | None = None,
+) -> DailyInferenceRunner:
     runner = DailyInferenceRunner.__new__(DailyInferenceRunner)
     runner.control = _Control()
-    runner.dataset_builder = _DatasetBuilder(values)
+    runner.dataset_builder = _DatasetBuilder(values, industry_entities)
     return runner
 
 
-def _training_manifest(job: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+def _training_manifest(
+    job: dict[str, Any], *, enabled: bool,
+    industry_enabled: bool = False,
+) -> dict[str, Any]:
     factor = job["dataset_spec"]["factors"][0]
     feature_name = (
         f"{factor['factor_id']}__v{int(factor['factor_version'])}__"
         f"{str(factor['params_hash'])[:8]}"
     )
+    industry_feature = normalize_industry_feature(
+        {"enabled": industry_enabled}, default_enabled=False,
+    )
+    industry_names = industry_feature_names(industry_feature)
+    feature_names = [feature_name, *industry_names]
     return {
         "model_kind": "lightgbm",
-        "feature_names": [feature_name],
-        "medians": {feature_name: 123.0},
+        "feature_names": feature_names,
+        "medians": {name: 0.0 for name in feature_names} | {
+            feature_name: 123.0,
+        },
         "preprocessing": normalize_feature_preprocessing(
             {"enabled": enabled}, default_enabled=False,
         ),
-        "preprocessing_excluded_features": [],
+        "preprocessing_excluded_features": industry_names,
+        "industry_feature": industry_feature,
     }
 
 
@@ -126,3 +160,90 @@ def test_daily_inference_rejects_preprocessing_different_from_training_manifest(
         runner.run(job, tmp_path / "mismatch")
 
     assert runner.dataset_builder.membership_calls == 0
+
+
+def test_daily_inference_appends_training_frozen_industry_columns_in_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    values = [float(index) for index in range(10)]
+    industries = ["801010.SI"] * 9 + ["899999.SI"]
+    job = valid_inference_job()
+    industry_feature = normalize_industry_feature(
+        {"enabled": True}, default_enabled=False,
+    )
+    job["dataset_spec"]["industry_feature"] = industry_feature
+    manifest = _training_manifest(
+        job, enabled=True, industry_enabled=True,
+    )
+    monkeypatch.setattr(
+        "factor_service.research.inference._load_bundle",
+        lambda _path: (object(), manifest),
+    )
+    captured: dict[str, pd.DataFrame] = {}
+
+    def predict(_model: Any, _kind: str, features: pd.DataFrame) -> np.ndarray:
+        captured["features"] = features.copy()
+        return np.arange(len(features), dtype=float)
+
+    monkeypatch.setattr(
+        "factor_service.research.inference.predict_feature_frame", predict,
+    )
+    runner = _runner(values, industries)
+
+    result = runner.run(job, tmp_path / "industry-infer")
+
+    industry_names = industry_feature_names(industry_feature)
+    actual = captured["features"]
+    assert actual.columns.tolist() == manifest["feature_names"]
+    assert (actual[industry_names].sum(axis=1) == 1.0).all()
+    assert actual.loc[0, "industry_sw2021_l1__801010_si"] == 1.0
+    assert actual.loc[9, "industry_sw2021_l1__unknown"] == 1.0
+    assert set(actual[industry_names].stack().unique()) == {0.0, 1.0}
+    assert runner.dataset_builder.industry_calls == 1
+    assert result.result["manifest"]["industry_feature"] == industry_feature
+    assert result.result["manifest"]["industry_feature_details"][
+        "mapped_coverage"
+    ] == pytest.approx(0.9)
+
+
+def test_daily_inference_rejects_industry_contract_or_column_order_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    job = valid_inference_job()
+    enabled = normalize_industry_feature(
+        {"enabled": True}, default_enabled=False,
+    )
+    disabled = normalize_industry_feature(
+        {"enabled": False}, default_enabled=False,
+    )
+    manifest = _training_manifest(
+        job, enabled=True, industry_enabled=True,
+    )
+    monkeypatch.setattr(
+        "factor_service.research.inference._load_bundle",
+        lambda _path: (object(), manifest),
+    )
+    runner = _runner([1.0] * 10, ["801010.SI"] * 10)
+    job["dataset_spec"]["industry_feature"] = disabled
+
+    with pytest.raises(PermanentJobError, match="行业特征口径不一致"):
+        runner.run(job, tmp_path / "industry-contract-mismatch")
+
+    assert runner.dataset_builder.membership_calls == 0
+
+    reordered = dict(manifest)
+    reordered["feature_names"] = list(manifest["feature_names"])
+    reordered["feature_names"][-2:] = reversed(
+        reordered["feature_names"][-2:]
+    )
+    monkeypatch.setattr(
+        "factor_service.research.inference._load_bundle",
+        lambda _path: (object(), reordered),
+    )
+    job["dataset_spec"]["industry_feature"] = enabled
+    second_runner = _runner([1.0] * 10, ["801010.SI"] * 10)
+
+    with pytest.raises(PermanentJobError, match="特征顺序"):
+        second_runner.run(job, tmp_path / "industry-order-mismatch")
+
+    assert second_runner.dataset_builder.membership_calls == 0

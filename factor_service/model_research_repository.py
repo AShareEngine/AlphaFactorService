@@ -21,6 +21,10 @@ from factor_service.entity_field_feature import (
 )
 from factor_service.model_validation import select_model_trial, select_parameter_trial
 from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
+from factor_service.research.industry_feature import (
+    INDUSTRY_FEATURE_SAFE_START,
+    normalize_industry_feature,
+)
 from factor_service.research.preprocessing import (
     DATASET_PIPELINE_VERSION,
     LEGACY_DATASET_PIPELINE_VERSIONS,
@@ -28,6 +32,9 @@ from factor_service.research.preprocessing import (
 )
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
+)
+from factor_service.research.training_resource_settings import (
+    normalize_frozen_training_data_bindings,
 )
 
 
@@ -123,7 +130,7 @@ class ModelResearchConflict(ModelResearchError):
 
 
 def _training_dataset_source(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Read the dataset contract and bridge the retired context-only switch.
+    """Read dataset contracts and bridge retired context-only switches.
 
     Preprocessing changes the immutable dataset contents, so new clients freeze
     it below ``dataset``.  This one-way bridge keeps requests from the previous
@@ -134,15 +141,25 @@ def _training_dataset_source(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_dataset, Mapping):
         raise ModelResearchError("dataset必须是对象")
     source = dict(raw_dataset)
-    if "preprocessing" in source:
-        return source
     context = payload.get("context") or {}
-    if not isinstance(context, Mapping) or "preprocessing_enabled" not in context:
+    if not isinstance(context, Mapping):
         return source
-    enabled = context.get("preprocessing_enabled")
-    if not isinstance(enabled, bool):
-        raise ModelResearchError("context.preprocessing_enabled必须是布尔值")
-    source["preprocessing"] = {"enabled": enabled}
+    if (
+        "preprocessing" not in source
+        and "preprocessing_enabled" in context
+    ):
+        enabled = context.get("preprocessing_enabled")
+        if not isinstance(enabled, bool):
+            raise ModelResearchError("context.preprocessing_enabled必须是布尔值")
+        source["preprocessing"] = {"enabled": enabled}
+    if (
+        "industry_feature" not in source
+        and "industry_as_feature" in context
+    ):
+        enabled = context.get("industry_as_feature")
+        if not isinstance(enabled, bool):
+            raise ModelResearchError("context.industry_as_feature必须是布尔值")
+        source["industry_feature"] = {"enabled": enabled}
     return source
 
 
@@ -3410,7 +3427,6 @@ def _architecture_spec(
             dataset.get("research_target") or "stock_selection"
         ).strip().lower()
         expected_target = {
-            "market_style": "market_style",
             "industry_rotation": "industry_rotation",
         }.get(role, "stock_selection")
         if research_target != expected_target:
@@ -3424,7 +3440,6 @@ def _architecture_spec(
         prediction = dict(model.get("prediction_json") or {})
         prediction_range = _model_prediction_range(model)
         stage = {
-            "market_style": "style_gate",
             "industry_rotation": "industry_gate",
             "risk_filter": "risk_gate",
         }.get(role, "stock_rank")
@@ -3446,8 +3461,7 @@ def _architecture_spec(
             "prediction_scope": str(
                 dataset.get("prediction_scope")
                 or (
-                    "market_style" if research_target == "market_style"
-                    else "industry" if research_target == "industry_rotation"
+                    "industry" if research_target == "industry_rotation"
                     else "stock"
                 )
             ),
@@ -3485,14 +3499,12 @@ def _architecture_spec(
     if pipeline_mode == "hierarchical":
         stage_counts = {
             stage: sum(item["stage"] == stage for item in enabled)
-            for stage in ("style_gate", "industry_gate", "stock_rank")
+            for stage in ("industry_gate", "stock_rank")
         }
-        if stage_counts["style_gate"] != 1:
-            raise ModelResearchError("三级门控架构必须且只能启用1个市场风格引擎")
         if stage_counts["industry_gate"] < 1:
-            raise ModelResearchError("三级门控架构至少需要1个行业轮动引擎")
+            raise ModelResearchError("分层门控架构至少需要1个行业轮动引擎")
         if stage_counts["stock_rank"] < 1:
-            raise ModelResearchError("三级门控架构至少需要1个个股选股引擎")
+            raise ModelResearchError("分层门控架构至少需要1个个股选股引擎")
     weighted_engines = [
         item for item in normalized
         if item["enabled"]
@@ -3542,7 +3554,7 @@ def _architecture_spec(
             "runtime_status": "research_backtest_ready",
             "pipeline_mode": pipeline_mode,
             "stage_order": (
-                ["style_gate", "industry_gate", "risk_gate", "stock_rank"]
+                ["industry_gate", "risk_gate", "stock_rank"]
                 if pipeline_mode == "hierarchical" else ["parallel_stock_rank"]
             ),
             "gate_semantics": (
@@ -3595,13 +3607,12 @@ def _architecture_readiness(
     pipeline_mode = str(config.get("pipeline_mode") or "flat")
     stage_counts = {
         stage: sum(str(item.get("stage") or "stock_rank") == stage for item in enabled)
-        for stage in ("style_gate", "industry_gate", "stock_rank")
+        for stage in ("industry_gate", "stock_rank")
     }
     topology_ready = (
         pipeline_mode == "flat"
         or (
             pipeline_mode == "hierarchical"
-            and stage_counts["style_gate"] == 1
             and stage_counts["industry_gate"] >= 1
             and stage_counts["stock_rank"] >= 1
         )
@@ -3652,13 +3663,12 @@ def _architecture_readiness(
                 "平行融合"
                 if pipeline_mode == "flat"
                 else (
-                    f"风格{stage_counts['style_gate']} / "
                     f"行业{stage_counts['industry_gate']} / "
                     f"个股{stage_counts['stock_rank']}"
                 )
             ),
             "operator": "valid", "threshold": (
-                "无角色约束" if pipeline_mode == "flat" else "1 / >=1 / >=1"
+                "无角色约束" if pipeline_mode == "flat" else ">=1 / >=1"
             ),
             "passed": topology_ready,
         },
@@ -3991,6 +4001,8 @@ def _historical_dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     historical = dict(source)
     if historical.get("preprocessing") is None:
         historical["preprocessing"] = {"enabled": False}
+    if historical.get("industry_feature") is None:
+        historical["industry_feature"] = {"enabled": False}
     return _dataset_spec(historical)
 
 
@@ -4153,6 +4165,7 @@ def _incremental_training_assessment(
                 and source_dataset.get("index_code") == dataset.get("index_code")
                 and source_dataset.get("sample_filters") == dataset.get("sample_filters")
                 and source_dataset.get("preprocessing") == dataset.get("preprocessing")
+                and source_dataset.get("industry_feature") == dataset.get("industry_feature")
                 and source_dataset.get("research_target") == dataset.get("research_target")
                 and source_dataset.get("prediction_scope") == dataset.get("prediction_scope")
                 and source_label == candidate_label
@@ -4273,11 +4286,9 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     research_target = str(
         source.get("research_target") or "stock_selection"
     ).strip().lower()
-    if research_target not in {
-        "stock_selection", "market_style", "industry_rotation",
-    }:
+    if research_target not in {"stock_selection", "industry_rotation"}:
         raise ModelResearchError(
-            "训练目标只支持stock_selection、market_style或industry_rotation"
+            "训练目标只支持stock_selection或industry_rotation"
         )
     if (
         research_target == "industry_rotation"
@@ -4315,9 +4326,7 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "positive_class": "future_return_gt_zero",
             "formula": f"1[future_return(T,T+{horizon}) > 0]",
         }
-        if research_target == "market_style":
-            label["entities"] = ["STYLE_SMALL", "STYLE_LARGE"]
-        elif research_target == "industry_rotation":
+        if research_target == "industry_rotation":
             label.update({
                 "classification": "sw2021_l1",
                 "safe_start": SW2021_INDUSTRY_SAFE_START,
@@ -4325,13 +4334,6 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     else:
         label = (
             {
-                "kind": f"future_{horizon}d_market_style_rank",
-                "horizon_trading_days": horizon,
-                "range": [-1.0, 1.0],
-                "entities": ["STYLE_SMALL", "STYLE_LARGE"],
-            }
-            if research_target == "market_style"
-            else {
                 "kind": f"future_{horizon}d_industry_rank",
                 "horizon_trading_days": horizon,
                 "range": [-1.0, 1.0],
@@ -4444,6 +4446,31 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise ModelResearchError(str(exc)) from exc
+    raw_industry_feature = source.get("industry_feature")
+    if raw_industry_feature is None:
+        raw_industry_feature = {}
+    if not isinstance(raw_industry_feature, Mapping):
+        raise ModelResearchError("industry_feature必须是对象")
+    try:
+        industry_feature = normalize_industry_feature(
+            raw_industry_feature, default_enabled=False,
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
+    if industry_feature["enabled"]:
+        if research_target != "stock_selection":
+            raise ModelResearchError("行业编码特征仅支持个股选股训练目标")
+        if date_start < INDUSTRY_FEATURE_SAFE_START:
+            raise ModelResearchError(
+                "行业编码特征仅支持2021-12-13及以后；"
+                "更早历史包含申万2021版回溯重分类"
+            )
+    try:
+        data_bindings = normalize_frozen_training_data_bindings(
+            source.get("data_bindings"), allow_empty=True,
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
     return {
         # Part of the immutable dataset identity. Bump this whenever label or
         # feature materialization semantics change so an older canonical
@@ -4455,14 +4482,15 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "benchmark_code": benchmark_code,
         "sample_filters": sample_filters,
         "preprocessing": preprocessing,
+        "industry_feature": industry_feature,
+        "data_bindings": data_bindings,
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,
         "research_target": research_target,
         "target_mode": target_mode,
         "prediction_scope": (
-            "market_style" if research_target == "market_style"
-            else "industry" if research_target == "industry_rotation"
+            "industry" if research_target == "industry_rotation"
             else "stock"
         ),
         "factors": normalized_factors,

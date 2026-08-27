@@ -12,12 +12,14 @@ from factor_service.research.dataset import (
     _future_rank_label,
     _industry_features,
     _industry_rank_label,
-    _market_style_features,
-    _market_style_rank_label,
     split_trading_dates,
     walk_forward_segments,
 )
 from factor_service.research.errors import JobCanceled
+from factor_service.research.industry_feature import (
+    industry_feature_names,
+    normalize_industry_feature,
+)
 from factor_service.research.job import CancellationToken
 from factor_service.entity_field_feature import normalize_entity_field_feature
 from tests.research.utils import valid_job
@@ -56,71 +58,6 @@ def test_future_direction_label_matches_quantmind_binary_definition() -> None:
     assert first.to_dict() == {"DOWN": 0.0, "FLAT": 0.0, "UP": 1.0}
     assert labels["LABEL0"].notna().all()
     assert dates[-1] not in set(labels["trade_date"])
-
-
-def test_market_style_features_use_daily_pit_market_cap_halves() -> None:
-    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
-    features = pd.DataFrame([
-        {"trade_date": day, "instrument": code, "factor": value}
-        for day, rows in (
-            (dates[0], (("A", 1.0), ("B", 3.0), ("C", 5.0), ("D", 7.0))),
-            (dates[1], (("A", 2.0), ("B", 4.0), ("C", 6.0), ("D", 8.0))),
-        )
-        for code, value in rows
-    ])
-    market_caps = pd.DataFrame([
-        {"trade_date": day, "instrument": code, "market_cap": cap}
-        for day, rows in (
-            (dates[0], (("A", 10), ("B", 20), ("C", 30), ("D", 40))),
-            # B和C在第二天交换大小盘归属，证明分组不是静态标签。
-            (dates[1], (("A", 10), ("B", 40), ("C", 20), ("D", 50))),
-        )
-        for code, cap in rows
-    ])
-
-    aggregated, membership = _market_style_features(
-        features, market_caps, ["factor"],
-    )
-
-    first = aggregated[aggregated["trade_date"] == dates[0]].set_index("instrument")
-    second = aggregated[aggregated["trade_date"] == dates[1]].set_index("instrument")
-    assert first.loc["STYLE_SMALL", "factor"] == pytest.approx(2.0)
-    assert first.loc["STYLE_LARGE", "factor"] == pytest.approx(6.0)
-    assert second.loc["STYLE_SMALL", "factor"] == pytest.approx(4.0)
-    assert second.loc["STYLE_LARGE", "factor"] == pytest.approx(6.0)
-    second_membership = membership[
-        membership["trade_date"] == dates[1]
-    ].set_index("instrument")["style_entity"]
-    assert second_membership.to_dict() == {
-        "A": "STYLE_SMALL", "C": "STYLE_SMALL",
-        "B": "STYLE_LARGE", "D": "STYLE_LARGE",
-    }
-
-
-def test_market_style_label_is_centered_between_small_and_large_groups() -> None:
-    dates = pd.date_range("2024-01-02", periods=3, freq="B")
-    prices = pd.DataFrame([
-        {"trade_date": day, "instrument": code, "adjusted_close": value}
-        for day, rows in (
-            (dates[0], (("A", 10.0), ("B", 10.0), ("C", 10.0), ("D", 10.0))),
-            (dates[1], (("A", 12.0), ("B", 11.0), ("C", 9.0), ("D", 8.0))),
-            (dates[2], (("A", 12.0), ("B", 11.0), ("C", 9.0), ("D", 8.0))),
-        )
-        for code, value in rows
-    ])
-    membership = pd.DataFrame([
-        {"trade_date": dates[0], "instrument": code, "style_entity": style}
-        for code, style in (
-            ("A", "STYLE_SMALL"), ("B", "STYLE_SMALL"),
-            ("C", "STYLE_LARGE"), ("D", "STYLE_LARGE"),
-        )
-    ])
-
-    labels = _market_style_rank_label(prices, membership, horizon=1)
-    first = labels.set_index("instrument")["LABEL0"]
-
-    assert first["STYLE_SMALL"] == pytest.approx(1.0)
-    assert first["STYLE_LARGE"] == pytest.approx(-1.0)
 
 
 def test_industry_features_use_signal_day_weights() -> None:
@@ -226,6 +163,115 @@ def test_industry_membership_rejects_duplicate_signal_day_assignment() -> None:
         builder._industry_membership(
             observations, "2024-01-02", "2024-01-02",
         )
+
+
+def test_dataset_build_appends_pit_industry_one_hot_and_excludes_it_from_scaling(
+    monkeypatch,
+) -> None:
+    dates = pd.date_range("2024-01-02", periods=100, freq="B")
+    instruments = [f"S{index:02d}" for index in range(10)]
+    membership = pd.DataFrame([
+        {"trade_date": day, "instrument": code}
+        for day in dates
+        for code in instruments
+    ])
+    factor_values = membership.copy()
+    factor_values["value"] = [
+        float(index) for index in range(len(factor_values))
+    ]
+    industry_membership = membership.copy()
+    industry_membership["industry_entity"] = [
+        (
+            "801030.SI"
+            if code == "S00" and day >= dates[50]
+            else "801010.SI"
+            if code < "S05"
+            else "801030.SI"
+        )
+        for day, code in zip(
+            industry_membership["trade_date"],
+            industry_membership["instrument"],
+        )
+    ]
+    industry_membership["industry_name"] = "行业"
+    industry_membership["industry_weight"] = 1.0
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace()
+    builder._membership = lambda *_args, **_kwargs: membership.copy()
+    builder._factor_definition = lambda _item: SimpleNamespace(output_type="number")
+    builder._factor_values = lambda *_args, **_kwargs: factor_values.copy()
+    builder._adjusted_close = lambda *_args, **_kwargs: pd.DataFrame()
+    industry_state = {"frame": industry_membership}
+    builder._industry_membership = (
+        lambda *_args, **_kwargs: industry_state["frame"].copy()
+    )
+
+    def fake_labels(_prices, *, horizon):
+        assert horizon == 5
+        labels = membership.copy()
+        labels["LABEL0"] = 0.0
+        return labels
+
+    monkeypatch.setattr(dataset_module, "_future_rank_label", fake_labels)
+    contract = normalize_industry_feature(
+        {"enabled": True}, default_enabled=False,
+    )
+    one_hot_names = industry_feature_names(contract)
+    job = valid_job()
+    job["dataset_spec"].update({
+        "date_start": dates[0].date().isoformat(),
+        "date_end": dates[-1].date().isoformat(),
+        "research_target": "stock_selection",
+        "target_mode": "return",
+        "preprocessing": {"enabled": True},
+        "industry_feature": contract,
+    })
+
+    prepared = builder.build(job)
+
+    assert prepared.feature_names[-32:] == one_hot_names
+    assert prepared.manifest["industry_feature"] == contract
+    assert prepared.manifest["industry_feature_details"] == {
+        "feature_names": one_hot_names,
+        "mapped_coverage": pytest.approx(1.0),
+        "unknown_rows": 0,
+        "category_count": 31,
+    }
+    assert set(one_hot_names).issubset(
+        prepared.manifest["preprocessing_excluded_features"]
+    )
+    one_hot_frame = prepared.frame.loc[:, [
+        ("feature", name) for name in one_hot_names
+    ]]
+    assert (one_hot_frame.sum(axis=1) == 1.0).all()
+    first_code = "industry_sw2021_l1__801010_si"
+    second_code = "industry_sw2021_l1__801030_si"
+    assert prepared.raw_frame.loc[
+        (dates[0], "S00"), ("feature", first_code)
+    ] == 1.0
+    assert prepared.raw_frame.loc[
+        (dates[-1], "S00"), ("feature", second_code)
+    ] == 1.0
+    assert prepared.frame.loc[
+        (dates[0], "S00"), ("feature", first_code)
+    ] == 1.0
+    assert prepared.frame.loc[
+        (dates[-1], "S00"), ("feature", second_code)
+    ] == 1.0
+
+    # Training and inference share dataset.minimum_factor_coverage.  A dataset
+    # accepted at the training stage must not become unscorable solely because
+    # inference applies a stricter industry threshold.
+    partly_unknown = industry_membership.copy()
+    partly_unknown.loc[
+        partly_unknown.index[:100], "industry_entity"
+    ] = "899999.SI"
+    industry_state["frame"] = partly_unknown
+    job["dataset_spec"]["minimum_factor_coverage"] = 0.95
+
+    with pytest.raises(ValueError, match=r"90\.00%低于95%"):
+        builder.build(job)
 
 
 def test_split_has_five_session_embargo_between_segments() -> None:

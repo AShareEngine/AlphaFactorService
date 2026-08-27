@@ -79,12 +79,11 @@ def dataset_walk_forward_attribution(
 def architecture_walk_forward_attribution(
     backtests: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Attribute aligned WFA backtests to style and industry gates."""
+    """Attribute aligned WFA backtests to industry and optional risk gates."""
     profile_labels = {
         "stock_only": "仅个股",
-        "style_stock": "风格 + 个股",
         "industry_stock": "行业 + 个股",
-        "full": "三级全开",
+        "full": "分层全开",
     }
     selected: dict[str, dict[str, Any]] = {}
     for raw in backtests:
@@ -125,7 +124,7 @@ def architecture_walk_forward_attribution(
     if not common_windows:
         return {
             "eligible": False,
-            "reason": "四组消融没有共同完整WFA窗口",
+            "reason": "三组消融没有共同完整WFA窗口",
             "profiles": [],
             "windows": [],
         }
@@ -166,16 +165,12 @@ def architecture_walk_forward_attribution(
             "all_profiles_negative": bool(finite_excess) and all(
                 value < 0 for value in finite_excess
             ),
-            "style_gate_delta": _difference(
-                values["style_stock"], values["stock_only"],
-            ),
             "industry_gate_delta": _difference(
                 values["industry_stock"], values["stock_only"],
             ),
             "full_vs_industry_delta": _difference(
                 values["full"], values["industry_stock"],
             ),
-            "gate_interaction_delta": _interaction_delta(values),
         })
     weak_window = min(
         rows,
@@ -197,7 +192,7 @@ def architecture_walk_forward_attribution(
     common_failure_count = sum(row["all_profiles_negative"] for row in rows)
     conclusion = (
         f"共同最弱窗口为W{weak_window['window']}（{weak_window['test_start']}至"
-        f"{weak_window['test_end']}）；四组方案均为负超额，说明问题不只来自单一门控。"
+        f"{weak_window['test_end']}）；三组方案均为负超额，说明问题不只来自单一门控。"
         if weak_window["all_profiles_negative"] else
         f"最弱窗口为W{weak_window['window']}，不同门控方案表现分化。"
     )
@@ -209,7 +204,6 @@ def architecture_walk_forward_attribution(
         "profiles": profile_rows,
         "best_profile": best_profile,
         "gate_contributions": {
-            "style_vs_stock_mean": mean_for("style_stock") - mean_for("stock_only"),
             "industry_vs_stock_mean": mean_for("industry_stock") - mean_for("stock_only"),
             "full_vs_industry_mean": mean_for("full") - mean_for("industry_stock"),
         },
@@ -1466,16 +1460,6 @@ def _difference(left: float | None, right: float | None) -> float | None:
     if left is None or right is None:
         return None
     return left - right
-
-
-def _interaction_delta(values: Mapping[str, float | None]) -> float | None:
-    required = [values.get(key) for key in (
-        "full", "industry_stock", "style_stock", "stock_only",
-    )]
-    if any(value is None for value in required):
-        return None
-    full, industry, style, stock = required
-    return float(full - industry - style + stock)  # type: ignore[operator]
 
 
 def _market_regime(benchmark_annual_return: float | None) -> str:

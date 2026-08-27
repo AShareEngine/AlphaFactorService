@@ -180,7 +180,6 @@ def test_walk_forward_attribution_finds_factor_reversal(
 def test_architecture_walk_forward_attribution_identifies_common_weak_window() -> None:
     excess = {
         "stock_only": [0.10, -0.20],
-        "style_stock": [0.12, -0.22],
         "industry_stock": [0.15, -0.16],
         "full": [0.17, -0.19],
     }

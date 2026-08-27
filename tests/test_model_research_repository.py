@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 
 import pytest
 
@@ -10,6 +11,7 @@ from factor_service.model_research_repository import (
     ModelResearchError,
     _architecture_readiness,
     _architecture_spec,
+    _canonical_json,
     _dataset_spec,
     _ensemble_spec,
     _experiment_summary,
@@ -25,6 +27,7 @@ from factor_service.model_research_repository import (
     _training_dataset_source,
     _walk_forward_spec,
 )
+from factor_service.research.industry_feature import normalize_industry_feature
 
 
 def _source() -> dict:
@@ -151,7 +154,8 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
-    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v6"
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v8"
+    assert spec["data_bindings"]["settings_revision"] == 0
     assert spec["sample_filters"] == {
         "minimum_listing_trading_days": 60,
         "exclude_st": True,
@@ -177,6 +181,9 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
             "constant_value": 0.0,
         },
     }
+    assert spec["industry_feature"] == normalize_industry_feature(
+        {"enabled": False}, default_enabled=True,
+    )
     assert spec["materialization"] == {
         "mode": "on_demand", "format": "parquet", "persist_factor_values": False,
     }
@@ -195,6 +202,7 @@ def test_dataset_contract_preserves_legacy_unfiltered_replay() -> None:
         "custom_formulas": [],
     }
     assert spec["preprocessing"]["enabled"] is False
+    assert spec["industry_feature"]["enabled"] is False
 
 
 def test_dataset_contract_freezes_preprocessing_and_changes_identity() -> None:
@@ -238,6 +246,64 @@ def test_persisted_dataset_without_preprocessing_uses_legacy_disabled_mode() -> 
     historical = _historical_dataset_spec(_source())
 
     assert historical["preprocessing"]["enabled"] is False
+    assert historical["industry_feature"]["enabled"] is False
+
+
+def test_dataset_contract_freezes_industry_one_hot_and_changes_hash() -> None:
+    base = {**_source(), "date_start": "2022-01-04"}
+    enabled = _dataset_spec({
+        **base,
+        "industry_feature": {"enabled": True},
+    })
+    disabled = _dataset_spec({
+        **base,
+        "industry_feature": {"enabled": False},
+    })
+
+    assert enabled["industry_feature"] == normalize_industry_feature(
+        {"enabled": True}, default_enabled=False,
+    )
+    assert disabled["industry_feature"]["enabled"] is False
+    assert sha256(_canonical_json(enabled).encode("utf-8")).hexdigest() != (
+        sha256(_canonical_json(disabled).encode("utf-8")).hexdigest()
+    )
+    with pytest.raises(ModelResearchError, match="2021-12-13"):
+        _dataset_spec({
+            **_source(),
+            "industry_feature": {"enabled": True},
+        })
+    with pytest.raises(ModelResearchError, match="仅支持个股选股"):
+        _dataset_spec({
+            **base,
+            "research_target": "industry_rotation",
+            "industry_feature": {"enabled": True},
+        })
+
+
+def test_legacy_context_industry_switch_is_moved_only_for_new_requests() -> None:
+    source = _training_dataset_source({
+        "dataset": {**_source(), "date_start": "2022-01-04"},
+        "context": {"industry_as_feature": True},
+    })
+
+    assert source["industry_feature"] == {"enabled": True}
+    assert "industry_feature" not in _source()
+
+    explicit = _training_dataset_source({
+        "dataset": {
+            **_source(),
+            "industry_feature": {"enabled": False},
+        },
+        "context": {"industry_as_feature": True},
+    })
+    assert explicit["industry_feature"] == {"enabled": False}
+
+    # Historical jobs never executed the former UI-only context switch.
+    historical = _historical_dataset_spec({
+        **_source(),
+        "pipeline_version": "alphablocks.dataset-pipeline.v6",
+    })
+    assert historical["industry_feature"]["enabled"] is False
 
 
 def test_dataset_contract_validates_sample_filters() -> None:
@@ -636,6 +702,21 @@ def test_incremental_training_requires_exact_lightgbm_feature_contract() -> None
     assert blocked["passed"] is False
     assert "feature_identity" in blocked["failed_checks"]
 
+    changed_industry = {
+        **candidate_dataset,
+        "industry_feature": normalize_industry_feature(
+            {"enabled": True}, default_enabled=False,
+        ),
+    }
+    industry_blocked = _incremental_training_assessment(
+        source, bundle,
+        dataset=changed_industry,
+        model=candidate_model,
+        walk_forward=_walk_forward_spec({}),
+    )
+    assert industry_blocked["passed"] is False
+    assert "target_contract" in industry_blocked["failed_checks"]
+
 
 def test_incremental_training_accepts_legacy_v5_disabled_preprocessing() -> None:
     source = _trained_model(
@@ -651,6 +732,7 @@ def test_incremental_training_accepts_legacy_v5_disabled_preprocessing() -> None
         "pipeline_version": "alphablocks.dataset-pipeline.v5",
     }
     source["dataset_spec"].pop("preprocessing")
+    source["dataset_spec"].pop("industry_feature")
     candidate_dataset = _dataset_spec({
         **_source(),
         "date_end": "2025-01-02",
@@ -725,19 +807,9 @@ def test_training_job_freezes_remote_execution_node() -> None:
         _execution_spec({"max_runtime_minutes": 30})
 
 
-def test_market_style_dataset_contract_freezes_target_and_style_label() -> None:
-    source = {**_source(), "research_target": "market_style"}
-
-    spec = _dataset_spec(source)
-
-    assert spec["research_target"] == "market_style"
-    assert spec["prediction_scope"] == "market_style"
-    assert spec["label"] == {
-        "kind": "future_5d_market_style_rank",
-        "horizon_trading_days": 5,
-        "range": [-1.0, 1.0],
-        "entities": ["STYLE_SMALL", "STYLE_LARGE"],
-    }
+def test_removed_market_style_dataset_target_is_rejected() -> None:
+    with pytest.raises(ModelResearchError, match="训练目标只支持"):
+        _dataset_spec({**_source(), "research_target": "market_style"})
 
 
 def test_industry_rotation_dataset_rejects_pre_sw2021_history() -> None:
@@ -1140,78 +1212,55 @@ def test_hierarchical_architecture_freezes_complete_decision_chain() -> None:
             },
         }
         for model_id, version in (
-            ("model-style", 1), ("model-industry", 2), ("model-stock", 3),
+            ("model-industry", 1), ("model-stock", 2),
         )
     ]
     models[0]["dataset_spec"] = {
         **models[0]["dataset_spec"],
-        "research_target": "market_style",
-        "prediction_scope": "market_style",
-    }
-    # 行业训练当前会被真实能力检查阻断；这里构造未来具备PIT时间戳后
-    # 注册的不可变模型，用于验证三级架构的执行契约。
-    models[1]["dataset_spec"] = {
-        **models[1]["dataset_spec"],
         "research_target": "industry_rotation",
         "prediction_scope": "industry",
     }
     spec = _architecture_spec({
-        "name": "风格行业个股三级架构",
+        "name": "行业个股分层架构",
         "pipeline_mode": "hierarchical",
         "merge_method": "weighted_score",
         "engines": [
             {
-                "engine_key": "style", "role": "market_style",
-                "model_id": "model-style", "model_version": 1,
-            },
-            {
                 "engine_key": "industry", "role": "industry_rotation",
-                "model_id": "model-industry", "model_version": 2,
+                "model_id": "model-industry", "model_version": 1,
             },
             {
                 "engine_key": "stock", "role": "stock_selection",
-                "model_id": "model-stock", "model_version": 3,
+                "model_id": "model-stock", "model_version": 2,
             },
         ],
     }, models)
 
     assert spec["pipeline_mode"] == "hierarchical"
     assert [item["stage"] for item in spec["engines"]] == [
-        "style_gate", "industry_gate", "stock_rank",
+        "industry_gate", "stock_rank",
     ]
     assert spec["execution_contract"]["stage_order"] == [
-        "style_gate", "industry_gate", "risk_gate", "stock_rank",
+        "industry_gate", "risk_gate", "stock_rank",
     ]
     readiness = _architecture_readiness(spec, models)
     assert readiness["research_backtest_ready"] is True
     assert readiness["stage_counts"] == {
-        "style_gate": 1, "industry_gate": 1, "stock_rank": 1,
+        "industry_gate": 1, "stock_rank": 1,
     }
 
 
 def test_hierarchical_architecture_rejects_missing_industry_stage() -> None:
-    models = [
-        _trained_model("model-style", 1, validation_icir=0.4),
-        _trained_model("model-stock", 2, validation_icir=0.4),
-    ]
-    models[0]["dataset_spec"] = {
-        **models[0]["dataset_spec"],
-        "research_target": "market_style",
-        "prediction_scope": "market_style",
-    }
+    models = [_trained_model("model-stock", 1, validation_icir=0.4)]
     with pytest.raises(ModelResearchError, match="行业轮动"):
         _architecture_spec({
-            "name": "不完整三级架构",
+            "name": "不完整分层架构",
             "pipeline_mode": "hierarchical",
             "merge_method": "weighted_score",
             "engines": [
                 {
-                    "role": "market_style", "model_id": "model-style",
-                    "model_version": 1,
-                },
-                {
                     "role": "stock_selection", "model_id": "model-stock",
-                    "model_version": 2,
+                    "model_version": 1,
                 },
             ],
         }, models)

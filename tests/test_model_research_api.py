@@ -49,6 +49,7 @@ class _Repository:
         return jobs[:limit]
 
     def create_training_job(self, payload):
+        self.created_payload = payload
         job = {"job_id": "job-created", "status": "queued", "title": payload["title"]}
         self.jobs[job["job_id"]] = job
         return job
@@ -328,6 +329,23 @@ def _client(monkeypatch, repository, scheduler) -> TestClient:
     app.include_router(model_research.router)
     monkeypatch.setattr(model_research, "repository", repository)
     monkeypatch.setattr(
+        model_research,
+        "get_training_resource_settings",
+        lambda: {
+            "schema_version": "alphablocks.model-training-resources.v1",
+            "revision": 1,
+            "entity_assets": {
+                "selection_mode": "all_authorized_stock_assets",
+                "bindings": [],
+            },
+            "local_node": {
+                "id": "local", "type": "local", "name": "本机训练",
+                "description": "test", "enabled": True,
+                "max_runtime_minutes": 1440,
+            },
+        },
+    )
+    monkeypatch.setattr(
         model_research.model_repository,
         "latest_model_backtest_jobs",
         lambda _identities: {},
@@ -348,6 +366,55 @@ def test_training_job_is_created_and_dispatched_locally(monkeypatch) -> None:
     assert dispatched.status_code == 202
     assert dispatched.json()["service"]["accepted"] is True
     assert scheduler.submitted[0]["lease_owner"] == "alpha-factor-service"
+
+
+def test_training_job_freezes_configured_database_binding(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    monkeypatch.setattr(
+        model_research,
+        "get_training_resource_settings",
+        lambda: {
+            "schema_version": "alphablocks.model-training-data-bindings.v1",
+            "revision": 2,
+            "bindings": {
+                "stock_industry_one_hot": {
+                    "enabled": True,
+                    "source_type": "entity_asset",
+                    "source_id": "asset_industry_membership",
+                    "source_label": "行业成分与权重",
+                    "provider_node_id": "industry_membership_weight_real",
+                    "field_bindings": {
+                        "trade_date": "trade_date",
+                        "instrument": "con_code",
+                        "industry_code": "index_code",
+                        "industry_name": "level1_name",
+                        "industry_level": "level_type",
+                        "weight": "weight",
+                    },
+                    "industry_level_value": "1",
+                    "catalog_updated_at": "",
+                },
+            },
+        },
+    )
+    payload = {
+        "title": "resource-policy",
+        "execution": {"node_id": "local", "max_runtime_minutes": 180},
+        "dataset": {
+            "industry_feature": {"enabled": True},
+            "factors": [],
+        },
+    }
+
+    accepted = client.post("/model-research/jobs", json=payload)
+
+    assert accepted.status_code == 201
+    frozen = repository.created_payload["dataset"]["industry_feature"]
+    assert frozen["schema_version"] == "alphablocks.stock-industry-one-hot.v2"
+    assert frozen["data_binding"]["source_id"] == "asset_industry_membership"
+    assert frozen["data_binding"]["provider_node_id"] == "industry_membership_weight_real"
+    assert frozen["data_binding"]["settings_revision"] == 2
 
 
 def test_completed_training_requires_explicit_registration(monkeypatch) -> None:
@@ -381,7 +448,6 @@ def test_training_targets_expose_real_availability(monkeypatch) -> None:
         def target_capabilities():
             return [
                 {"target": "stock_selection", "ready": True},
-                {"target": "market_style", "ready": True},
                 {
                     "target": "industry_rotation", "ready": True,
                     "minimum_date": "2021-12-13",
@@ -396,10 +462,7 @@ def test_training_targets_expose_real_availability(monkeypatch) -> None:
     response = client.get("/model-research/training-targets")
 
     assert response.status_code == 200
-    assert response.json()["targets"][1] == {
-        "target": "market_style", "ready": True,
-    }
-    assert response.json()["targets"][2]["minimum_date"] == "2021-12-13"
+    assert response.json()["targets"][1]["minimum_date"] == "2021-12-13"
 
 
 def test_execution_nodes_and_local_status_are_exposed_without_secrets(monkeypatch) -> None:
@@ -424,6 +487,59 @@ def test_execution_nodes_and_local_status_are_exposed_without_secrets(monkeypatc
     assert "ssh_password" not in nodes.text
     assert status.status_code == 200
     assert status.json()["status"]["online"] is True
+
+
+def test_training_resource_settings_are_read_and_updated_with_revision(monkeypatch) -> None:
+    current = {
+        "schema_version": "alphablocks.model-training-data-bindings.v1",
+        "revision": 4,
+        "updated_at": "2026-08-27T00:00:00+00:00",
+        "bindings": {
+            "stock_industry_one_hot": {
+                "enabled": False,
+                "source_type": "node",
+                "source_id": "",
+                "source_label": "",
+                "provider_node_id": "",
+                "field_bindings": {},
+                "industry_level_value": "1",
+                "catalog_updated_at": "",
+            },
+        },
+    }
+    captured = {}
+
+    class _SettingsRepository:
+        def update(self, source, *, expected_revision):
+            captured.update({
+                "source": source, "expected_revision": expected_revision,
+            })
+            return {**current, "revision": 5}
+
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+    monkeypatch.setattr(
+        model_research, "get_training_resource_settings", lambda: current,
+    )
+    monkeypatch.setattr(
+        model_research, "TrainingResourceSettingsRepository",
+        _SettingsRepository,
+    )
+
+    loaded = client.get("/model-research/training-data-bindings")
+    updated = client.put(
+        "/model-research/training-data-bindings",
+        json={"expected_revision": 4, "settings": {
+            "schema_version": current["schema_version"],
+            "bindings": current["bindings"],
+        }},
+    )
+
+    assert loaded.status_code == 200
+    assert loaded.json()["storage"] == "postgresql"
+    assert loaded.json()["settings"]["revision"] == 4
+    assert updated.status_code == 200
+    assert updated.json()["settings"]["revision"] == 5
+    assert captured["expected_revision"] == 4
 
 
 def test_execution_node_settings_crud_api_never_returns_password_values(monkeypatch) -> None:
@@ -471,30 +587,6 @@ def test_execution_node_settings_crud_api_never_returns_password_values(monkeypa
     assert "private-password" not in "".join(
         response.text for response in (listed, created, updated, deleted)
     )
-
-
-def test_market_style_model_can_be_viewed_but_not_top20_backtested(monkeypatch) -> None:
-    class _StyleRepository(_Repository):
-        def get_model(self, model_id, version):
-            return {
-                **super().get_model(model_id, version),
-                "dataset_spec": {
-                    "research_target": "market_style",
-                    "prediction_scope": "market_style",
-                    "factors": [{"factor_id": "mom_20"}],
-                },
-            }
-
-    client = _client(monkeypatch, _StyleRepository(), _Scheduler())
-
-    viewed = client.get("/model-research/models/style-model/versions/1")
-    backtest = client.post(
-        "/model-research/models/style-model/versions/1/backtests", json={},
-    )
-
-    assert viewed.status_code == 200
-    assert backtest.status_code == 409
-    assert "模型架构中作为门控引擎" in backtest.json()["detail"]
 
 
 def test_model_registry_action_uses_validation_gate_and_returns_pool_state(monkeypatch) -> None:
@@ -847,9 +939,8 @@ def test_model_architecture_can_start_and_list_ablation_backtests(monkeypatch) -
 
     profiles = [
         {"key": "stock_only", "label": "仅个股"},
-        {"key": "style_stock", "label": "风格 + 个股"},
         {"key": "industry_stock", "label": "行业 + 个股"},
-        {"key": "full", "label": "三级全开"},
+        {"key": "full", "label": "分层全开"},
     ]
     monkeypatch.setattr(
         model_research.model_repository, "architecture_ablation_profiles",
@@ -874,7 +965,7 @@ def test_model_architecture_can_start_and_list_ablation_backtests(monkeypatch) -
     )
     assert created.status_code == 201
     assert [item["configuration"]["ablation_profile"] for item in created.json()["backtests"]] == [
-        "stock_only", "style_stock", "industry_stock", "full",
+        "stock_only", "industry_stock", "full",
     ]
 
     listed = client.get(
@@ -1078,7 +1169,7 @@ def test_architecture_walk_forward_attribution_combines_engines(monkeypatch) -> 
             "eligible": True,
             "weak_window": {
                 "window": 3, "all_profiles_negative": True,
-                "market_regime": "strong_bull", "style_gate_delta": -0.01,
+                "market_regime": "strong_bull",
                 "industry_gate_delta": 0.02,
             },
         },

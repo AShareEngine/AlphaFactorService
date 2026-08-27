@@ -10,13 +10,15 @@ import pandas as pd
 FEATURE_PREPROCESSING_SCHEMA_VERSION = (
     "alphablocks.cross-sectional-feature-preprocessing.v1"
 )
-DATASET_PIPELINE_VERSION = "alphablocks.dataset-pipeline.v6"
+DATASET_PIPELINE_VERSION = "alphablocks.dataset-pipeline.v8"
 LEGACY_DATASET_PIPELINE_VERSIONS = frozenset({
     "alphablocks.dataset-pipeline.v1",
     "alphablocks.dataset-pipeline.v2",
     "alphablocks.dataset-pipeline.v3",
     "alphablocks.dataset-pipeline.v4",
     "alphablocks.dataset-pipeline.v5",
+    "alphablocks.dataset-pipeline.v6",
+    "alphablocks.dataset-pipeline.v7",
 })
 _DEFAULT_QUANTILES = (0.01, 0.99)
 _DEFAULT_MINIMUM_OBSERVATIONS = 10

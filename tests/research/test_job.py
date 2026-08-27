@@ -18,10 +18,21 @@ from factor_service.research.errors import (
 from factor_service.research.job import (
     CancellationToken, _canonical_json, safe_job_dir, validate_job,
 )
+from factor_service.research.industry_feature import normalize_industry_feature
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
 from factor_service.research.preprocessing import normalize_feature_preprocessing
+from factor_service.research.training_resource_settings import (
+    BINDING_DEFINITIONS,
+    INDEX_MEMBERSHIP_BINDING_ID,
+    SECURITY_MASTER_BINDING_ID,
+    STOCK_DAILY_BINDING_ID,
+    STOCK_STATUS_BINDING_ID,
+    TRADING_CALENDAR_BINDING_ID,
+    frozen_training_data_bindings,
+    normalize_training_resource_settings,
+)
 from factor_service.research.state import JobStateStore
 from tests.research.utils import valid_inference_job, valid_job
 
@@ -86,14 +97,46 @@ def test_job_validation_accepts_and_validates_sample_filters() -> None:
         validate_job(source)
 
 
-def test_job_validation_requires_normalized_preprocessing_for_v6() -> None:
+def _frozen_core_bindings() -> dict:
+    binding_ids = [
+        STOCK_DAILY_BINDING_ID,
+        SECURITY_MASTER_BINDING_ID,
+        INDEX_MEMBERSHIP_BINDING_ID,
+        TRADING_CALENDAR_BINDING_ID,
+        STOCK_STATUS_BINDING_ID,
+    ]
+    bindings = {}
+    for binding_id in binding_ids:
+        roles = BINDING_DEFINITIONS[binding_id]["roles"]
+        bindings[binding_id] = {
+            "enabled": True,
+            "source_type": "node",
+            "source_id": f"{binding_id}_node",
+            "source_label": binding_id,
+            "provider_node_id": f"{binding_id}_node",
+            "field_bindings": {
+                role["id"]: role["id"] for role in roles
+            },
+            "catalog_updated_at": "",
+        }
+    settings = normalize_training_resource_settings({"bindings": bindings})
+    settings["revision"] = 1
+    return frozen_training_data_bindings(settings, binding_ids)
+
+
+def test_job_validation_requires_normalized_dataset_contracts_for_v8() -> None:
     source = valid_job()
     preprocessing = normalize_feature_preprocessing(
         {"enabled": True}, default_enabled=False,
     )
+    industry_feature = normalize_industry_feature(
+        {"enabled": False}, default_enabled=False,
+    )
     for target in (source["dataset_spec"], source["config_json"]["dataset"]):
-        target["pipeline_version"] = "alphablocks.dataset-pipeline.v6"
+        target["pipeline_version"] = "alphablocks.dataset-pipeline.v8"
         target["preprocessing"] = deepcopy(preprocessing)
+        target["industry_feature"] = deepcopy(industry_feature)
+        target["data_bindings"] = deepcopy(_frozen_core_bindings())
     source["dataset_hash"] = sha256(
         _canonical_json(source["dataset_spec"]).encode("utf-8")
     ).hexdigest()
@@ -107,22 +150,93 @@ def test_job_validation_requires_normalized_preprocessing_for_v6() -> None:
     source["dataset_hash"] = sha256(
         _canonical_json(source["dataset_spec"]).encode("utf-8")
     ).hexdigest()
-    with pytest.raises(PermanentJobError, match="v6数据集缺少"):
+    with pytest.raises(PermanentJobError, match="v8数据集缺少"):
+        validate_job(source)
+
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target["preprocessing"] = deepcopy(preprocessing)
+        target.pop("industry_feature")
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="v8数据集缺少.*industry_feature"):
         validate_job(source)
 
 
 def test_job_validation_rejects_partial_preprocessing_contract() -> None:
     source = valid_job()
     partial = {"enabled": True}
+    industry_feature = normalize_industry_feature(
+        {"enabled": False}, default_enabled=False,
+    )
     for target in (source["dataset_spec"], source["config_json"]["dataset"]):
-        target["pipeline_version"] = "alphablocks.dataset-pipeline.v6"
+        target["pipeline_version"] = "alphablocks.dataset-pipeline.v7"
         target["preprocessing"] = deepcopy(partial)
+        target["industry_feature"] = deepcopy(industry_feature)
     source["dataset_hash"] = sha256(
         _canonical_json(source["dataset_spec"]).encode("utf-8")
     ).hexdigest()
 
     with pytest.raises(PermanentJobError, match="不是规范化冻结规格"):
         validate_job(source)
+
+
+def test_job_validation_freezes_industry_contract_and_safe_start() -> None:
+    source = valid_job()
+    preprocessing = normalize_feature_preprocessing(
+        {"enabled": True}, default_enabled=False,
+    )
+    enabled = normalize_industry_feature(
+        {"enabled": True}, default_enabled=False,
+    )
+    for target in (source["dataset_spec"], source["config_json"]["dataset"]):
+        target.update({
+            "pipeline_version": "alphablocks.dataset-pipeline.v7",
+            "date_start": "2022-01-04",
+            "preprocessing": deepcopy(preprocessing),
+            "industry_feature": deepcopy(enabled),
+        })
+    source["dataset_hash"] = sha256(
+        _canonical_json(source["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+
+    validated = validate_job(source)
+
+    assert validated["dataset_spec"]["industry_feature"] == enabled
+
+    partial = deepcopy(source)
+    for target in (
+        partial["dataset_spec"], partial["config_json"]["dataset"],
+    ):
+        target["industry_feature"] = {"enabled": True}
+    partial["dataset_hash"] = sha256(
+        _canonical_json(partial["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="industry_feature不是规范化"):
+        validate_job(partial)
+
+    unsafe = deepcopy(source)
+    for target in (
+        unsafe["dataset_spec"], unsafe["config_json"]["dataset"],
+    ):
+        target["date_start"] = "2021-12-10"
+    unsafe["dataset_hash"] = sha256(
+        _canonical_json(unsafe["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="2021-12-13"):
+        validate_job(unsafe)
+
+    wrong_target = deepcopy(source)
+    for target in (
+        wrong_target["dataset_spec"],
+        wrong_target["config_json"]["dataset"],
+    ):
+        target["research_target"] = "industry_rotation"
+    wrong_target["dataset_hash"] = sha256(
+        _canonical_json(wrong_target["dataset_spec"]).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(PermanentJobError, match="仅支持个股选股"):
+        validate_job(wrong_target)
 
 
 def test_job_validation_accepts_frozen_custom_sample_filter_formula() -> None:
