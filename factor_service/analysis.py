@@ -12,7 +12,12 @@ import pandas as pd
 
 from factor_service import repository
 from factor_service.clickhouse import client, settings
-from factor_service.schemas import FactorAnalysisJobOut
+from factor_service.schemas import (
+    FactorAnalysisJobOut,
+    FactorFormulaAnalysisRequest,
+    FactorOut,
+)
+from factor_service.worker import build_factor_query_plan, factor_query_source
 
 
 logger = logging.getLogger(__name__)
@@ -72,17 +77,115 @@ def run_analysis_job(analysis_job_id: str) -> FactorAnalysisJobOut:
 
 
 def build_analysis_payload(job: FactorAnalysisJobOut) -> AnalysisPayload:
-    try:
-        from alphalens import performance, utils
-    except ImportError as exc:
-        raise RuntimeError("因子分析需要安装 alphalens-reloaded") from exc
-
     periods = sorted({int(item) for item in job.periods if int(item) > 0})
     if not periods:
         raise ValueError("分析周期不能为空")
 
     date_start, date_end = _resolve_analysis_range(job)
     factor = _load_factor_series(job, date_start, date_end)
+    return _analyze_factor_series(job, factor, date_start, date_end, periods)
+
+
+def run_formula_analysis(request: FactorFormulaAnalysisRequest) -> dict[str, Any]:
+    """Evaluate one formula in memory without registering or materializing it."""
+    if request.date_start > request.date_end:
+        raise ValueError("开始日期不能晚于结束日期")
+    periods = sorted({int(item) for item in request.periods if int(item) > 0})
+    if not periods:
+        raise ValueError("分析周期不能为空")
+    analysis_id = "formula_analysis_" + __import__("uuid").uuid4().hex
+    formula_params = dict(request.params or {})
+    factor = FactorOut(
+        factor_id=analysis_id,
+        label=request.name,
+        description="ephemeral formula analysis",
+        entity_type="stock",
+        category="research_formula",
+        group_name="ephemeral",
+        output_type="number",
+        frequency="daily",
+        asset_id="stock",
+        source_node_id="stock_daily_real",
+        required_fields=[],
+        params={
+            **formula_params,
+            "data_processing": dict(request.preprocessing or {}),
+        },
+        param_schema={name: {} for name in formula_params},
+        availability_policy={
+            "field": "available_at",
+            "policy": "persisted_timestamp",
+        },
+        expression=request.expression,
+        enabled=True,
+        version=1,
+        available_versions=[1],
+    )
+    with factor_query_source(
+        factor,
+        overrides=formula_params,
+        date_start=request.date_start,
+        date_end=request.date_end,
+        job_id=analysis_id,
+    ) as source_binding:
+        plan = build_factor_query_plan(
+            factor,
+            overrides=formula_params,
+            entity_type="stock",
+            date_start=request.date_start,
+            date_end=request.date_end,
+            job_id=analysis_id,
+            source_binding=source_binding,
+        )
+        rows = client().query(plan.sql, parameters=plan.params).result_rows
+    if not rows:
+        raise ValueError("公式在指定日期范围没有生成可用因子值")
+    frame = pd.DataFrame(
+        rows,
+        columns=["date", "asset", "raw_value", "rank", "percentile", "score"],
+    )
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["asset"] = frame["asset"].astype(str)
+    frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+    frame = frame.dropna(subset=["score"])
+    if frame.empty:
+        raise ValueError("公式生成的因子值全部为空")
+    index = pd.MultiIndex.from_frame(frame[["date", "asset"]], names=["date", "asset"])
+    factor_series = pd.Series(
+        frame["score"].to_numpy(dtype=float), index=index, name="factor",
+    ).sort_index()
+    job = FactorAnalysisJobOut(
+        analysis_job_id=analysis_id,
+        factor_id=request.name,
+        factor_version=0,
+        entity_type="stock",
+        params_hash=plan.params_hash,
+        date_start=request.date_start,
+        date_end=request.date_end,
+        periods=periods,
+        quantiles=request.quantiles,
+        price_field=request.price_field,
+        cumulative_returns=request.cumulative_returns,
+        max_loss=request.max_loss,
+        status="running",
+    )
+    payload = _analyze_factor_series(
+        job, factor_series, request.date_start, request.date_end, periods,
+    )
+    return _formula_payload_response(request, payload, analysis_id)
+
+
+def _analyze_factor_series(
+    job: FactorAnalysisJobOut,
+    factor: pd.Series,
+    date_start: date,
+    date_end: date,
+    periods: list[int],
+) -> AnalysisPayload:
+    try:
+        from alphalens import performance, utils
+    except ImportError as exc:
+        raise RuntimeError("因子分析需要安装 alphalens-reloaded") from exc
     price_end = date_end + timedelta(days=max(periods) * 4 + 15)
     prices = _load_prices(job, date_start, price_end)
     factor = _shift_factor_to_next_trading_day(factor, prices.index)
@@ -120,6 +223,74 @@ def build_analysis_payload(job: FactorAnalysisJobOut) -> AnalysisPayload:
         turnover_rows=turnover_rows,
         row_count=int(len(factor_data)),
     )
+
+
+def _formula_payload_response(
+    request: FactorFormulaAnalysisRequest,
+    payload: AnalysisPayload,
+    analysis_id: str,
+) -> dict[str, Any]:
+    summary = [
+        {
+            "analysis_job_id": row[0],
+            "metric": row[1],
+            "period": row[2],
+            "value": row[3],
+            "payload": json.loads(row[4]) if row[4] else {},
+        }
+        for row in payload.summary_rows
+    ]
+    ic = [
+        {
+            "analysis_job_id": row[0],
+            "trade_date": row[1],
+            "period": row[2],
+            "ic": row[3],
+        }
+        for row in payload.ic_rows
+    ]
+    quantile_returns = [
+        {
+            "analysis_job_id": row[0],
+            "trade_date": row[1],
+            "period": row[2],
+            "quantile": row[3],
+            "mean_return": row[4],
+        }
+        for row in payload.quantile_return_rows
+    ]
+    turnover = [
+        {
+            "analysis_job_id": row[0],
+            "trade_date": row[1],
+            "period": row[2],
+            "quantile": row[3],
+            "turnover": row[4],
+            "rank_autocorrelation": row[5],
+        }
+        for row in payload.turnover_rows
+    ]
+    return {
+        "schema_version": "alphablocks.ephemeral-formula-analysis.v1",
+        "analysis_id": analysis_id,
+        "name": request.name,
+        "expression": request.expression,
+        "params": dict(request.params),
+        "preprocessing": dict(request.preprocessing),
+        "date_start": request.date_start,
+        "date_end": request.date_end,
+        "periods": list(request.periods),
+        "quantiles": request.quantiles,
+        "signal_lag_trading_days": 1,
+        "ic_method": "spearman_rank",
+        "row_count": payload.row_count,
+        "summary": summary,
+        "ic": ic,
+        "quantile_returns": quantile_returns,
+        "turnover": turnover,
+        "persisted": False,
+        "registered": False,
+    }
 
 
 def _resolve_analysis_range(job: FactorAnalysisJobOut) -> tuple[date, date]:

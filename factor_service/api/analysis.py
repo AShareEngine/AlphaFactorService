@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from factor_service import repository
-from factor_service.analysis import run_analysis_job, run_pending_analysis_jobs
+from factor_service.analysis import (
+    run_analysis_job,
+    run_formula_analysis,
+    run_pending_analysis_jobs,
+)
 from factor_service.schemas import (
     FactorAnalysisIcOut,
     FactorAnalysisJobCreate,
@@ -13,6 +17,7 @@ from factor_service.schemas import (
     FactorAnalysisQuantileReturnOut,
     FactorAnalysisSummaryOut,
     FactorAnalysisTurnoverOut,
+    FactorFormulaAnalysisRequest,
 )
 
 
@@ -56,6 +61,29 @@ def get_analysis_job(analysis_job_id: str) -> FactorAnalysisJobOut:
 def run_one_analysis_job(analysis_job_id: str) -> FactorAnalysisJobOut:
     try:
         return run_analysis_job(analysis_job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/jobs/{analysis_job_id}/start", response_model=FactorAnalysisJobOut)
+def start_one_analysis_job(
+    analysis_job_id: str,
+    background_tasks: BackgroundTasks,
+) -> FactorAnalysisJobOut:
+    """Start one pending analysis without blocking an SDK or notebook request."""
+    job = repository.get_analysis_job(analysis_job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="分析任务不存在")
+    if job.status == "pending":
+        background_tasks.add_task(run_analysis_job, analysis_job_id)
+    return job
+
+
+@router.post("/formula")
+def analyze_formula(payload: FactorFormulaAnalysisRequest) -> dict:
+    """Analyze an unregistered formula without persisting factor values."""
+    try:
+        return run_formula_analysis(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -29,10 +29,12 @@ from factor_service.research.industry_feature import (
 from factor_service.research.data_binding_source import (
     load_bound_index_membership,
     load_bound_industry_membership,
+    load_bound_registered_membership,
     load_bound_security_master,
     load_bound_stock_daily,
     load_bound_stock_status,
     load_bound_trading_calendar,
+    load_bound_universe_filter_membership,
 )
 from factor_service.research.preprocessing import (
     LEGACY_DATASET_PIPELINE_VERSIONS,
@@ -56,6 +58,9 @@ from factor_service.research.training_resource_settings import (
     training_data_binding,
     training_data_binding_ready,
 )
+from factor_service.research.universe_field_filter import (
+    normalize_universe_field_filters,
+)
 from factor_service.schemas import FactorOut
 from factor_service.worker import build_factor_query_plan, factor_query_source
 
@@ -68,6 +73,9 @@ SW2021_INDUSTRY_SAFE_START = INDUSTRY_FEATURE_SAFE_START
 DEFAULT_FACTOR_QUERY_CHUNK_DAYS = 90
 LISTING_AGE_CALENDAR_CODE = "000001.SH"
 SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DATASET_SPLIT_RESOLUTION_SCHEMA_VERSION = (
+    "alphablocks.dataset-split-resolution.v1"
+)
 
 
 @dataclass(frozen=True)
@@ -249,13 +257,29 @@ class DatasetBuilder:
         _progress(progress, "building_membership", 6, {})
         universe_id = str(spec.get("universe_id") or "csi500")
         index_code = str(spec.get("index_code") or "000905.SH")
+        universe_field_filters = normalize_universe_field_filters(
+            spec.get("universe_field_filters")
+        )
         membership = self._membership(
             date_start, date_end, universe_id=universe_id, index_code=index_code,
             sample_filters=spec.get("sample_filters"),
+            universe_field_filters=universe_field_filters,
             data_bindings=data_bindings,
+            universe_source=spec.get("universe_source"),
+            data_cutoff=str(spec["data_cutoff"]),
         )
         if membership.empty:
             raise ValueError("历史股票池应用样本过滤后为空")
+        membership_calendar_value = membership.attrs.get("_trading_calendar")
+        membership_calendar = pd.DatetimeIndex(
+            [] if membership_calendar_value is None else membership_calendar_value
+        )
+        universe_filter_steps = list(
+            membership.attrs.get("universe_filter_steps") or []
+        )
+        universe_source_provenance = dict(
+            membership.attrs.get("training_data_binding") or {}
+        )
         expected = membership[["trade_date", "instrument"]].drop_duplicates()
         expected_count = max(1, len(expected))
         minimum_coverage = float(
@@ -398,13 +422,12 @@ class DatasetBuilder:
             labels, on=["trade_date", "instrument"], how="inner",
         )
         raw_panel.sort_values(["trade_date", "instrument"], inplace=True)
-        trading_dates = pd.Index(sorted(raw_panel["trade_date"].unique()))
         split_config = dict(spec.get("split") or {})
-        segments = split_trading_dates(
-            trading_dates,
-            embargo_days=max(1, int(split_config.get("embargo_days") or 5)),
-            train_ratio=float(split_config.get("train") or 0.6),
-            valid_ratio=float(split_config.get("valid") or 0.2),
+        segments = materialized_dataset_segments(
+            split=split_config,
+            membership_calendar=membership_calendar,
+            available_sample_dates=raw_panel["trade_date"],
+            label_horizon_trading_days=horizon,
         )
         _progress(progress, "splitting_dataset", 52, {"segments": segments})
         train_start, train_end = segments["train"]
@@ -494,6 +517,10 @@ class DatasetBuilder:
             future_function_guards.append(
                 "daily point-in-time listing age, ST and delisting filters applied before materialization"
             )
+        if universe_field_filters:
+            future_function_guards.append(
+                "entity-asset field predicates resolved to frozen node versions and applied point-in-time"
+            )
         if sample_filters.get("custom_formulas"):
             future_function_guards.append(
                 "custom sample formulas use allowlisted point-in-time fields and backward-only windows"
@@ -531,7 +558,16 @@ class DatasetBuilder:
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "target_contract": target_contract,
+            "target_ref": dict(spec.get("target_ref") or {}),
+            "transform_refs": list(spec.get("transform_refs") or []),
+            "universe_rule_refs": list(
+                spec.get("universe_rule_refs") or []
+            ),
+            "universe_field_filters": universe_field_filters,
             "sample_filters": sample_filters,
+            "universe_filter_steps": universe_filter_steps,
+            "universe_source": dict(spec.get("universe_source") or {}),
+            "universe_source_provenance": universe_source_provenance,
             "future_function_guards": future_function_guards,
             "materialization": {
                 "mode": "on_demand",
@@ -556,11 +592,32 @@ class DatasetBuilder:
         universe_id: str = "csi500",
         index_code: str = "000905.SH",
         sample_filters: dict[str, Any] | None = None,
+        universe_field_filters: list[dict[str, Any]] | None = None,
         data_bindings: dict[str, Any] | None = None,
+        universe_source: dict[str, Any] | None = None,
+        data_cutoff: str = "",
     ) -> pd.DataFrame:
-        if universe_id not in UNIVERSES:
+        frozen_source = dict(universe_source or {})
+        registered_source = (
+            frozen_source
+            if frozen_source.get("source_kind") == "entity_asset"
+            else {}
+        )
+        configured_source = (
+            frozen_source
+            if frozen_source.get("source_kind") == "configured_stock_pool"
+            else {}
+        )
+        if frozen_source and not str(data_cutoff or "").strip():
+            raise ValueError("自定义历史成员股票池缺少冻结data_cutoff")
+        if universe_id not in UNIVERSES and not frozen_source:
             raise ValueError(f"不支持的股票池: {universe_id}")
-        if index_code not in {config["index_code"] for config in UNIVERSES.values()}:
+        if (
+            not frozen_source
+            and index_code not in {
+                config["index_code"] for config in UNIVERSES.values()
+            }
+        ):
             raise ValueError(f"不支持的基准指数: {index_code}")
         calendar_binding = frozen_data_binding(
             data_bindings, TRADING_CALENDAR_BINDING_ID,
@@ -571,7 +628,16 @@ class DatasetBuilder:
             )
             if calendar.empty:
                 raise ValueError("设置中心绑定的交易日历在训练区间内为空")
-            if universe_id == "all_a":
+            if registered_source:
+                frame = load_bound_registered_membership(
+                    self.settings,
+                    registered_source,
+                    calendar,
+                    date_start=date_start,
+                    date_end=date_end,
+                    data_cutoff=data_cutoff,
+                )
+            elif universe_id == "all_a":
                 master_binding = frozen_data_binding(
                     data_bindings, SECURITY_MASTER_BINDING_ID,
                 )
@@ -598,15 +664,24 @@ class DatasetBuilder:
                     index_code=index_code, date_end=date_end,
                 )
                 frame = _expand_membership_intervals(calendar, intervals)
+            provenance = dict(frame.attrs.get("training_data_binding") or {})
             if not frame.empty:
                 frame = self._apply_sample_filters(
                     frame,
                     date_start=date_start,
                     date_end=date_end,
                     sample_filters=sample_filters,
+                    universe_field_filters=universe_field_filters,
                     data_bindings=data_bindings,
+                    data_cutoff=data_cutoff,
                 )
+                if provenance:
+                    frame.attrs["training_data_binding"] = provenance
+            frame.attrs["_trading_calendar"] = pd.DatetimeIndex(calendar)
             return frame
+
+        if registered_source or configured_source:
+            raise ValueError("配置历史成员股票池必须使用冻结的交易日历绑定")
 
         calendar_code = "000905.SH" if universe_id == "all_a" else index_code
         if universe_id == "all_a":
@@ -658,13 +733,19 @@ class DatasetBuilder:
         frame = pd.DataFrame(rows, columns=["trade_date", "instrument"])
         if not frame.empty:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+            calendar = pd.DatetimeIndex(
+                frame["trade_date"].dropna().drop_duplicates().sort_values()
+            )
             frame = self._apply_sample_filters(
                 frame,
                 date_start=date_start,
                 date_end=date_end,
                 sample_filters=sample_filters,
+                universe_field_filters=universe_field_filters,
                 data_bindings=data_bindings,
+                data_cutoff=data_cutoff,
             )
+            frame.attrs["_trading_calendar"] = calendar
         return frame
 
     def _apply_sample_filters(
@@ -674,26 +755,57 @@ class DatasetBuilder:
         date_start: str,
         date_end: str,
         sample_filters: dict[str, Any] | None,
+        universe_field_filters: list[dict[str, Any]] | None = None,
         data_bindings: dict[str, Any] | None = None,
+        data_cutoff: str = "",
     ) -> pd.DataFrame:
         filters = dict(sample_filters or {})
         minimum_days = int(filters.get("minimum_listing_trading_days") or 0)
         exclude_st = filters.get("exclude_st") is True
         exclude_delisting = filters.get("exclude_delisting") is True
+        field_filters = normalize_universe_field_filters(
+            universe_field_filters
+        )
         custom_formulas = normalize_custom_sample_filters(
             filters.get("custom_formulas", []),
         )
+        source_provenance = dict(
+            membership.attrs.get("training_data_binding") or {}
+        ).get("registered_membership_source") or {}
+        steps: list[dict[str, Any]] = [
+            _universe_filter_step(
+                "membership_source",
+                len(membership),
+                len(membership),
+                params={
+                    key: source_provenance[key]
+                    for key in (
+                        "asset_id", "asset_version", "asset_version_id",
+                        "binding_fingerprint", "membership_shape",
+                    )
+                    if key in source_provenance
+                },
+            )
+        ]
         if (
             minimum_days <= 0
             and not exclude_st
             and not exclude_delisting
+            and not field_filters
             and not custom_formulas
         ):
-            return membership
+            result = membership[
+                ["trade_date", "instrument"]
+            ].drop_duplicates().sort_values(
+                ["trade_date", "instrument"], ignore_index=True,
+            )
+            result.attrs["universe_filter_steps"] = steps
+            return result
 
         result = membership.copy()
         instruments = sorted(result["instrument"].astype(str).unique().tolist())
         if minimum_days > 0:
+            before_count = len(result)
             master_binding = frozen_data_binding(
                 data_bindings, SECURITY_MASTER_BINDING_ID,
             )
@@ -728,6 +840,43 @@ class DatasetBuilder:
                 result = self._apply_legacy_listing_age_filter(
                     result, date_start, date_end, minimum_days, instruments,
                 )
+            steps.append(_universe_filter_step(
+                "listing_age",
+                before_count,
+                len(result),
+                params={"minimum_trading_days": minimum_days},
+            ))
+
+        for predicate in field_filters:
+            before_count = len(result)
+            result = load_bound_universe_filter_membership(
+                self.settings,
+                dict(predicate["binding"]),
+                result,
+                operator=str(predicate["operator"]),
+                value=predicate.get("value"),
+                data_type=str(predicate["data_type"]),
+                data_cutoff=data_cutoff,
+            )
+            steps.append(_universe_filter_step(
+                "entity_field",
+                before_count,
+                len(result),
+                params={
+                    "asset_id": predicate["asset_id"],
+                    "provider_node": predicate["provider_node"],
+                    "field": predicate["field"],
+                    "operator": predicate["operator"],
+                    **(
+                        {"value": predicate["value"]}
+                        if "value" in predicate else {}
+                    ),
+                    "missing_policy": predicate["missing_policy"],
+                    "binding_fingerprint": predicate["binding"]["fingerprint"],
+                },
+            ))
+            if result.empty:
+                break
         
         if (exclude_st or exclude_delisting) and not result.empty:
             status_binding = frozen_data_binding(
@@ -747,27 +896,64 @@ class DatasetBuilder:
                     ["is_st", "is_delisting"]
                 ].fillna(0)
                 if exclude_st:
+                    before_count = len(result)
                     result = result[result["is_st"] != 1]
+                    steps.append(_universe_filter_step(
+                        "exclude_st", before_count, len(result),
+                    ))
                 if exclude_delisting:
+                    before_count = len(result)
                     result = result[result["is_delisting"] != 1]
+                    steps.append(_universe_filter_step(
+                        "exclude_delisting", before_count, len(result),
+                    ))
             else:
-                result = self._apply_legacy_status_filter(
-                    result, date_start, date_end,
-                    exclude_st=exclude_st,
-                    exclude_delisting=exclude_delisting,
-                )
+                if exclude_st:
+                    before_count = len(result)
+                    result = self._apply_legacy_status_filter(
+                        result, date_start, date_end,
+                        exclude_st=True,
+                        exclude_delisting=False,
+                    )
+                    steps.append(_universe_filter_step(
+                        "exclude_st", before_count, len(result),
+                    ))
+                if exclude_delisting and not result.empty:
+                    before_count = len(result)
+                    result = self._apply_legacy_status_filter(
+                        result, date_start, date_end,
+                        exclude_st=False,
+                        exclude_delisting=True,
+                    )
+                    steps.append(_universe_filter_step(
+                        "exclude_delisting", before_count, len(result),
+                    ))
 
         if custom_formulas and not result.empty:
-            result = self._apply_custom_formula_filters(
-                result,
-                date_start=date_start,
-                date_end=date_end,
-                formulas=custom_formulas,
-            )
+            for formula in custom_formulas:
+                before_count = len(result)
+                result = self._apply_custom_formula_filters(
+                    result,
+                    date_start=date_start,
+                    date_end=date_end,
+                    formulas=[formula],
+                )
+                steps.append(_universe_filter_step(
+                    f"formula:{str(formula.get('formula_hash') or formula.get('hash') or '')[:16]}",
+                    before_count,
+                    len(result),
+                    params={
+                        "expression": str(formula.get("expression") or ""),
+                    },
+                ))
+                if result.empty:
+                    break
 
-        return result[["trade_date", "instrument"]].drop_duplicates().sort_values(
+        output = result[["trade_date", "instrument"]].drop_duplicates().sort_values(
             ["trade_date", "instrument"], ignore_index=True,
         )
+        output.attrs["universe_filter_steps"] = steps
+        return output
 
     def _apply_legacy_listing_age_filter(
         self,
@@ -832,6 +1018,9 @@ class DatasetBuilder:
         exclude_st: bool,
         exclude_delisting: bool,
     ) -> pd.DataFrame:
+        result = result.drop(
+            columns=["is_st", "is_delisting"], errors="ignore",
+        )
         status_rows = self.client.query(
                 f"""
                 SELECT
@@ -1527,6 +1716,107 @@ def _weighted_group_means(
     return result.sort_values(group_columns).reset_index(drop=True)
 
 
+def _normalized_calendar(dates: Any) -> pd.DatetimeIndex:
+    calendar = pd.DatetimeIndex(
+        pd.to_datetime(pd.Index(dates), errors="coerce")
+    ).dropna()
+    return pd.DatetimeIndex(
+        calendar.normalize().unique()
+    ).sort_values()
+
+
+def _calendar_fingerprint(dates: pd.DatetimeIndex) -> str:
+    payload = "\n".join(item.date().isoformat() for item in dates)
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _split_from_calendar(
+    dates: Any,
+    split: dict[str, Any],
+) -> dict[str, tuple[str, str]]:
+    embargo_days = max(1, int(split.get("embargo_days") or 5))
+    if str(split.get("mode") or "ratio") == "dates":
+        return split_trading_dates_by_dates(
+            pd.Index(dates),
+            train=split.get("train"),
+            valid=split.get("valid") or split.get("validation"),
+            test=split.get("test"),
+            embargo_days=embargo_days,
+        )
+    return split_trading_dates(
+        pd.Index(dates),
+        embargo_days=embargo_days,
+        train_ratio=float(split.get("train") or 0.6),
+        valid_ratio=float(split.get("valid") or 0.2),
+    )
+
+
+def resolve_dataset_split(
+    calendar: Any,
+    *,
+    split: dict[str, Any],
+    label_horizon_trading_days: int,
+) -> dict[str, Any]:
+    """Freeze calendar-derived split boundaries for deterministic replay."""
+
+    normalized = _normalized_calendar(calendar)
+    horizon = int(label_horizon_trading_days)
+    if horizon < 1:
+        raise ValueError("标签预测周期必须至少为1个交易日")
+    if len(normalized) <= horizon:
+        raise ValueError(f"训练日期范围不足以生成{horizon}交易日标签")
+    trainable = normalized[:-horizon]
+    segments = _split_from_calendar(trainable, split)
+    return {
+        "schema_version": DATASET_SPLIT_RESOLUTION_SCHEMA_VERSION,
+        "segments": {
+            name: list(value) for name, value in segments.items()
+        },
+        "calendar": {
+            "fingerprint": _calendar_fingerprint(normalized),
+            "session_count": len(normalized),
+            "date_start": normalized[0].date().isoformat(),
+            "date_end": normalized[-1].date().isoformat(),
+            "trainable_fingerprint": _calendar_fingerprint(trainable),
+            "trainable_session_count": len(trainable),
+            "trainable_date_start": trainable[0].date().isoformat(),
+            "trainable_date_end": trainable[-1].date().isoformat(),
+            "label_horizon_trading_days": horizon,
+            "embargo_days": max(1, int(split.get("embargo_days") or horizon)),
+        },
+    }
+
+
+def materialized_dataset_segments(
+    *,
+    split: dict[str, Any],
+    membership_calendar: Any,
+    available_sample_dates: Any,
+    label_horizon_trading_days: int,
+) -> dict[str, tuple[str, str]]:
+    """Reuse a preflight resolution; sample sparsity never moves boundaries."""
+
+    frozen_resolution = split.get("resolved")
+    if isinstance(frozen_resolution, dict):
+        calendar = _normalized_calendar(membership_calendar)
+        if calendar.empty:
+            raise ValueError("冻结切分缺少训练时交易日历，无法校验漂移")
+        current_resolution = resolve_dataset_split(
+            calendar,
+            split=split,
+            label_horizon_trading_days=label_horizon_trading_days,
+        )
+        if current_resolution != frozen_resolution:
+            raise ValueError("冻结交易日历或切分边界已漂移，拒绝重算Dataset")
+        return {
+            name: tuple(value)
+            for name, value in current_resolution["segments"].items()
+        }
+    # Backward-compatible rebuild path for historical jobs created before
+    # preflight froze the calendar-derived split resolution.
+    return _split_from_calendar(available_sample_dates, split)
+
+
 def split_trading_dates(
     dates: pd.Index,
     *,
@@ -1562,6 +1852,73 @@ def split_trading_dates(
         "valid": (unique[valid_start_index].date().isoformat(), unique[valid_end_index].date().isoformat()),
         "test": (unique[test_start_index].date().isoformat(), unique[-1].date().isoformat()),
     }
+
+
+def split_trading_dates_by_dates(
+    dates: pd.Index,
+    *,
+    train: Any,
+    valid: Any,
+    test: Any,
+    embargo_days: int = 5,
+) -> dict[str, tuple[str, str]]:
+    """Validate an explicit split against the materialized trading calendar."""
+    unique = pd.Index(sorted(pd.to_datetime(dates).normalize().unique()))
+    if len(unique) < 3:
+        raise ValueError("有效交易日不足，无法切分训练/验证/测试集")
+    segments = {
+        "train": _explicit_date_segment(train, "train"),
+        "valid": _explicit_date_segment(valid, "validation"),
+        "test": _explicit_date_segment(test, "test"),
+    }
+    calendar = set(unique)
+    for name, (start, end) in segments.items():
+        start_at = pd.Timestamp(start).normalize()
+        end_at = pd.Timestamp(end).normalize()
+        if start_at not in calendar or end_at not in calendar:
+            raise ValueError(f"{name}切分边界必须是有效交易日")
+        if start_at > end_at:
+            raise ValueError(f"{name}切分开始日期不得晚于结束日期")
+    train_start, train_end = map(pd.Timestamp, segments["train"])
+    valid_start, valid_end = map(pd.Timestamp, segments["valid"])
+    test_start, test_end = map(pd.Timestamp, segments["test"])
+    if not (train_end < valid_start and valid_end < test_start):
+        raise ValueError("训练/验证/测试日期必须严格有序且不得重叠")
+    if train_start != unique[0] or test_end != unique[-1]:
+        raise ValueError("显式切分必须覆盖完整可训练交易日范围")
+    embargo = max(1, int(embargo_days))
+    train_valid_gap = int(((unique > train_end) & (unique < valid_start)).sum())
+    valid_test_gap = int(((unique > valid_end) & (unique < test_start)).sum())
+    if train_valid_gap != embargo or valid_test_gap != embargo:
+        raise ValueError(
+            f"显式切分之间必须各保留恰好{embargo}个交易日隔离"
+        )
+    covered = (
+        ((unique >= train_start) & (unique <= train_end))
+        | ((unique >= valid_start) & (unique <= valid_end))
+        | ((unique >= test_start) & (unique <= test_end))
+        | ((unique > train_end) & (unique < valid_start))
+        | ((unique > valid_end) & (unique < test_start))
+    )
+    if not bool(covered.all()):
+        raise ValueError("显式切分存在未声明的交易日空档")
+    return segments
+
+
+def _explicit_date_segment(value: Any, name: str) -> tuple[str, str]:
+    if isinstance(value, dict):
+        start = value.get("start") or value.get("date_start")
+        end = value.get("end") or value.get("date_end")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        start, end = value
+    else:
+        raise ValueError(f"{name}切分必须是[start, end]")
+    try:
+        start_at = pd.Timestamp(start).normalize()
+        end_at = pd.Timestamp(end).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name}切分日期无效") from exc
+    return start_at.date().isoformat(), end_at.date().isoformat()
 
 
 def walk_forward_segments(
@@ -1646,6 +2003,27 @@ def _frame_fingerprint(frame: pd.DataFrame) -> str:
     return sha256(columns + hashed).hexdigest()
 
 
+def _universe_filter_step(
+    rule_id: str,
+    before_count: int,
+    after_count: int,
+    *,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    before = max(0, int(before_count))
+    after = max(0, int(after_count))
+    return {
+        "rule_id": str(rule_id),
+        "before_count": before,
+        "after_count": after,
+        "removed_count": max(0, before - after),
+        "removed_ratio": (
+            round(max(0, before - after) / before, 8) if before else 0.0
+        ),
+        "params": dict(params or {}),
+    }
+
+
 def _checkpoint(cancellation: CancellationToken | None) -> None:
     if cancellation is not None:
         cancellation.checkpoint()
@@ -1659,6 +2037,7 @@ def _progress(
 
 
 __all__ = [
-    "DatasetBuilder", "PreparedDataset", "split_trading_dates", "walk_forward_segments",
+    "DatasetBuilder", "PreparedDataset", "split_trading_dates",
+    "split_trading_dates_by_dates", "walk_forward_segments",
     "FACTOR_COMPUTED_CUTOFF", "FACTOR_EVENT_CUTOFF",
 ]

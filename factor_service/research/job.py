@@ -36,6 +36,12 @@ from factor_service.research.training_resource_settings import (
     normalize_frozen_training_data_bindings,
     required_training_data_binding_ids,
 )
+from factor_service.research.universe_source import (
+    normalize_universe_source,
+)
+from factor_service.research.universe_field_filter import (
+    normalize_universe_field_filters,
+)
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -163,17 +169,52 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         raise PermanentJobError("config_json.dataset与冻结dataset_spec不一致")
     universe_id = str(spec.get("universe_id") or "").strip()
     index_code = str(spec.get("index_code") or "").strip()
-    if universe_id not in UNIVERSES:
-        raise PermanentJobError(f"不支持的股票池: {universe_id}")
-    if index_code != UNIVERSES[universe_id]["index_code"]:
-        raise PermanentJobError("dataset_spec的股票池与index_code不一致")
+    try:
+        universe_source = normalize_universe_source(
+            spec.get("universe_source"), allow_empty=True,
+        )
+    except ValueError as exc:
+        raise PermanentJobError(str(exc)) from exc
+    if universe_source and universe_source != spec.get("universe_source"):
+        raise PermanentJobError(
+            "dataset_spec.universe_source不是规范化冻结规格"
+        )
+    source_kind = str(universe_source.get("source_kind") or "")
+    if source_kind == "configured_stock_pool":
+        if universe_id != universe_source["source_id"]:
+            raise PermanentJobError(
+                "dataset_spec的universe_id与冻结配置股票池不一致"
+            )
+        selector_value = str(
+            dict(universe_source.get("selector") or {}).get("value") or ""
+        ).strip()
+        if index_code != selector_value:
+            raise PermanentJobError(
+                "dataset_spec的index_code与配置股票池选择值不一致"
+            )
+    elif universe_source:
+        if universe_id != universe_source["source_id"]:
+            raise PermanentJobError(
+                "dataset_spec的universe_id与冻结成员来源不一致"
+            )
+        if index_code != UNIVERSES["csi500"]["index_code"]:
+            raise PermanentJobError("自定义股票池的报告基准不受支持")
+    else:
+        if universe_id not in UNIVERSES:
+            raise PermanentJobError(f"不支持的股票池: {universe_id}")
+        if index_code != UNIVERSES[universe_id]["index_code"]:
+            raise PermanentJobError("dataset_spec的股票池与index_code不一致")
     sample_filters = spec.get("sample_filters")
     if sample_filters is not None:
         if not isinstance(sample_filters, dict):
             raise PermanentJobError("dataset_spec.sample_filters必须是对象")
-        required_filter_fields = {
-            "minimum_listing_trading_days", "exclude_st", "exclude_delisting",
-        }
+        legacy_boolean_filters = any(
+            field in sample_filters
+            for field in ("exclude_st", "exclude_delisting")
+        )
+        required_filter_fields = {"minimum_listing_trading_days"}
+        if legacy_boolean_filters:
+            required_filter_fields.update({"exclude_st", "exclude_delisting"})
         allowed_filter_fields = required_filter_fields | {"custom_formulas"}
         if (
             not required_filter_fields.issubset(sample_filters)
@@ -185,9 +226,12 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         minimum_listing_days = sample_filters["minimum_listing_trading_days"]
         if type(minimum_listing_days) is not int or not 0 <= minimum_listing_days <= 5000:
             raise PermanentJobError("最少上市交易日必须是0至5000的整数")
-        for field in ("exclude_st", "exclude_delisting"):
-            if type(sample_filters[field]) is not bool:
-                raise PermanentJobError(f"sample_filters.{field}必须是布尔值")
+        if legacy_boolean_filters:
+            for field in ("exclude_st", "exclude_delisting"):
+                if type(sample_filters[field]) is not bool:
+                    raise PermanentJobError(
+                        f"sample_filters.{field}必须是布尔值"
+                    )
         if "custom_formulas" in sample_filters:
             try:
                 normalized_formulas = normalize_custom_sample_filters(
@@ -199,6 +243,16 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
                 raise PermanentJobError(
                     "sample_filters.custom_formulas不是规范化冻结规格"
                 )
+    try:
+        universe_field_filters = normalize_universe_field_filters(
+            spec.get("universe_field_filters")
+        )
+    except ValueError as exc:
+        raise PermanentJobError(str(exc)) from exc
+    if universe_field_filters != list(spec.get("universe_field_filters") or []):
+        raise PermanentJobError(
+            "dataset_spec.universe_field_filters不是规范化冻结规格"
+        )
     preprocessing = spec.get("preprocessing")
     pipeline_version = str(spec.get("pipeline_version") or "")
     if preprocessing is None:
@@ -331,6 +385,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             "模型只允许stacking、lightgbm、xgboost、catboost、random_forest、linear、"
             "mlp、gru、lstm、alstm、transformer、tabnet、tcn、nativetft或transformer_lstm"
         )
+    _integer(model.get("version") or 1, "model.version", 1, 1)
     params = model.get("params") or {}
     if not isinstance(params, dict):
         raise PermanentJobError(f"{model_kind}参数必须是对象")
@@ -431,6 +486,7 @@ def _validate_stacking_model(model: dict[str, Any], *, target_mode: str) -> None
         kind = str(base_model.get("kind") or "").strip().lower()
         if kind not in MODEL_PARAM_FIELDS or kind == "stacking":
             raise PermanentJobError(f"Stacking基模型{kind or '--'}无效")
+        _integer(base_model.get("version") or 1, f"{kind}.version", 1, 1)
         params = base_model.get("params") or {}
         if not isinstance(params, dict):
             raise PermanentJobError(f"Stacking基模型{kind}参数必须是对象")
@@ -646,6 +702,22 @@ def _validate_incremental_training(
     if source_version >= planned_version:
         raise PermanentJobError("增量训练来源版本必须早于目标版本")
     _identifier(source.get("source_job_id"), "source_job_id")
+    bundle_identity = source.get("source_bundle_identity")
+    if bundle_identity is not None:
+        if not isinstance(bundle_identity, dict):
+            raise PermanentJobError("source_bundle_identity必须是对象")
+        _identifier(
+            bundle_identity.get("model_id"),
+            "source_bundle_identity.model_id",
+        )
+        _integer(
+            bundle_identity.get("model_version"),
+            "source_bundle_identity.model_version", 1, 1_000_000,
+        )
+        _identifier(
+            bundle_identity.get("job_id"),
+            "source_bundle_identity.job_id",
+        )
     source_end = _date(source.get("source_date_end"), "source_date_end")
     if source_end >= _date(dataset_spec.get("date_end"), "date_end"):
         raise PermanentJobError("增量训练数据集没有新增日期")

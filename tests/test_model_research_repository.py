@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from hashlib import sha256
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,8 @@ from factor_service.model_research_repository import (
     ModelResearchError,
     _architecture_readiness,
     _architecture_spec,
+    _attempt_identity,
+    _attempt_row,
     _canonical_json,
     _dataset_spec,
     _ensemble_spec,
@@ -24,6 +27,7 @@ from factor_service.model_research_repository import (
     _model_spec,
     _model_payload_references,
     _research_origin_spec,
+    _registration_payloads,
     _training_dataset_source,
     _walk_forward_spec,
 )
@@ -43,6 +47,46 @@ def _source() -> dict:
             "params": {"window": 20},
         }],
     }
+
+
+def test_dataset_spec_preserves_versioned_capability_identities() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "research_target": "stock_selection",
+        "target_ref": {"id": "stock_selection", "version": 1},
+        "transform_refs": [{
+            "id": "sw2021_industry_one_hot",
+            "version": 2,
+            "implementation_hash": "factor-service:industry-one-hot.v2",
+            "fit_scope": "pit_membership_dictionary",
+        }],
+        "universe_rule_refs": [{
+            "id": "exclude_st", "version": 1, "params": {},
+        }],
+    })
+
+    assert spec["target_ref"] == {"id": "stock_selection", "version": 1}
+    assert spec["transform_refs"][0]["version"] == 2
+    assert spec["universe_rule_refs"] == [{
+        "id": "exclude_st", "version": 1, "params": {},
+    }]
+
+
+def test_dataset_spec_rejects_target_identity_mismatch() -> None:
+    with pytest.raises(ModelResearchError, match="target_ref.id"):
+        _dataset_spec({
+            **_source(),
+            "research_target": "stock_selection",
+            "target_ref": {"id": "industry_rotation", "version": 1},
+        })
+
+
+def test_model_spec_preserves_v1_identity_and_rejects_unknown_version() -> None:
+    assert _model_spec({
+        "kind": "lightgbm", "version": 1, "params": {},
+    })["version"] == 1
+    with pytest.raises(ModelResearchError, match="model.version=1"):
+        _model_spec({"kind": "lightgbm", "version": 2, "params": {}})
 
 
 def _trained_model(
@@ -105,12 +149,33 @@ def test_model_reference_detection_covers_ensemble_and_incremental_lineage() -> 
     ) is False
 
 
+def test_job_row_only_marks_terminal_infrastructure_failure_retryable() -> None:
+    base = {
+        "job_id": "job-failed",
+        "kind": "train",
+        "status": "failed",
+        "result_json": {"failure": {"retryable": True}},
+    }
+
+    assert _job_row(base)["retryable"] is True
+    assert _job_row({
+        **base, "result_json": {"failure": {"retryable": False}},
+    })["retryable"] is False
+    assert _job_row({**base, "status": "queued"})["retryable"] is False
+
+
 class _Cursor:
-    def __init__(self, row=None) -> None:
+    def __init__(self, row=None, rows=None) -> None:
         self.row = row
+        self.rows = rows
 
     def fetchone(self):
         return self.row
+
+    def fetchall(self):
+        if self.rows is not None:
+            return self.rows
+        return [] if self.row is None else [self.row]
 
 
 class _RecordingConnection:
@@ -118,6 +183,7 @@ class _RecordingConnection:
         self.job_row = job_row
         self.existing_version = existing_version
         self.queries: list[str] = []
+        self.executions: list[tuple[str, tuple]] = []
 
     def __enter__(self):
         return self
@@ -131,10 +197,25 @@ class _RecordingConnection:
     def execute(self, query, _params=()):
         normalized = " ".join(str(query).split())
         self.queries.append(normalized)
+        self.executions.append((normalized, tuple(_params)))
+        if normalized.startswith("SELECT to_regclass"):
+            return _Cursor({"relation": "model_job_attempts"})
+        if normalized.startswith("INSERT INTO model_job_events"):
+            return _Cursor({"event_id": len(self.executions)})
+        if normalized.startswith("SELECT attempt_count FROM model_jobs"):
+            return _Cursor({"attempt_count": int(self.job_row.get("attempt_count") or 0)})
+        if normalized.startswith("UPDATE model_job_attempts"):
+            return _Cursor({"attempt_id": "model-attempt-recorded"})
+        if "WHERE status IN ('leased', 'running', 'uploading')" in normalized:
+            return _Cursor(rows=[])
         if normalized.startswith("SELECT * FROM model_jobs"):
             return _Cursor(self.job_row)
         if normalized.startswith("SELECT job_id FROM model_versions"):
             return _Cursor(self.existing_version)
+        if normalized.startswith("SELECT COALESCE(max(version), 0) + 1"):
+            return _Cursor({"version": 7})
+        if normalized.startswith("SELECT GREATEST"):
+            return _Cursor({"version": 7})
         return _Cursor()
 
 
@@ -487,6 +568,7 @@ def test_training_completion_does_not_insert_model_version_before_confirmation()
         "title": "待确认模型",
         "model_kind": "lightgbm",
         "config_json": {"planned_model_version": 3},
+        "attempt_count": 1,
     }
     connection = _RecordingConnection(row)
     repository = ModelResearchRepository(_RecordingDatabase(connection))
@@ -501,6 +583,147 @@ def test_training_completion_does_not_insert_model_version_before_confirmation()
     assert "INSERT INTO model_versions" not in sql
     assert "model_version = NULL" in sql
     assert "INSERT INTO model_job_events" in sql
+
+
+def _claimable_job(*, attempt_count: int = 0, status: str = "queued") -> dict:
+    return {
+        "job_id": "job-attempt-audit",
+        "kind": "train",
+        "status": status,
+        "lease_owner": "alpha-factor-service" if status == "leased" else "",
+        "lease_token": "lease-token" if status == "leased" else "",
+        "lease_expires_at": datetime(2030, 1, 1, tzinfo=timezone.utc),
+        "cancel_requested": False,
+        "attempt_count": attempt_count,
+        "max_attempts": max(3, attempt_count + 1),
+        "model_id": "model-attempt-audit",
+        "dataset_id": "dataset-attempt-audit",
+        "config_json": {"execution": {"node_id": "gpu-node-a"}},
+    }
+
+
+def test_claim_persists_real_attempt_identity_ordinal_and_node() -> None:
+    connection = _RecordingConnection(_claimable_job())
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: {"job_id": _job_id, "attempts": []}
+
+    repository.claim_specific_job("job-attempt-audit")
+
+    inserts = [
+        params for query, params in connection.executions
+        if query.startswith("INSERT INTO model_job_attempts")
+    ]
+    assert len(inserts) == 1
+    params = inserts[0]
+    assert params[:4] == (
+        _attempt_identity("job-attempt-audit", 1),
+        "job-attempt-audit",
+        1,
+        "gpu-node-a",
+    )
+
+
+def test_dispatch_failure_closes_attempt_without_deleting_or_reusing_ordinal() -> None:
+    connection = _RecordingConnection(
+        _claimable_job(attempt_count=1, status="leased"),
+    )
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: {"job_id": _job_id, "status": "queued"}
+
+    repository.release_dispatch_lease(
+        "job-attempt-audit",
+        lease_token="lease-token",
+        error_message="worker endpoint unavailable",
+    )
+
+    sql = "\n".join(connection.queries)
+    assert "DELETE FROM model_job_attempts" not in sql
+    assert "attempt_count = GREATEST(attempt_count - 1, 0)" not in sql
+    assert "max_attempts = GREATEST(max_attempts, attempt_count + 1)" in sql
+    terminal_updates = [
+        (query, params) for query, params in connection.executions
+        if query.startswith("UPDATE model_job_attempts")
+        and "finished_at = %s" in query
+    ]
+    assert len(terminal_updates) == 1
+    _, params = terminal_updates[0]
+    assert "failed" in params
+    error = next(value.obj for value in params if hasattr(value, "obj"))
+    assert error == {
+        "code": "dispatch_failed",
+        "message": "worker endpoint unavailable",
+        "retryable": True,
+    }
+
+
+def test_manual_retry_preserves_prior_attempt_and_next_claim_appends_ordinal() -> None:
+    failed = _claimable_job(attempt_count=1, status="failed")
+    failed.update({
+        "lease_owner": "",
+        "lease_token": "",
+        "result_json": {"failure": {"retryable": True}},
+    })
+    retry_connection = _RecordingConnection(failed)
+    repository = ModelResearchRepository(_RecordingDatabase(retry_connection))
+    repository.get_job = lambda _job_id: {"job_id": _job_id, "status": "queued"}
+
+    repository.retry_job("job-attempt-audit", idempotency_key="retry-1")
+
+    retry_sql = "\n".join(retry_connection.queries)
+    assert "INSERT INTO model_job_attempts" not in retry_sql
+    assert "DELETE FROM model_job_attempts" not in retry_sql
+
+    queued = _claimable_job(attempt_count=1, status="queued")
+    claim_connection = _RecordingConnection(queued)
+    repository = ModelResearchRepository(_RecordingDatabase(claim_connection))
+    repository.get_job = lambda _job_id: {"job_id": _job_id, "attempts": []}
+
+    repository.claim_specific_job("job-attempt-audit")
+
+    insert_params = next(
+        params for query, params in claim_connection.executions
+        if query.startswith("INSERT INTO model_job_attempts")
+    )
+    assert insert_params[:3] == (
+        _attempt_identity("job-attempt-audit", 2),
+        "job-attempt-audit",
+        2,
+    )
+
+
+def test_attempt_row_exposes_error_log_cursor_and_artifact_identities() -> None:
+    started = datetime(2026, 8, 28, 1, 2, tzinfo=timezone.utc)
+    finished = datetime(2026, 8, 28, 1, 4, tzinfo=timezone.utc)
+    attempt = _attempt_row({
+        "attempt_id": "model-attempt-2",
+        "job_id": "job-attempt-audit",
+        "ordinal": 2,
+        "status": "failed",
+        "execution_node_id": "gpu-node-a",
+        "started_at": started,
+        "finished_at": finished,
+        "error_json": {"code": "oom", "retryable": True},
+        "log_start_event_id": 12,
+        "log_end_event_id": 18,
+        "artifact_refs_json": {
+            "artifact-b": {"artifact_id": "artifact-b", "sha256": "b" * 64},
+            "artifact-a": {"artifact_id": "artifact-a", "sha256": "a" * 64},
+        },
+    })
+
+    assert attempt["ordinal"] == 2
+    assert attempt["retryable"] is True
+    assert attempt["error"] == {"code": "oom", "retryable": True}
+    assert attempt["logs"] == [{
+        "kind": "event_stream",
+        "job_id": "job-attempt-audit",
+        "attempt_ordinal": 2,
+        "start_cursor": 12,
+        "end_cursor": 18,
+    }]
+    assert [item["artifact_id"] for item in attempt["artifacts"]] == [
+        "artifact-a", "artifact-b",
+    ]
 
 
 def test_explicit_registration_inserts_model_version_and_links_artifacts() -> None:
@@ -529,8 +752,246 @@ def test_explicit_registration_inserts_model_version_and_links_artifacts() -> No
 
     sql = "\n".join(connection.queries)
     assert "INSERT INTO model_versions" in sql
-    assert "UPDATE model_jobs SET model_version" in sql
-    assert "UPDATE model_artifacts SET model_version" in sql
+    assert "UPDATE model_jobs SET model_id" in sql
+    assert "UPDATE model_artifacts SET model_id" in sql
+
+
+def test_explicit_registration_assigns_public_model_identity_at_registration() -> None:
+    row = {
+        "job_id": "job-public-id",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "model_id": "temporary-study-model",
+        "dataset_id": "dataset-public-id",
+        "title": "公开模型",
+        "model_kind": "lightgbm",
+        "config_json": {"planned_model_version": 1},
+        "result_json": {
+            "metrics": {"ic": 0.03},
+            "feature_importance": [],
+            "predictions": {"row_count": 100},
+            "manifest": {"schema_version": "test"},
+        },
+    }
+    connection = _RecordingConnection(row)
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: dict(row)
+    repository._prediction_alias_version = lambda **kwargs: (
+        int(kwargs["minimum_version"])
+    )
+    copy_calls: list[dict] = []
+    repository._copy_training_prediction_identity = lambda **kwargs: (
+        copy_calls.append(kwargs)
+        or {"copied": True, "source_rows": 100, "target_rows": 100}
+    )
+
+    repository.register_training_result(
+        "job-public-id", model_id="csi500-stock-selector",
+    )
+
+    sql = "\n".join(connection.queries)
+    assert "FROM model_versions WHERE model_id" in sql
+    assert "FROM model_jobs" in sql
+    assert "status NOT IN ('failed', 'canceled')" in sql
+    assert "UPDATE model_jobs SET model_id" in sql
+    assert copy_calls == [{
+        "job_id": "job-public-id",
+        "source_model_id": "temporary-study-model",
+        "source_model_version": 1,
+        "target_model_id": "csi500-stock-selector",
+        "target_model_version": 7,
+        "expected_source_rows": 100,
+    }]
+
+
+def test_registration_payloads_preserve_training_and_registration_identities() -> None:
+    source_config = {"planned_model_version": 1, "model": {"kind": "lightgbm"}}
+    source_result = {
+        "predictions": {"row_count": 12, "model_version": 1},
+        "manifest": {
+            "model_id": "temporary-model",
+            "model_version": 1,
+            "schema_version": "test",
+        },
+    }
+
+    config, result = _registration_payloads(
+        job_id="job-registration",
+        config=source_config,
+        result=source_result,
+        training_model_id="temporary-model",
+        training_model_version=1,
+        registered_model_id="public-model",
+        registered_model_version=7,
+        prediction_alias={"copied": True, "source_rows": 12, "target_rows": 12},
+        registered_at="2026-08-28T00:00:00+00:00",
+    )
+
+    training_identity = {
+        "model_id": "temporary-model", "model_version": 1,
+        "job_id": "job-registration",
+    }
+    registration_identity = {
+        "model_id": "public-model", "model_version": 7,
+        "job_id": "job-registration",
+    }
+    assert config["planned_model_version"] == 7
+    assert config["training_identity"] == training_identity
+    assert config["registration_identity"] == registration_identity
+    assert config["bundle_identity"] == training_identity
+    assert result["training_identity"] == training_identity
+    assert result["registration_identity"] == registration_identity
+    assert result["manifest"]["model_id"] == "public-model"
+    assert result["manifest"]["model_version"] == 7
+    assert result["manifest"]["bundle_identity"] == training_identity
+    assert result["predictions"]["model_id"] == "public-model"
+    assert result["predictions"]["model_version"] == 7
+    assert result["registration"]["status"] == "registered"
+    assert result["prediction_identity_alias"]["source_retained"] is True
+    assert source_config["planned_model_version"] == 1
+    assert source_result["manifest"]["model_id"] == "temporary-model"
+
+
+def test_prediction_identity_copy_is_non_destructive_and_count_verified(
+    monkeypatch,
+) -> None:
+    class QueryResult:
+        def __init__(self, count: int) -> None:
+            self.result_rows = [[count]]
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.results = iter((
+                [[3]],
+                [[0, []]],
+                [[3]],
+            ))
+            self.commands: list[str] = []
+
+        def query(self, _query, *, parameters):
+            assert parameters["job_id"] == "job-copy"
+            result = next(self.results)
+            response = QueryResult(0)
+            response.result_rows = result
+            return response
+
+        def command(self, query, *, parameters):
+            assert parameters["source_model_id"] == "internal-model"
+            assert parameters["target_model_id"] == "public-model"
+            self.commands.append(" ".join(str(query).split()))
+
+    client = FakeClient()
+    import clickhouse_connect
+    from factor_service.research import config as research_config
+
+    monkeypatch.setattr(clickhouse_connect, "get_client", lambda **_kwargs: client)
+    monkeypatch.setattr(research_config, "load_settings", lambda: SimpleNamespace(
+        model_database="factor_model",
+        clickhouse_host="localhost",
+        clickhouse_port=8123,
+        clickhouse_user="default",
+        clickhouse_password="",
+    ))
+
+    report = ModelResearchRepository._copy_training_prediction_identity(
+        job_id="job-copy",
+        source_model_id="internal-model",
+        source_model_version=1,
+        target_model_id="public-model",
+        target_model_version=7,
+        expected_source_rows=3,
+    )
+
+    assert report == {"copied": True, "source_rows": 3, "target_rows": 3}
+    assert len(client.commands) == 1
+    assert client.commands[0].startswith("INSERT INTO")
+    assert "SELECT" in client.commands[0]
+    assert "DELETE" not in client.commands[0]
+
+
+def test_prediction_alias_version_reuses_own_orphan_and_skips_foreign_orphan(
+    monkeypatch,
+) -> None:
+    class QueryResult:
+        def __init__(self, rows) -> None:
+            self.result_rows = rows
+
+    class FakeClient:
+        def __init__(self, run_ids) -> None:
+            self.run_ids = run_ids
+
+        def query(self, _query, *, parameters):
+            assert parameters == {"target_model_id": "public-model"}
+            return QueryResult([[7, self.run_ids]])
+
+    clients = iter((FakeClient(["job-copy"]), FakeClient(["another-job"])))
+    import clickhouse_connect
+    from factor_service.research import config as research_config
+
+    monkeypatch.setattr(
+        clickhouse_connect, "get_client", lambda **_kwargs: next(clients),
+    )
+    monkeypatch.setattr(research_config, "load_settings", lambda: SimpleNamespace(
+        model_database="factor_model",
+        clickhouse_host="localhost",
+        clickhouse_port=8123,
+        clickhouse_user="default",
+        clickhouse_password="",
+    ))
+
+    assert ModelResearchRepository._prediction_alias_version(
+        target_model_id="public-model",
+        job_id="job-copy",
+        minimum_version=7,
+    ) == 7
+    assert ModelResearchRepository._prediction_alias_version(
+        target_model_id="public-model",
+        job_id="job-copy",
+        minimum_version=7,
+    ) == 8
+
+
+def test_prediction_identity_copy_reuses_verified_existing_alias(monkeypatch) -> None:
+    class QueryResult:
+        def __init__(self, rows) -> None:
+            self.result_rows = rows
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.results = iter(([[3]], [[3, ["job-copy"]]]))
+            self.commands: list[str] = []
+
+        def query(self, _query, *, parameters):
+            return QueryResult(next(self.results))
+
+        def command(self, query, *, parameters):
+            self.commands.append(str(query))
+
+    client = FakeClient()
+    import clickhouse_connect
+    from factor_service.research import config as research_config
+
+    monkeypatch.setattr(clickhouse_connect, "get_client", lambda **_kwargs: client)
+    monkeypatch.setattr(research_config, "load_settings", lambda: SimpleNamespace(
+        model_database="factor_model",
+        clickhouse_host="localhost",
+        clickhouse_port=8123,
+        clickhouse_user="default",
+        clickhouse_password="",
+    ))
+
+    report = ModelResearchRepository._copy_training_prediction_identity(
+        job_id="job-copy",
+        source_model_id="internal-model",
+        source_model_version=1,
+        target_model_id="public-model",
+        target_model_version=7,
+        expected_source_rows=3,
+    )
+
+    assert report == {"copied": False, "source_rows": 3, "target_rows": 3}
+    assert client.commands == []
 
 
 def test_declining_registration_preserves_result_without_creating_version() -> None:
@@ -625,6 +1086,41 @@ def test_dataset_spec_accepts_custom_split_ratios() -> None:
     assert spec["split"]["valid"] == pytest.approx(0.15)
     assert spec["split"]["test"] == pytest.approx(0.1)
     assert spec["split"]["embargo_days"] == 5
+    assert spec["split"]["mode"] == "ratio"
+
+
+def test_dataset_spec_accepts_explicit_train_validation_and_test_dates() -> None:
+    spec = _dataset_spec({
+        **_source(),
+        "split": {
+            "mode": "dates",
+            "train": ["2020-01-01", "2022-12-30"],
+            "validation": ["2023-01-09", "2023-06-30"],
+            "test": ["2023-07-10", "2024-01-01"],
+            "embargo_days": 5,
+        },
+    })
+
+    assert spec["split"] == {
+        "mode": "dates",
+        "train": ["2020-01-01", "2022-12-30"],
+        "valid": ["2023-01-09", "2023-06-30"],
+        "test": ["2023-07-10", "2024-01-01"],
+        "embargo_days": 5,
+    }
+
+
+def test_dataset_spec_rejects_mixed_or_overlapping_date_split() -> None:
+    with pytest.raises(ModelResearchError, match="严格有序"):
+        _dataset_spec({
+            **_source(),
+            "split": {
+                "mode": "dates",
+                "train": ["2020-01-01", "2023-01-15"],
+                "validation": ["2023-01-09", "2023-06-30"],
+                "test": ["2023-07-10", "2024-01-01"],
+            },
+        })
 
 
 def test_dataset_spec_accepts_custom_universe() -> None:
@@ -716,6 +1212,52 @@ def test_incremental_training_requires_exact_lightgbm_feature_contract() -> None
     )
     assert industry_blocked["passed"] is False
     assert "target_contract" in industry_blocked["failed_checks"]
+
+
+def test_incremental_contract_records_immutable_bundle_identity() -> None:
+    source = _trained_model(
+        "public-model", 7, validation_icir=0.5, model_kind="lightgbm",
+    )
+    source.update({
+        "job_id": "model_job_source",
+        "state": "validated",
+        "dataset_hash": "d" * 64,
+        "manifest_json": {
+            "model_id": "public-model",
+            "model_version": 7,
+            "bundle_identity": {
+                "model_id": "temporary-model",
+                "model_version": 1,
+                "job_id": "model_job_source",
+            },
+        },
+    })
+    candidate_dataset = _dataset_spec({
+        **_source(),
+        "date_end": "2025-01-02",
+        "data_cutoff": "2025-01-02T15:00:00+08:00",
+    })
+    assessment = _incremental_training_assessment(
+        source,
+        {
+            "artifact_id": "artifact-bundle",
+            "relative_path": "jobs/source/bundle.tar.gz",
+            "sha256": "b" * 64,
+            "file_name": "bundle.tar.gz",
+        },
+        dataset=candidate_dataset,
+        model=_model_spec({"kind": "lightgbm", "params": {}}),
+        walk_forward=_walk_forward_spec({}),
+    )
+
+    assert assessment["passed"] is True
+    assert assessment["contract"]["source_model_id"] == "public-model"
+    assert assessment["contract"]["source_model_version"] == 7
+    assert assessment["contract"]["source_bundle_identity"] == {
+        "model_id": "temporary-model",
+        "model_version": 1,
+        "job_id": "model_job_source",
+    }
 
 
 def test_incremental_training_accepts_legacy_v5_disabled_preprocessing() -> None:
@@ -1792,6 +2334,9 @@ def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
                 "xgboost": {"max_depth": 4},
                 "mlp": {"hidden_layers": [32, 64]},
             },
+            "model_versions_by_kind": {
+                "lightgbm": 1, "xgboost": 1, "mlp": 1,
+            },
         },
     })
 
@@ -1805,6 +2350,7 @@ def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
     assert [
         item["model"]["kind"] for item in captured
     ] == ["lightgbm", "xgboost", "mlp"]
+    assert [item["model"]["version"] for item in captured] == [1, 1, 1]
     assert [
         item["experiment"]["search_params"]["model_kind"] for item in captured
     ] == ["lightgbm", "xgboost", "mlp"]
@@ -1816,7 +2362,7 @@ def test_model_ensemble_experiment_trains_each_selected_kind_once() -> None:
     )
 
 
-def test_model_ensemble_summary_selects_only_best_absolute_validation_icir() -> None:
+def test_model_ensemble_summary_selects_best_qualified_absolute_validation_icir() -> None:
     def job(index: int, kind: str, *, rank_ic: float, ic_ir: float) -> dict:
         return {
             "job_id": f"ensemble-job-{index}",
@@ -1850,13 +2396,33 @@ def test_model_ensemble_summary_selects_only_best_absolute_validation_icir() -> 
         job(3, "mlp", rank_ic=0.05, ic_ir=0.61),
     ])
 
-    assert result["selection"]["selected_job_id"] == "ensemble-job-2"
-    assert result["selection"]["selected_model_kind"] == "xgboost"
+    assert result["selection"]["selected_job_id"] == "ensemble-job-3"
+    assert result["selection"]["best_observed_job_id"] == "ensemble-job-2"
+    assert result["selection"]["selected_model_kind"] == "mlp"
     assert result["comparison"]["selection_metric"] == "abs(validation.ic_ir)"
     assert [
         item["job_id"] for item in result["comparison"]["trials"]
         if item["is_selected"]
-    ] == ["ensemble-job-2"]
+    ] == ["ensemble-job-3"]
+
+
+def test_model_ensemble_rejects_misaligned_version_identity_map() -> None:
+    repository = object.__new__(ModelResearchRepository)
+    repository.create_training_job = lambda _payload: pytest.fail(
+        "invalid version map must fail before creating jobs"
+    )
+
+    with pytest.raises(ModelResearchError, match="逐项对齐"):
+        repository.create_training_experiment({
+            "dataset": _source(),
+            "model": {"kind": "lightgbm", "version": 1, "params": {}},
+            "search": {
+                "strategy": "model_ensemble",
+                "model_kinds": ["lightgbm", "xgboost"],
+                "model_params_by_kind": {"lightgbm": {}, "xgboost": {}},
+                "model_versions_by_kind": {"lightgbm": 1},
+            },
+        })
 
 
 def test_model_ensemble_stacking_creates_one_composite_trial() -> None:

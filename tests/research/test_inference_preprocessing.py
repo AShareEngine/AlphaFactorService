@@ -35,10 +35,12 @@ class _DatasetBuilder:
         self.values = values
         self.industry_entities = industry_entities
         self.membership_calls = 0
+        self.membership_kwargs: list[dict[str, Any]] = []
         self.industry_calls = 0
 
-    def _membership(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+    def _membership(self, *_args: Any, **kwargs: Any) -> pd.DataFrame:
         self.membership_calls += 1
+        self.membership_kwargs.append(kwargs)
         return pd.DataFrame({
             "trade_date": pd.to_datetime(["2024-12-31"] * len(self.values)),
             "instrument": [f"{index:06d}.SZ" for index in range(len(self.values))],
@@ -122,7 +124,8 @@ def test_daily_inference_applies_preprocessing_frozen_in_training_manifest(
     )
     raw = [np.nan, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 100.0]
 
-    result = _runner(raw).run(job, tmp_path / "infer")
+    runner = _runner(raw)
+    result = runner.run(job, tmp_path / "infer")
 
     feature_name = manifest["feature_names"][0]
     actual = captured["features"][feature_name].to_numpy(dtype=float)
@@ -135,6 +138,9 @@ def test_daily_inference_applies_preprocessing_frozen_in_training_manifest(
     assert actual.mean() == pytest.approx(0.0, abs=1e-12)
     assert actual.std(ddof=0) == pytest.approx(1.0)
     assert actual[0] == pytest.approx(actual[5])
+    assert {
+        item["data_cutoff"] for item in runner.dataset_builder.membership_kwargs
+    } == {"2024-12-31T08:00:00+00:00"}
     assert result.result["manifest"]["preprocessing"] == manifest["preprocessing"]
     assert (
         "training-identical same-date cross-sectional median, 1/99 winsorization and z-score"

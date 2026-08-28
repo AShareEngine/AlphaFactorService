@@ -124,7 +124,7 @@ def test_parameter_selection_returns_no_finalist_when_gate_fails() -> None:
     assert result["selected_job_id"] == ""
 
 
-def test_model_selection_matches_quantmind_absolute_validation_icir() -> None:
+def test_model_selection_uses_absolute_icir_only_among_qualified_models() -> None:
     result = select_model_trial([
         _trial(1, rank_ic=0.07, ic_ir=0.25),
         _trial(2, rank_ic=0.03, ic_ir=-0.72),
@@ -133,9 +133,20 @@ def test_model_selection_matches_quantmind_absolute_validation_icir() -> None:
 
     assert result["status"] == "selected"
     assert result["ranking_metric"] == "abs(validation.ic_ir)"
-    assert result["selected_job_id"] == "job-2"
-    assert result["selected_model_version"] == 2
+    assert result["selected_job_id"] == "job-3"
+    assert result["selected_model_version"] == 3
     assert result["best_observed_ic_ir"] == -0.72
+
+
+def test_model_selection_returns_no_candidate_when_all_models_fail_gate() -> None:
+    result = select_model_trial([
+        _trial(1, rank_ic=0.01, ic_ir=0.90),
+        _trial(2, rank_ic=0.00, ic_ir=-1.20),
+    ], complete=True)
+
+    assert result["status"] == "no_qualified_trials"
+    assert result["selected_job_id"] == ""
+    assert result["best_observed_job_id"] == "job-2"
 
 
 def test_model_selection_waits_for_every_model_to_finish() -> None:

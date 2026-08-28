@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pandas as pd
 
 from factor_service.research.data_binding_source import (
+    _observation_chunks,
+    _query_binding,
     load_bound_industry_membership,
     load_bound_stock_daily,
     load_bound_stock_status,
@@ -36,6 +38,64 @@ def _binding() -> dict:
         },
         "industry_level_value": "1",
     }
+
+
+def test_observation_chunks_ignore_array_valued_dataframe_attrs() -> None:
+    observations = pd.DataFrame({
+        "trade_date": ["2026-01-05", "2026-01-06"],
+        "instrument": ["000001.SZ", "600000.SH"],
+    })
+    observations.attrs["source_rows"] = pd.Series([1, 2]).to_numpy()
+
+    chunks = _observation_chunks(observations)
+
+    assert len(chunks) == 1
+    assert chunks[0].to_dict("records") == [
+        {"trade_date": "2026-01-05", "instrument": "000001.SZ"},
+        {"trade_date": "2026-01-06", "instrument": "600000.SH"},
+    ]
+    assert chunks[0].attrs == {}
+
+
+def test_query_binding_forwards_and_verifies_frozen_data_cutoff(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "ok": True,
+                "columns": ["trade_date", "con_code"],
+                "rows": [["2024-01-02", "000001.SZ"]],
+                "provenance": {
+                    "data_cutoff": "2025-01-02T07:00:00+00:00",
+                },
+            }
+
+    def fake_post(url, *, json, timeout):
+        calls.append((url, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(
+        "factor_service.research.data_binding_source.requests.post",
+        fake_post,
+    )
+
+    _, provenance = _query_binding(
+        settings=_settings(),
+        binding=_binding(),
+        roles=("trade_date", "instrument"),
+        date_start="2024-01-02",
+        date_end_exclusive="2024-01-03",
+        data_cutoff="2025-01-02T07:00:00+00:00",
+    )
+
+    assert calls[0][1]["data_cutoff"] == "2025-01-02T07:00:00+00:00"
+    assert provenance["data_cutoff"] == "2025-01-02T07:00:00+00:00"
 
 
 def test_load_bound_industry_membership_uses_frozen_database_binding(

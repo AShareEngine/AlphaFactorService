@@ -41,6 +41,8 @@ from factor_service.model_selection import (
 )
 from factor_service.research.config import load_settings as load_research_settings
 from factor_service.research.dataset import DatasetBuilder
+from factor_service.research.dataset_preflight import DatasetPreflightService
+from factor_service.research.dataset_preview import DatasetPreviewService
 from factor_service.model_research_repository import (
     ModelResearchConflict,
     ModelResearchError,
@@ -58,8 +60,11 @@ from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
 from factor_service.research.training_resource_settings import (
     TrainingResourceRevisionConflict,
     TrainingResourceSettingsRepository,
+    configured_stock_pool_sources,
+    frozen_data_binding,
     frozen_training_data_bindings,
     get_training_resource_settings,
+    normalize_frozen_training_data_bindings,
     required_training_data_binding_ids,
     training_data_binding_catalog,
 )
@@ -311,7 +316,57 @@ def _freeze_training_data_bindings(payload: dict[str, Any]) -> None:
     dataset = payload.get("dataset")
     if not isinstance(dataset, dict):
         return
-    settings = get_training_resource_settings()
+    required_ids = required_training_data_binding_ids(dataset)
+    universe_source = dataset.get("universe_source")
+    configured_source = (
+        isinstance(universe_source, dict)
+        and str(universe_source.get("source_kind") or "")
+        == "configured_stock_pool"
+    )
+    settings = get_training_resource_settings() if configured_source else None
+    if configured_source:
+        current_sources = {
+            str(item.get("source_id") or ""): {
+                key: value
+                for key, value in item.items()
+                if key != "available"
+            }
+            for item in configured_stock_pool_sources(settings)
+        }
+        current = current_sources.get(
+            str(universe_source.get("source_id") or "")
+        )
+        if current != universe_source:
+            raise ModelResearchConflict(
+                "模型训练股票池配置已变更，请重新校验Draft"
+            )
+    if dataset.get("data_bindings"):
+        try:
+            frozen = normalize_frozen_training_data_bindings(
+                dataset.get("data_bindings"),
+            )
+        except ValueError as exc:
+            raise ModelResearchConflict(str(exc)) from exc
+        missing = [
+            binding_id for binding_id in required_ids
+            if frozen_data_binding(frozen, binding_id) is None
+        ]
+        if missing:
+            raise ModelResearchConflict(
+                "dataset.data_bindings缺少冻结绑定: " + ", ".join(missing)
+            )
+        dataset["data_bindings"] = frozen
+        feature = dataset.get("industry_feature") or {}
+        if isinstance(feature, dict) and feature.get("enabled") is True:
+            dataset["industry_feature"] = {
+                **feature,
+                "schema_version": "alphablocks.stock-industry-one-hot.v2",
+                "data_binding": frozen["bindings"].get(
+                    "stock_industry_one_hot"
+                ),
+            }
+        return
+    settings = settings or get_training_resource_settings()
     if str(settings.get("schema_version") or "").endswith(".v1"):
         feature = dataset.get("industry_feature") or {}
         if not isinstance(feature, dict) or feature.get("enabled") is not True:
@@ -330,7 +385,7 @@ def _freeze_training_data_bindings(payload: dict[str, Any]) -> None:
         return
     try:
         frozen = frozen_training_data_bindings(
-            settings, required_training_data_binding_ids(dataset),
+            settings, required_ids,
         )
     except ValueError as exc:
         raise ModelResearchConflict(str(exc)) from exc
@@ -383,11 +438,13 @@ def get_training_targets() -> dict[str, Any]:
 @router.get("/training-data-bindings")
 def get_model_training_resource_settings() -> dict[str, Any]:
     try:
+        settings = get_training_resource_settings()
         return {
             "ok": True,
             "storage": "postgresql",
             "capabilities": training_data_binding_catalog(),
-            "settings": get_training_resource_settings(),
+            "settings": settings,
+            "universe_sources": configured_stock_pool_sources(settings),
         }
     except Exception as exc:
         _raise(exc)
@@ -412,6 +469,7 @@ def update_model_training_resource_settings(
             "storage": "postgresql",
             "capabilities": training_data_binding_catalog(),
             "settings": settings,
+            "universe_sources": configured_stock_pool_sources(settings),
         }
     except TrainingResourceRevisionConflict as exc:
         _raise(ModelResearchConflict(str(exc)))
@@ -816,6 +874,74 @@ def create_experiment(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         _raise(exc)
 
 
+@router.post("/dataset-preflight")
+def preflight_dataset(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Freeze bindings and validate calendar/split semantics without X/y."""
+    try:
+        _freeze_training_data_bindings(payload)
+        return {
+            "ok": True,
+            "preflight": DatasetPreflightService().validate(payload),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/dataset-previews", status_code=HTTPStatus.ACCEPTED)
+def create_dataset_preview(
+    background_tasks: BackgroundTasks,
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Materialize the exact immutable X/y snapshot without training a model."""
+    try:
+        _freeze_training_data_bindings(payload)
+        previews = DatasetPreviewService(repository)
+        preview = previews.create(payload)
+        if str(preview.get("status") or "") == "running":
+            background_tasks.add_task(previews.run, str(preview["preview_id"]))
+        return {"ok": True, "preview": preview}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/dataset-previews/{preview_id}")
+def get_dataset_preview(preview_id: str) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "preview": DatasetPreviewService(repository).get(preview_id),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/dataset-previews/{preview_id}/sample")
+def get_dataset_preview_sample(preview_id: str) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "sample": DatasetPreviewService(repository).sample(preview_id),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.get("/dataset-previews/{preview_id}/events")
+def list_dataset_preview_events(
+    preview_id: str,
+    after: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    try:
+        return {
+            "ok": True,
+            "events": DatasetPreviewService(repository).events(
+                preview_id, after=after,
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.get("/experiments/{experiment_id}")
 def get_experiment(experiment_id: str) -> dict[str, Any]:
     try:
@@ -860,10 +986,44 @@ def cancel_job(job_id: str) -> dict[str, Any]:
         _raise(exc)
 
 
-@router.post("/jobs/{job_id}/register")
-def register_training_result(job_id: str) -> dict[str, Any]:
+@router.post("/jobs/{job_id}/retry")
+def retry_job(
+    job_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, Any]:
     try:
-        return {"ok": True, "job": repository.register_training_result(job_id)}
+        source = repository.get_job(job_id)
+        _validate_execution_node(source.get("config_json") or {})
+        return {
+            "ok": True,
+            "job": repository.retry_job(
+                job_id,
+                idempotency_key=str((payload or {}).get("idempotency_key") or ""),
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/jobs/{job_id}/register")
+def register_training_result(
+    job_id: str,
+    payload: dict[str, Any] | None = Body(default=None),
+) -> dict[str, Any]:
+    try:
+        requested_model_id = str((payload or {}).get("model_id") or "").strip()
+        job = (
+            repository.register_training_result(
+                job_id,
+                model_id=requested_model_id,
+            )
+            if requested_model_id
+            else repository.register_training_result(job_id)
+        )
+        return {
+            "ok": True,
+            "job": job,
+        }
     except Exception as exc:
         _raise(exc)
 

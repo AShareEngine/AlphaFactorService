@@ -189,14 +189,14 @@ def select_model_trial(
 ) -> dict[str, Any]:
     """Select the single best model kind using QuantMind's validation ICIR rule.
 
-    Every model still receives the normal validation-gate assessment for audit and
-    later research controls.  Multi-model comparison itself always produces one
-    primary model once all trials are terminal, ranked only by the absolute
-    validation ICIR; test metrics are deliberately excluded from selection.
+    Every model receives the normal validation-gate assessment for audit and later
+    research controls.  Once all trials are terminal, the best *qualified* model is
+    selected by absolute validation ICIR.  When no model passes the gate there is
+    deliberately no recommendation; test metrics are excluded from selection.
     """
     assessments = []
     observed = []
-    qualified_count = 0
+    qualified = []
     for source in jobs:
         job = dict(source)
         experiment = dict((job.get("config_json") or {}).get("experiment") or {})
@@ -219,29 +219,30 @@ def select_model_trial(
             **assessment,
         }
         assessments.append(item)
-        if assessment["passed"]:
-            qualified_count += 1
         if (
             item["status"] == "succeeded"
             and _number(validation_metrics.get("ic_ir")) is not None
         ):
             observed.append(item)
+            if assessment["passed"]:
+                qualified.append(item)
 
     observed.sort(key=_model_trial_sort_key)
+    qualified.sort(key=_model_trial_sort_key)
     best_observed = observed[0] if observed else None
-    selected = best_observed if complete else None
+    selected = qualified[0] if complete and qualified else None
     if not complete:
         status = "evaluating"
     elif selected:
         status = "selected"
     else:
-        status = "no_completed_models"
+        status = "no_qualified_trials"
     return {
         "policy": "alphablocks.model-ensemble-selection.v2",
         "status": status,
         "complete": bool(complete),
         "ranking_metric": "abs(validation.ic_ir)",
-        "qualified_count": qualified_count,
+        "qualified_count": len(qualified),
         "selected_job_id": selected["job_id"] if selected else "",
         "selected_model_id": selected["model_id"] if selected else "",
         "selected_model_version": selected["model_version"] if selected else 0,

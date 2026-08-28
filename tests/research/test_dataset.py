@@ -12,7 +12,10 @@ from factor_service.research.dataset import (
     _future_rank_label,
     _industry_features,
     _industry_rank_label,
+    materialized_dataset_segments,
+    resolve_dataset_split,
     split_trading_dates,
+    split_trading_dates_by_dates,
     walk_forward_segments,
 )
 from factor_service.research.errors import JobCanceled
@@ -226,12 +229,22 @@ def test_dataset_build_appends_pit_industry_one_hot_and_excludes_it_from_scaling
         "target_mode": "return",
         "preprocessing": {"enabled": True},
         "industry_feature": contract,
+        "target_ref": {"id": "stock_selection", "version": 1},
+        "transform_refs": [{
+            "id": "sw2021_industry_one_hot", "version": 2,
+        }],
+        "universe_rule_refs": [{"id": "exclude_st", "version": 1}],
     })
 
     prepared = builder.build(job)
 
     assert prepared.feature_names[-32:] == one_hot_names
     assert prepared.manifest["industry_feature"] == contract
+    assert prepared.manifest["target_ref"] == {
+        "id": "stock_selection", "version": 1,
+    }
+    assert prepared.manifest["transform_refs"][0]["version"] == 2
+    assert prepared.manifest["universe_rule_refs"][0]["id"] == "exclude_st"
     assert prepared.manifest["industry_feature_details"] == {
         "feature_names": one_hot_names,
         "mapped_coverage": pytest.approx(1.0),
@@ -286,6 +299,59 @@ def test_split_has_five_session_embargo_between_segments() -> None:
     assert test_start - valid_end == 6
 
 
+def test_materialization_reuses_frozen_ratio_boundaries_when_samples_miss_day() -> None:
+    calendar = pd.date_range("2024-01-02", periods=105, freq="B")
+    split = {
+        "mode": "ratio", "train": 0.6, "valid": 0.2, "test": 0.2,
+        "embargo_days": 5,
+    }
+    resolution = resolve_dataset_split(
+        calendar, split=split, label_horizon_trading_days=5,
+    )
+    frozen = {**split, "resolved": resolution}
+    sparse_samples = calendar[:-5].delete(58)
+
+    segments = materialized_dataset_segments(
+        split=frozen,
+        membership_calendar=calendar,
+        available_sample_dates=sparse_samples,
+        label_horizon_trading_days=5,
+    )
+
+    assert segments == {
+        name: tuple(value)
+        for name, value in resolution["segments"].items()
+    }
+    assert segments != split_trading_dates(
+        sparse_samples,
+        embargo_days=5,
+        train_ratio=0.6,
+        valid_ratio=0.2,
+    )
+
+
+def test_materialization_rejects_frozen_calendar_drift() -> None:
+    calendar = pd.date_range("2024-01-02", periods=105, freq="B")
+    split = {
+        "mode": "ratio", "train": 0.6, "valid": 0.2, "test": 0.2,
+        "embargo_days": 5,
+    }
+    frozen = {
+        **split,
+        "resolved": resolve_dataset_split(
+            calendar, split=split, label_horizon_trading_days=5,
+        ),
+    }
+
+    with pytest.raises(ValueError, match="交易日历或切分边界已漂移"):
+        materialized_dataset_segments(
+            split=frozen,
+            membership_calendar=calendar.delete(20),
+            available_sample_dates=calendar[:-5],
+            label_horizon_trading_days=5,
+        )
+
+
 def test_split_rejects_too_little_history() -> None:
     with pytest.raises(ValueError, match="不足60天"):
         split_trading_dates(pd.Index(pd.date_range("2024-01-02", periods=30, freq="B")))
@@ -323,6 +389,39 @@ def test_split_rejects_invalid_ratios() -> None:
         )
 
 
+def test_explicit_date_split_requires_real_boundaries_and_embargo() -> None:
+    dates = pd.date_range("2024-01-02", periods=100, freq="B")
+    segments = split_trading_dates_by_dates(
+        pd.Index(dates),
+        train=(dates[0], dates[59]),
+        valid=(dates[65], dates[79]),
+        test=(dates[85], dates[-1]),
+        embargo_days=5,
+    )
+
+    assert segments == {
+        "train": (
+            dates[0].date().isoformat(), dates[59].date().isoformat(),
+        ),
+        "valid": (
+            dates[65].date().isoformat(), dates[79].date().isoformat(),
+        ),
+        "test": (
+            dates[85].date().isoformat(), dates[-1].date().isoformat(),
+        ),
+    }
+
+
+def test_explicit_date_split_rejects_hidden_gaps() -> None:
+    dates = pd.date_range("2024-01-02", periods=100, freq="B")
+    with pytest.raises(ValueError, match="恰好5个交易日"):
+        split_trading_dates_by_dates(
+            pd.Index(dates),
+            train=(dates[0], dates[58]),
+            valid=(dates[65], dates[79]),
+            test=(dates[85], dates[-1]),
+            embargo_days=5,
+        )
 def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> None:
     dates = pd.date_range("2018-01-02", periods=1600, freq="B")
     windows = walk_forward_segments(

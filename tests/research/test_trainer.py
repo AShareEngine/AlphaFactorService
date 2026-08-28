@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 from pathlib import Path
+from hashlib import sha256
+import json
 import pickle
 import subprocess
 import sys
+import tarfile
 import textwrap
 
 import numpy as np
@@ -18,6 +21,7 @@ from factor_service.research.trainer import (
     _fit_stacking,
     _fit_model,
     _incremental_prepared_dataset,
+    _load_incremental_source,
     _metrics,
     _predict_dataset,
     _predict_training_dataset,
@@ -27,6 +31,43 @@ from factor_service.research.trainer import (
     _walk_forward_frame,
     predict_feature_frame,
 )
+
+
+def test_incremental_bundle_uses_recorded_training_identity_after_registration(
+    tmp_path: Path,
+) -> None:
+    bundle_path = tmp_path / "source-bundle.tar.gz"
+    manifest_path = tmp_path / "manifest.json"
+    model_path = tmp_path / "model.pkl"
+    manifest_path.write_text(json.dumps({
+        "model_id": "temporary-model",
+        "model_version": 1,
+        "model_kind": "lightgbm",
+    }), encoding="utf-8")
+    model_path.write_bytes(pickle.dumps({"model": "test"}))
+    with tarfile.open(bundle_path, "w:gz") as archive:
+        archive.add(manifest_path, arcname="manifest.json")
+        archive.add(model_path, arcname="model.pkl")
+
+    model, manifest = _load_incremental_source(
+        SimpleNamespace(model_artifacts_root=tmp_path),
+        {
+            "source_model_id": "public-model",
+            "source_model_version": 7,
+            "source_bundle_identity": {
+                "model_id": "temporary-model",
+                "model_version": 1,
+                "job_id": "job-source",
+            },
+            "source_artifact": {
+                "relative_path": bundle_path.name,
+                "sha256": sha256(bundle_path.read_bytes()).hexdigest(),
+            },
+        },
+    )
+
+    assert model == {"model": "test"}
+    assert manifest["model_id"] == "temporary-model"
 
 
 def test_stacking_bundle_combines_base_predictions_and_round_trips() -> None:

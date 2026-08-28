@@ -17,8 +17,14 @@ LEGACY_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
 PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
     "alphablocks.model-training-data-bindings.v2"
 )
-TRAINING_DATA_BINDING_SCHEMA_VERSION = (
+PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION_V3 = (
     "alphablocks.model-training-data-bindings.v3"
+)
+TRAINING_DATA_BINDING_SCHEMA_VERSION = (
+    "alphablocks.model-training-data-bindings.v4"
+)
+CONFIGURED_STOCK_POOL_SOURCE_SCHEMA_VERSION = (
+    "alphablocks.configured-stock-pool-source.v1"
 )
 FROZEN_TRAINING_DATA_BINDING_SCHEMA_VERSION = (
     "alphablocks.frozen-model-training-data-bindings.v1"
@@ -35,6 +41,7 @@ INDUSTRY_FEATURE_BINDING_ID = "stock_industry_one_hot"
 SOURCE_TYPES = {"node"}
 LEGACY_FROZEN_SOURCE_TYPES = {"node", "entity_asset"}
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_STOCK_POOLS = 100
 
 
 def _role(
@@ -202,7 +209,7 @@ def normalize_training_resource_settings(
     source: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     raw = _configuration_payload(source)
-    unknown = sorted(set(raw) - {"schema_version", "bindings"})
+    unknown = sorted(set(raw) - {"schema_version", "bindings", "stock_pools"})
     if unknown:
         raise ValueError(
             "模型训练数据绑定包含未支持字段: " + ", ".join(unknown)
@@ -213,6 +220,7 @@ def normalize_training_resource_settings(
     if schema_version not in {
         LEGACY_TRAINING_DATA_BINDING_SCHEMA_VERSION,
         PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION,
+        PREVIOUS_TRAINING_DATA_BINDING_SCHEMA_VERSION_V3,
         TRAINING_DATA_BINDING_SCHEMA_VERSION,
     }:
         raise ValueError("模型训练数据绑定schema_version不受支持")
@@ -237,7 +245,42 @@ def normalize_training_resource_settings(
             )
             for binding_id in BINDING_DEFINITIONS
         },
+        "stock_pools": _normalize_stock_pools(raw.get("stock_pools")),
     }
+
+
+def configured_stock_pool_sources(
+    settings: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    normalized = normalize_training_resource_settings(settings)
+    revision = int((settings or {}).get("revision") or 0)
+    membership = normalized["bindings"][INDEX_MEMBERSHIP_BINDING_ID]
+    ready = training_data_binding_ready(
+        membership, INDEX_MEMBERSHIP_BINDING_ID,
+    )
+    return [
+        {
+            "schema_version": CONFIGURED_STOCK_POOL_SOURCE_SCHEMA_VERSION,
+            "source_id": pool["id"],
+            "source_kind": "configured_stock_pool",
+            "label": pool["label"],
+            "version": revision,
+            "available": bool(pool["enabled"] and ready and revision > 0),
+            "pit": True,
+            "settings_revision": revision,
+            "binding_id": INDEX_MEMBERSHIP_BINDING_ID,
+            "binding_fingerprint": str(membership.get("fingerprint") or ""),
+            "selector": {
+                "field_role": "index_code",
+                "operator": "eq",
+                "value": pool["selector_value"],
+            },
+            "benchmark_code": pool["benchmark_code"],
+            "config_fingerprint": pool["fingerprint"],
+        }
+        for pool in normalized["stock_pools"]
+        if pool["enabled"]
+    ]
 
 
 def training_data_binding(
@@ -293,6 +336,11 @@ def required_training_data_binding_ids(
     spec = dict(dataset_spec or {})
     required = [STOCK_DAILY_BINDING_ID, TRADING_CALENDAR_BINDING_ID]
     universe_id = str(spec.get("universe_id") or "csi500")
+    universe_source = spec.get("universe_source")
+    registered_membership = (
+        isinstance(universe_source, Mapping)
+        and str(universe_source.get("source_kind") or "") == "entity_asset"
+    )
     filters = spec.get("sample_filters")
     filters = dict(filters) if isinstance(filters, Mapping) else {}
     try:
@@ -303,11 +351,11 @@ def required_training_data_binding_ids(
         minimum_listing_days = 0
     if universe_id == "all_a" or minimum_listing_days > 0:
         required.append(SECURITY_MASTER_BINDING_ID)
-    if universe_id != "all_a":
+    if universe_id != "all_a" and not registered_membership:
         required.append(INDEX_MEMBERSHIP_BINDING_ID)
     if (
-        filters.get("exclude_st", True) is True
-        or filters.get("exclude_delisting", True) is True
+        filters.get("exclude_st") is True
+        or filters.get("exclude_delisting") is True
     ):
         required.append(STOCK_STATUS_BINDING_ID)
     target = str(spec.get("research_target") or "stock_selection")
@@ -643,9 +691,72 @@ def _configuration_payload(
     raw = dict(source or {})
     return {
         key: raw[key]
-        for key in ("schema_version", "bindings")
+        for key in ("schema_version", "bindings", "stock_pools")
         if key in raw
     }
+
+
+def _normalize_stock_pools(source: Any) -> list[dict[str, Any]]:
+    if source is None:
+        return []
+    if not isinstance(source, list):
+        raise ValueError("模型训练stock_pools必须是数组")
+    if len(source) > MAX_STOCK_POOLS:
+        raise ValueError(f"模型训练股票池最多{MAX_STOCK_POOLS}个")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(source):
+        label = f"stock_pools[{index}]"
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{label}必须是对象")
+        raw = dict(item)
+        unknown = sorted(set(raw) - {
+            "id", "label", "enabled", "selector_value",
+            "benchmark_code", "fingerprint",
+        })
+        if unknown:
+            raise ValueError(
+                f"{label}包含未支持字段: " + ", ".join(unknown)
+            )
+        pool_id = str(raw.get("id") or "").strip()
+        if not IDENTIFIER.fullmatch(pool_id) or len(pool_id) > 80:
+            raise ValueError(f"{label}.id不是合法稳定标识")
+        if pool_id in seen:
+            raise ValueError(f"股票池ID重复: {pool_id}")
+        seen.add(pool_id)
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{label}.enabled必须是布尔值")
+        pool_label = str(raw.get("label") or pool_id).strip()
+        if not pool_label or len(pool_label) > 80:
+            raise ValueError(f"{label}.label不能为空或超过80字符")
+        selector_value = str(raw.get("selector_value") or "").strip()
+        if not selector_value or len(selector_value) > 80:
+            raise ValueError(
+                f"{label}.selector_value不能为空或超过80字符"
+            )
+        benchmark_code = str(
+            raw.get("benchmark_code") or selector_value
+        ).strip()
+        if not benchmark_code or len(benchmark_code) > 80:
+            raise ValueError(
+                f"{label}.benchmark_code不能为空或超过80字符"
+            )
+        core = {
+            "id": pool_id,
+            "label": pool_label,
+            "enabled": enabled,
+            "selector_value": selector_value,
+            "benchmark_code": benchmark_code,
+        }
+        fingerprint = sha256(
+            _canonical_json(core).encode("utf-8")
+        ).hexdigest()
+        configured = str(raw.get("fingerprint") or "").strip().lower()
+        if configured and configured != fingerprint:
+            raise ValueError(f"{label}.fingerprint与配置不一致")
+        result.append({**core, "fingerprint": fingerprint})
+    return result
 
 
 def _upgrade_legacy_binding(
@@ -722,6 +833,7 @@ def _canonical_json(value: Any) -> str:
 
 __all__ = [
     "BINDING_DEFINITIONS",
+    "CONFIGURED_STOCK_POOL_SOURCE_SCHEMA_VERSION",
     "FROZEN_TRAINING_DATA_BINDING_SCHEMA_VERSION",
     "INDEX_MEMBERSHIP_BINDING_ID",
     "INDUSTRY_FEATURE_BINDING_ID",
@@ -732,6 +844,7 @@ __all__ = [
     "TRAINING_DATA_BINDING_SCHEMA_VERSION",
     "TrainingResourceRevisionConflict",
     "TrainingResourceSettingsRepository",
+    "configured_stock_pool_sources",
     "frozen_data_binding",
     "frozen_training_data_binding",
     "frozen_training_data_bindings",

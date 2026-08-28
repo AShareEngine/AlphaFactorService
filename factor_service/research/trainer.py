@@ -336,6 +336,10 @@ class QlibTrainer:
             "job_id": job["job_id"],
             "model_id": job["model_id"],
             "model_kind": model_kind,
+            "algorithm_ref": {
+                "id": model_kind,
+                "version": int(model_spec.get("version") or 1),
+            },
             "research_target": research_target,
             "prediction_scope": prediction_scope,
             "target_mode": target_mode,
@@ -756,10 +760,19 @@ def _load_incremental_source(
         raise ValueError("增量训练来源manifest必须是对象")
     if str(manifest.get("model_kind") or "") != "lightgbm":
         raise ValueError("增量训练来源Bundle不是LightGBM模型")
+    bundle_identity = dict(contract.get("source_bundle_identity") or {})
+    expected_bundle_model_id = str(
+        bundle_identity.get("model_id")
+        or contract.get("source_model_id") or ""
+    )
+    expected_bundle_model_version = int(
+        bundle_identity.get("model_version")
+        or contract.get("source_model_version") or 0
+    )
     if (
-        str(manifest.get("model_id") or "") != str(contract.get("source_model_id") or "")
+        str(manifest.get("model_id") or "") != expected_bundle_model_id
         or int(manifest.get("model_version") or 0)
-        != int(contract.get("source_model_version") or 0)
+        != expected_bundle_model_version
     ):
         raise ValueError("增量训练来源Bundle与锁定模型版本不一致")
     return model, manifest

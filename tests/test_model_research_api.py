@@ -149,6 +149,16 @@ class _Repository:
     def get_job(self, job_id):
         return dict(self.jobs[job_id])
 
+    def retry_job(self, job_id, *, idempotency_key):
+        job = {
+            **self.jobs[job_id],
+            "status": "queued",
+            "retryable": False,
+            "idempotency_key": idempotency_key,
+        }
+        self.jobs[job_id] = job
+        return dict(job)
+
     def register_training_result(self, job_id):
         job = {
             **self.jobs[job_id],
@@ -752,6 +762,27 @@ def test_failed_experiment_can_be_restarted_as_a_new_run(monkeypatch) -> None:
     )
 
 
+def test_failed_job_can_be_retried_in_place_with_idempotency_key(monkeypatch) -> None:
+    repository = _Repository()
+    repository.jobs["failed-trial"] = {
+        "job_id": "failed-trial",
+        "kind": "train",
+        "status": "failed",
+        "retryable": True,
+        "config_json": {"execution": {"node_id": "local"}},
+    }
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    response = client.post(
+        "/model-research/jobs/failed-trial/retry",
+        json={"idempotency_key": "retry-once"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["status"] == "queued"
+    assert response.json()["job"]["idempotency_key"] == "retry-once"
+
+
 def test_experiment_lineage_conflict_is_returned_as_http_409(monkeypatch) -> None:
     repository = _Repository()
 
@@ -770,6 +801,41 @@ def test_experiment_lineage_conflict_is_returned_as_http_409(monkeypatch) -> Non
 
     assert response.status_code == 409
     assert "冻结因子" in response.json()["detail"]
+
+
+def test_dataset_preflight_endpoint_freezes_before_calendar_validation(
+    monkeypatch,
+) -> None:
+    client = _client(monkeypatch, _Repository(), _Scheduler())
+    calls = []
+
+    def freeze(payload):
+        payload["dataset"]["data_bindings"] = {"frozen": True}
+        calls.append("freeze")
+
+    class Preflight:
+        def validate(self, payload):
+            assert payload["dataset"]["data_bindings"] == {"frozen": True}
+            calls.append("validate")
+            return {
+                "schema_version": "alphablocks.dataset-preflight.v1",
+                "dataset": payload["dataset"],
+                "dataset_hash": "a" * 64,
+                "segments": {},
+                "calendar": {},
+            }
+
+    monkeypatch.setattr(model_research, "_freeze_training_data_bindings", freeze)
+    monkeypatch.setattr(model_research, "DatasetPreflightService", Preflight)
+
+    response = client.post(
+        "/model-research/dataset-preflight",
+        json={"dataset": {"name": "preflight"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["preflight"]["dataset_hash"] == "a" * 64
+    assert calls == ["freeze", "validate"]
 
 
 def test_removed_page_only_experiment_and_scheduler_endpoints_return_404(

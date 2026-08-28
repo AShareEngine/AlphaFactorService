@@ -20,7 +20,10 @@ from factor_service.entity_field_feature import (
     normalize_entity_field_feature,
 )
 from factor_service.model_validation import select_model_trial, select_parameter_trial
-from factor_service.research.dataset import SW2021_INDUSTRY_SAFE_START
+from factor_service.research.dataset import (
+    DATASET_SPLIT_RESOLUTION_SCHEMA_VERSION,
+    SW2021_INDUSTRY_SAFE_START,
+)
 from factor_service.research.industry_feature import (
     INDUSTRY_FEATURE_SAFE_START,
     normalize_industry_feature,
@@ -36,6 +39,12 @@ from factor_service.research.sample_filter_formula import (
 from factor_service.research.training_resource_settings import (
     normalize_frozen_training_data_bindings,
 )
+from factor_service.research.universe_source import (
+    normalize_universe_source,
+)
+from factor_service.research.universe_field_filter import (
+    normalize_universe_field_filters,
+)
 
 
 ACTIVE_STATUSES = frozenset({"leased", "running", "uploading"})
@@ -43,6 +52,7 @@ TERMINAL_STATUSES = frozenset({"succeeded", "failed", "canceled"})
 MAX_EXPERIMENT_TRIALS = 24
 MAX_EXPERIMENT_ITERATIONS = 3
 MAX_LINEAGE_TRIALS = 24
+ATTEMPT_AUDIT_MIGRATION = "0036_model_job_attempt_audit"
 
 CLASSICAL_STACKING_KINDS = frozenset({
     "lightgbm", "xgboost", "catboost", "random_forest", "linear",
@@ -129,6 +139,19 @@ class ModelResearchConflict(ModelResearchError):
     pass
 
 
+def _require_attempt_audit_schema(conn: Any) -> None:
+    """Fail with an actionable contract error before touching the v36 table."""
+
+    row = conn.execute(
+        "SELECT to_regclass(current_schema() || '.model_job_attempts') AS relation"
+    ).fetchone()
+    if not row or not row.get("relation"):
+        raise ModelResearchConflict(
+            f"control database缺少迁移{ATTEMPT_AUDIT_MIGRATION}；"
+            "请先升级AlphaBlocks控制库再启动训练调度"
+        )
+
+
 def _training_dataset_source(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Read dataset contracts and bridge retired context-only switches.
 
@@ -168,6 +191,34 @@ class ModelResearchRepository:
         self.database = database or get_control_database()
 
     def create_training_job(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        prepared = self._prepare_training_job(payload)
+        submission = dict(prepared.get("submission") or {})
+        existing_job_ids: list[str] = []
+        with self.database.connection() as conn:
+            with conn.transaction():
+                if submission:
+                    self._lock_training_submission(conn, submission)
+                    existing = self._training_submission_rows(conn, submission)
+                    if existing:
+                        self._assert_training_submission_replay(
+                            existing, submission, expected_count=1,
+                        )
+                        existing_job_ids = [str(existing[0]["job_id"])]
+                if not existing_job_ids:
+                    self._insert_prepared_training_job(
+                        conn, prepared, now=_utcnow(),
+                    )
+        return self.get_job(
+            existing_job_ids[0] if existing_job_ids else str(prepared["job_id"])
+        )
+
+    def _prepare_training_job(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        job_id: str = "",
+        submission: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         spec = _dataset_spec(_training_dataset_source(payload))
         model = _model_spec(
             payload.get("model") or {}, target_mode=spec["target_mode"],
@@ -187,10 +238,46 @@ class ModelResearchRepository:
         spec_json = _canonical_json(spec)
         spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
         dataset_id = f"dataset_{spec_hash[:24]}"
-        job_id = f"model_job_{uuid4().hex}"
+        identity = dict(submission or {})
+        if not identity:
+            request = {
+                "resource_kind": "job",
+                "client_study_id": _bounded_identity(
+                    payload.get("client_study_id"), "client_study_id",
+                ),
+                "title": str(
+                    payload.get("title") or f"{model['kind']} 因子模型"
+                ).strip()[:160],
+                "requested_model_id": str(payload.get("model_id") or "").strip(),
+                "dataset": spec,
+                "model": model,
+                "walk_forward": walk_forward,
+                "execution": execution,
+                "research_origin": research_origin,
+                "incremental_from": dict(payload.get("incremental_from") or {}),
+                "experiment": _experiment_ref(payload.get("experiment") or {}),
+            }
+            identity = _training_submission_identity(
+                payload, resource_kind="job", request=request,
+            )
+        resource_seed = str(
+            identity.get("client_study_id")
+            or identity.get("idempotency_key")
+            or ""
+        )
+        if not job_id:
+            job_id = (
+                f"model_job_{sha256(('job:' + resource_seed).encode('utf-8')).hexdigest()[:32]}"
+                if identity
+                else f"model_job_{uuid4().hex}"
+            )
         model_id = _clean_identifier(
             str(payload.get("model_id") or ""),
-            default=f"model_{uuid4().hex[:16]}",
+            default=(
+                f"model_{sha256(('model:' + resource_seed).encode('utf-8')).hexdigest()[:16]}"
+                if identity
+                else f"model_{uuid4().hex[:16]}"
+            ),
         )
         incremental_training: dict[str, Any] = {}
         incremental_source = payload.get("incremental_from") or {}
@@ -231,69 +318,158 @@ class ModelResearchRepository:
             config["research_origin"] = research_origin
         if incremental_training:
             config["incremental_training"] = incremental_training
-        now = _utcnow()
-        with self.database.connection() as conn:
-            with conn.transaction():
-                conn.execute(
-                    """
-                    INSERT INTO model_dataset_specs(
-                        dataset_id, spec_hash, name, universe_id, factor_count,
-                        data_cutoff, spec_json, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (spec_hash) DO NOTHING
-                    """,
-                    (
-                        dataset_id,
-                        spec_hash,
-                        str(spec.get("name") or title),
-                        spec["universe_id"],
-                        len(spec["factors"]),
-                        spec["data_cutoff"],
-                        Jsonb(spec),
-                        now,
-                    ),
-                )
-                row = conn.execute(
-                    "SELECT dataset_id FROM model_dataset_specs WHERE spec_hash = %s",
-                    (spec_hash,),
-                ).fetchone()
-                dataset_id = str(row["dataset_id"])
-                conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                    (f"model:{model_id}",),
-                )
-                version_row = conn.execute(
-                    """
-                    SELECT GREATEST(
-                        COALESCE((SELECT max(version) FROM model_versions WHERE model_id = %s), 0),
-                        COALESCE((SELECT max((config_json ->> 'planned_model_version')::integer)
-                                  FROM model_jobs
-                                  WHERE model_id = %s AND status NOT IN ('failed', 'canceled')), 0)
-                    ) + 1 AS version
-                    """,
-                    (model_id, model_id),
-                ).fetchone()
-                config["planned_model_version"] = int(version_row["version"])
-                conn.execute(
-                    """
-                    INSERT INTO model_jobs(
-                        job_id, dataset_id, model_id, kind, model_kind, title,
-                        status, config_json, requested_at, updated_at
-                    ) VALUES (%s, %s, %s, 'train', %s, %s,
-                              'queued', %s, %s, %s)
-                    """,
-                    (job_id, dataset_id, model_id, model["kind"], title, Jsonb(config), now, now),
-                )
-                self._event(
-                    conn, job_id, "job.queued", stage="queued",
-                    payload={
-                        "dataset_hash": spec_hash,
-                        "experiment_id": experiment.get("experiment_id", ""),
-                        "trial_index": experiment.get("trial_index"),
-                        "trial_count": experiment.get("trial_count"),
-                    },
-                )
-        return self.get_job(job_id)
+        if identity:
+            config["submission"] = identity
+        return {
+            "job_id": job_id,
+            "dataset_id": dataset_id,
+            "dataset_spec": spec,
+            "dataset_hash": spec_hash,
+            "model_id": model_id,
+            "model": model,
+            "title": title,
+            "config": config,
+            "experiment": experiment,
+            "submission": identity,
+        }
+
+    def _insert_prepared_training_job(
+        self, conn: Any, prepared: Mapping[str, Any], *, now: datetime,
+    ) -> None:
+        spec = dict(prepared["dataset_spec"])
+        spec_hash = str(prepared["dataset_hash"])
+        dataset_id = str(prepared["dataset_id"])
+        model_id = str(prepared["model_id"])
+        model = dict(prepared["model"])
+        config = dict(prepared["config"])
+        experiment = dict(prepared.get("experiment") or {})
+        conn.execute(
+            """
+            INSERT INTO model_dataset_specs(
+                dataset_id, spec_hash, name, universe_id, factor_count,
+                data_cutoff, spec_json, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (spec_hash) DO NOTHING
+            """,
+            (
+                dataset_id,
+                spec_hash,
+                str(spec.get("name") or prepared["title"]),
+                spec["universe_id"],
+                len(spec["factors"]),
+                spec["data_cutoff"],
+                Jsonb(spec),
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT dataset_id FROM model_dataset_specs WHERE spec_hash = %s",
+            (spec_hash,),
+        ).fetchone()
+        dataset_id = str(row["dataset_id"])
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (f"model:{model_id}",),
+        )
+        version_row = conn.execute(
+            """
+            SELECT GREATEST(
+                COALESCE((SELECT max(version) FROM model_versions WHERE model_id = %s), 0),
+                COALESCE((SELECT max((config_json ->> 'planned_model_version')::integer)
+                          FROM model_jobs
+                          WHERE model_id = %s AND status NOT IN ('failed', 'canceled')), 0)
+            ) + 1 AS version
+            """,
+            (model_id, model_id),
+        ).fetchone()
+        config["planned_model_version"] = int(version_row["version"])
+        conn.execute(
+            """
+            INSERT INTO model_jobs(
+                job_id, dataset_id, model_id, kind, model_kind, title,
+                status, config_json, requested_at, updated_at
+            ) VALUES (%s, %s, %s, 'train', %s, %s,
+                      'queued', %s, %s, %s)
+            """,
+            (
+                str(prepared["job_id"]), dataset_id, model_id, model["kind"],
+                str(prepared["title"]), Jsonb(config), now, now,
+            ),
+        )
+        self._event(
+            conn, str(prepared["job_id"]), "job.queued", stage="queued",
+            payload={
+                "dataset_hash": spec_hash,
+                "experiment_id": experiment.get("experiment_id", ""),
+                "trial_index": experiment.get("trial_index"),
+                "trial_count": experiment.get("trial_count"),
+            },
+        )
+
+    @staticmethod
+    def _lock_training_submission(
+        conn: Any, submission: Mapping[str, Any],
+    ) -> None:
+        tokens = sorted({
+            value
+            for value in (
+                f"key:{submission.get('idempotency_key')}"
+                if submission.get("idempotency_key") else "",
+                f"client:{submission.get('client_study_id')}"
+                if submission.get("client_study_id") else "",
+            )
+            if value
+        })
+        for token in tokens:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"training-submission:{token}",),
+            )
+
+    @staticmethod
+    def _training_submission_rows(
+        conn: Any, submission: Mapping[str, Any],
+    ) -> list[Mapping[str, Any]]:
+        cursor = conn.execute(
+            """
+            SELECT job_id, config_json
+            FROM model_jobs
+            WHERE config_json -> 'submission' ->> 'scope' = 'training'
+              AND (
+                    (%s <> '' AND config_json -> 'submission' ->> 'idempotency_key' = %s)
+                 OR (%s <> '' AND config_json -> 'submission' ->> 'client_study_id' = %s)
+              )
+            ORDER BY COALESCE(
+                (config_json -> 'submission' ->> 'ordinal')::integer, 1
+            ), requested_at, job_id
+            """,
+            (
+                str(submission.get("idempotency_key") or ""),
+                str(submission.get("idempotency_key") or ""),
+                str(submission.get("client_study_id") or ""),
+                str(submission.get("client_study_id") or ""),
+            ),
+        )
+        return list(cursor.fetchall())
+
+    @staticmethod
+    def _assert_training_submission_replay(
+        rows: list[Mapping[str, Any]],
+        submission: Mapping[str, Any],
+        *,
+        expected_count: int,
+    ) -> None:
+        expected_hash = str(submission.get("request_hash") or "")
+        expected_kind = str(submission.get("resource_kind") or "")
+        for row in rows:
+            stored = dict(dict(row.get("config_json") or {}).get("submission") or {})
+            if (
+                str(stored.get("request_hash") or "") != expected_hash
+                or str(stored.get("resource_kind") or "") != expected_kind
+            ):
+                raise ModelResearchConflict("幂等键或client_study_id已用于不同训练请求")
+        if len(rows) != int(expected_count):
+            raise ModelResearchConflict("幂等训练记录不完整，请勿创建重复试验")
 
     def incremental_training_precheck(
         self, model_id: str, version: int, payload: Mapping[str, Any],
@@ -440,7 +616,16 @@ class ModelResearchRepository:
             raise ModelResearchError(
                 "实验策略只支持grid、horizon_grid、factor_ablation或model_ensemble"
             )
-        experiment_id = f"model_experiment_{uuid4().hex}"
+        submission_seed = (
+            _bounded_identity(payload.get("client_study_id"), "client_study_id")
+            or _bounded_identity(payload.get("idempotency_key"), "idempotency_key")
+        )
+        experiment_id = (
+            "model_experiment_"
+            + sha256(("experiment:" + submission_seed).encode("utf-8")).hexdigest()[:32]
+            if submission_seed
+            else f"model_experiment_{uuid4().hex}"
+        )
         parent_experiment_id = str(
             payload.get("parent_experiment_id") or ""
         ).strip()
@@ -544,13 +729,43 @@ class ModelResearchRepository:
             params_by_kind = search.get("model_params_by_kind") or {}
             if not isinstance(params_by_kind, Mapping):
                 raise ModelResearchError("model_params_by_kind必须是对象")
+            raw_versions = search.get("model_versions_by_kind")
+            if raw_versions is None:
+                versions_by_kind = {kind: 1 for kind in normalized_kinds}
+            elif not isinstance(raw_versions, Mapping):
+                raise ModelResearchError("model_versions_by_kind必须是对象")
+            else:
+                normalized_versions = {
+                    str(key).strip().lower(): value
+                    for key, value in raw_versions.items()
+                }
+                version_keys = set(normalized_versions)
+                if version_keys != set(normalized_kinds):
+                    raise ModelResearchError(
+                        "model_versions_by_kind必须与model_kinds逐项对齐"
+                    )
+                versions_by_kind = {}
+                for trial_kind in normalized_kinds:
+                    try:
+                        version = int(normalized_versions.get(trial_kind))
+                    except (TypeError, ValueError) as exc:
+                        raise ModelResearchError(
+                            f"{trial_kind}模型版本必须是正整数"
+                        ) from exc
+                    if version != 1:
+                        raise ModelResearchError(
+                            "当前模型执行合同只支持model.version=1"
+                        )
+                    versions_by_kind[trial_kind] = version
             base_models = []
             for trial_kind in normalized_kinds:
                 params_source = params_by_kind.get(trial_kind) or {}
                 if not isinstance(params_source, Mapping):
                     raise ModelResearchError(f"{trial_kind}的参数配置无效")
                 base_models.append(_model_spec({
-                    "kind": trial_kind, "params": params_source,
+                    "kind": trial_kind,
+                    "version": versions_by_kind[trial_kind],
+                    "params": params_source,
                 }, target_mode=target_mode))
             ensemble_method = str(
                 search.get("ensemble_method") or "none"
@@ -619,19 +834,19 @@ class ModelResearchRepository:
                     key: trial["model"]["params"][key]
                     for key in sorted(search.get("parameters") or {})
                 }
-        jobs: list[dict[str, Any]] = []
         trial_count = len(normalized_trials)
         if lineage_prior_trial_count + trial_count > MAX_LINEAGE_TRIALS:
             raise ModelResearchConflict(
                 f"同一研究谱系累计最多允许{MAX_LINEAGE_TRIALS}组试验，防止验证集多重比较过拟合"
             )
+        trial_payloads: list[dict[str, Any]] = []
         for index, trial in enumerate(normalized_trials, start=1):
             horizon = int(
                 dict(trial["dataset"].get("label") or {}).get(
                     "horizon_trading_days"
                 ) or 5
             )
-            jobs.append(self.create_training_job({
+            trial_payloads.append({
                 "title": (
                     f"{experiment_title} · T+{horizon}"
                     if strategy == "horizon_grid"
@@ -669,7 +884,75 @@ class ModelResearchRepository:
                     "search_params": trial["search_params"],
                     "auto_dispatch": True,
                 },
-            }))
+            })
+
+        # Normalization-only unit tests construct an uninitialized repository
+        # and replace create_training_job with a recorder.  Real repository
+        # instances always use the single-transaction path below.
+        if not hasattr(self, "database"):
+            jobs = [self.create_training_job(item) for item in trial_payloads]
+            return _experiment_summary(experiment_id, jobs)
+
+        execution = _execution_spec(
+            payload.get("execution") or {
+                "node_id": payload.get("execution_node_id") or "local",
+            }
+        )
+        submission = _training_submission_identity(
+            payload,
+            resource_kind="experiment",
+            request={
+                "resource_kind": "experiment",
+                "title": experiment_title,
+                "model_id": model_id,
+                "strategy": strategy,
+                "parent_experiment_id": parent_experiment_id,
+                "parent_job_id": parent_job_id,
+                "iteration": iteration,
+                "lineage_prior_trial_count": lineage_prior_trial_count,
+                "walk_forward": walk_forward,
+                "execution": execution,
+                "research_origin": dict(payload.get("research_origin") or {}),
+                "trials": normalized_trials,
+            },
+        )
+        prepared: list[dict[str, Any]] = []
+        for index, item in enumerate(trial_payloads, start=1):
+            child_submission = (
+                {**submission, "ordinal": index, "trial_count": trial_count}
+                if submission else {}
+            )
+            child_job_id = (
+                "model_job_"
+                + sha256(
+                    f"experiment-job:{experiment_id}:{index}".encode("utf-8")
+                ).hexdigest()[:32]
+                if submission else ""
+            )
+            prepared.append(self._prepare_training_job(
+                item, job_id=child_job_id, submission=child_submission,
+            ))
+
+        existing_job_ids: list[str] = []
+        with self.database.connection() as conn:
+            with conn.transaction():
+                if submission:
+                    self._lock_training_submission(conn, submission)
+                    existing = self._training_submission_rows(conn, submission)
+                    if existing:
+                        self._assert_training_submission_replay(
+                            existing, submission, expected_count=trial_count,
+                        )
+                        existing_job_ids = [
+                            str(row["job_id"]) for row in existing
+                        ]
+                if not existing_job_ids:
+                    now = _utcnow()
+                    for item in prepared:
+                        self._insert_prepared_training_job(conn, item, now=now)
+
+        job_ids = existing_job_ids or [str(item["job_id"]) for item in prepared]
+        jobs = [self.get_job(job_id) for job_id in job_ids]
         return _experiment_summary(experiment_id, jobs)
 
     def restart_training_experiment(self, experiment_id: str) -> dict[str, Any]:
@@ -1217,10 +1500,18 @@ class ModelResearchRepository:
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         values.append(max(1, min(int(limit), 500)))
         with self.database.connection() as conn:
+            _require_attempt_audit_schema(conn)
             rows = conn.execute(
                 f"""
                 SELECT jobs.*, specs.spec_hash AS dataset_hash,
-                       specs.spec_json AS dataset_spec
+                       specs.spec_json AS dataset_spec,
+                       COALESCE((
+                           SELECT jsonb_agg(
+                               to_jsonb(attempts) ORDER BY attempts.ordinal
+                           )
+                           FROM model_job_attempts attempts
+                           WHERE attempts.job_id = jobs.job_id
+                       ), '[]'::jsonb) AS attempts_json
                 FROM model_jobs jobs
                 JOIN model_dataset_specs specs USING(dataset_id)
                 {where}
@@ -1309,10 +1600,18 @@ class ModelResearchRepository:
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.database.connection() as conn:
+            _require_attempt_audit_schema(conn)
             row = conn.execute(
                 """
                 SELECT jobs.*, specs.spec_hash AS dataset_hash,
-                       specs.spec_json AS dataset_spec
+                       specs.spec_json AS dataset_spec,
+                       COALESCE((
+                           SELECT jsonb_agg(
+                               to_jsonb(attempts) ORDER BY attempts.ordinal
+                           )
+                           FROM model_job_attempts attempts
+                           WHERE attempts.job_id = jobs.job_id
+                       ), '[]'::jsonb) AS attempts_json
                 FROM model_jobs jobs
                 JOIN model_dataset_specs specs USING(dataset_id)
                 WHERE jobs.job_id = %s
@@ -1363,6 +1662,65 @@ class ModelResearchRepository:
                 self._event(conn, job_id, "job.cancel_requested", stage=status)
         return self.get_job(job_id)
 
+    def retry_job(
+        self, job_id: str, *, idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Queue one new Attempt for a retryable, terminal training failure."""
+        clean_key = str(idempotency_key or "").strip()
+        if not clean_key:
+            raise ModelResearchError("idempotency_key不能为空")
+        now = _utcnow()
+        replay = False
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型任务不存在")
+                result = dict(row.get("result_json") or {})
+                prior_retry = dict(result.get("manual_retry") or {})
+                if (
+                    str(row.get("status") or "") == "queued"
+                    and str(prior_retry.get("idempotency_key") or "") == clean_key
+                ):
+                    replay = True
+                elif str(row.get("kind") or "train") != "train":
+                    raise ModelResearchConflict("只有训练任务可以手动重试")
+                elif str(row.get("status") or "") != "failed":
+                    raise ModelResearchConflict("只有失败且可重试的任务可以手动重试")
+                elif dict(result.get("failure") or {}).get("retryable") is not True:
+                    raise ModelResearchConflict("任务失败原因不允许手动重试")
+                else:
+                    result["manual_retry"] = {
+                        "idempotency_key": clean_key,
+                        "requested_at": now.isoformat(),
+                        "prior_attempt_count": int(row.get("attempt_count") or 0),
+                    }
+                    conn.execute(
+                        """
+                        UPDATE model_jobs
+                        SET status = 'queued', cancel_requested = FALSE,
+                            max_attempts = GREATEST(max_attempts, attempt_count + 1),
+                            result_json = %s, progress_json = '{}',
+                            lease_owner = '', lease_token = '', lease_expires_at = NULL,
+                            error_message = '', finished_at = NULL, updated_at = %s
+                        WHERE job_id = %s
+                        """,
+                        (Jsonb(result), now, job_id),
+                    )
+                    self._event(
+                        conn, job_id, "job.manual_retry_queued", stage="queued",
+                        payload={
+                            "attempt_count": int(row.get("attempt_count") or 0),
+                            "next_attempt": int(row.get("attempt_count") or 0) + 1,
+                        },
+                    )
+        if replay:
+            return self.get_job(job_id)
+        return self.get_job(job_id)
+
     def claim_specific_job(
         self, job_id: str, *, lease_seconds: int = 90,
     ) -> dict[str, Any]:
@@ -1402,6 +1760,14 @@ class ModelResearchRepository:
                     raise ModelResearchConflict("任务当前不可分配")
                 if int(row["attempt_count"]) >= int(row["max_attempts"]):
                     raise ModelResearchConflict("任务已达到最大尝试次数")
+                ordinal = int(row["attempt_count"]) + 1
+                _insert_attempt_audit_row(
+                    conn,
+                    row=row,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    started_at=now,
+                )
                 conn.execute(
                     """
                     UPDATE model_jobs
@@ -1465,6 +1831,14 @@ class ModelResearchRepository:
                 if not row:
                     return None
                 job_id = str(row["job_id"])
+                ordinal = int(row["attempt_count"]) + 1
+                _insert_attempt_audit_row(
+                    conn,
+                    row=row,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    started_at=now,
+                )
                 conn.execute(
                     """
                     UPDATE model_jobs
@@ -1490,7 +1864,7 @@ class ModelResearchRepository:
     def release_dispatch_lease(
         self, job_id: str, *, lease_token: str, error_message: str,
     ) -> dict[str, Any]:
-        """Return a job to the queue when HTTP dispatch never reached the worker."""
+        """Return a job to the queue while retaining the failed dispatch Attempt."""
         now = _utcnow()
         with self.database.connection() as conn:
             with conn.transaction():
@@ -1501,13 +1875,13 @@ class ModelResearchRepository:
                 if not row:
                     raise ModelResearchNotFound("模型任务不存在")
                 self._assert_lease(row, lease_token)
+                ordinal = int(row.get("attempt_count") or 0)
                 conn.execute(
                     """
                     UPDATE model_jobs
                     SET status = 'queued', lease_owner = '', lease_token = '',
                         lease_expires_at = NULL,
-                        attempt_count = GREATEST(attempt_count - 1, 0),
-                        started_at = CASE WHEN attempt_count <= 1 THEN NULL ELSE started_at END,
+                        max_attempts = GREATEST(max_attempts, attempt_count + 1),
                         error_message = %s, updated_at = %s
                     WHERE job_id = %s
                     """,
@@ -1517,6 +1891,20 @@ class ModelResearchRepository:
                     conn, job_id, "job.dispatch_failed", stage="queued",
                     message=str(error_message)[:1000],
                 )
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    status="failed",
+                    finished_at=now,
+                    error={
+                        "code": "dispatch_failed",
+                        "message": str(error_message)[:4000],
+                        "retryable": True,
+                    },
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("调度失败缺少Attempt审计记录")
         return self.get_job(job_id)
 
     def renew_lease(
@@ -1541,6 +1929,19 @@ class ModelResearchRepository:
                     """,
                     (expires, Jsonb(payload), now, job_id, "alpha-factor-service", lease_token),
                 ).fetchone()
+                if row:
+                    attempt_status = (
+                        "uploading"
+                        if str(row.get("status") or "") == "uploading"
+                        else "running"
+                    )
+                    _update_attempt_audit_row(
+                        conn,
+                        job_id=job_id,
+                        ordinal=int(row.get("attempt_count") or 0),
+                        status=attempt_status,
+                        require_active=True,
+                    )
                 if row and record_event:
                     stage = str(payload.get("stage") or "progress")
                     self._event(
@@ -1582,12 +1983,20 @@ class ModelResearchRepository:
                     WHERE job_id = %s AND lease_owner = %s AND lease_token = %s
                       AND status IN ('leased', 'running', 'uploading')
                       AND cancel_requested = FALSE
-                    RETURNING job_id
+                    RETURNING job_id, attempt_count
                     """,
                     (stage, Jsonb(dict(progress or {})), _utcnow(), job_id, "alpha-factor-service", lease_token),
                 ).fetchone()
                 if not row:
                     raise ModelResearchConflict("任务租约失效、已取消或不属于调度服务")
+                attempt_status = "uploading" if stage == "uploading" else "running"
+                _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=int(row.get("attempt_count") or 0),
+                    status=attempt_status,
+                    require_active=True,
+                )
                 self._event(conn, job_id, f"job.{stage}", stage=stage, message=message, payload=progress)
         return self.get_job(job_id)
 
@@ -1634,9 +2043,24 @@ class ModelResearchRepository:
                         "registration_status": "pending_confirmation",
                     },
                 )
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=int(row.get("attempt_count") or 0),
+                    status="succeeded",
+                    finished_at=now,
+                    error={},
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("训练Attempt审计记录不存在或已终止")
         return self.get_job(job_id)
 
-    def register_training_result(self, job_id: str) -> dict[str, Any]:
+    def register_training_result(
+        self,
+        job_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
         """Register one completed training result only after explicit user confirmation."""
         current = self.get_job(job_id)
         if str(current.get("kind") or "train") != "train":
@@ -1646,6 +2070,15 @@ class ModelResearchRepository:
         )
         if str(registration.get("status") or "") == "declined":
             raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
+        requested_model_id = (
+            _required_identifier(str(model_id), "model_id")
+            if model_id is not None
+            else ""
+        )
+        if int(current.get("model_version") or 0) > 0:
+            if requested_model_id and requested_model_id != str(current.get("model_id") or ""):
+                raise ModelResearchConflict("该训练结果已经注册为另一个model_id")
+            return current
         experiment = dict(
             (current.get("config_json") or {}).get("experiment") or {}
         )
@@ -1671,27 +2104,115 @@ class ModelResearchRepository:
                     raise ModelResearchConflict("只有训练任务结果可以确认入库")
                 if str(row["status"] or "") != "succeeded":
                     raise ModelResearchConflict("只有训练完成的任务可以确认入库")
-                model_id = str(row["model_id"])
+                # A concurrent request may have completed registration while
+                # this caller was waiting for the row lock.  Re-check the
+                # durable identity inside the transaction instead of applying
+                # a second alias to the same training result.
+                if int(row.get("model_version") or 0) > 0:
+                    if (
+                        requested_model_id
+                        and requested_model_id != str(row.get("model_id") or "")
+                    ):
+                        raise ModelResearchConflict(
+                            "该训练结果已经注册为另一个model_id"
+                        )
+                    # Do not open a second pooled connection while this
+                    # transaction still owns the row lock.  Preserve joined
+                    # dataset fields from the initial read and overlay the
+                    # freshly locked durable job row.
+                    return {**current, **_job_row(row)}
+                internal_model_id = str(row["model_id"])
+                registered_model_id = requested_model_id or internal_model_id
                 config = dict(row["config_json"] or {})
-                version = int(config.get("planned_model_version") or 0)
-                if version <= 0:
+                result = dict(row["result_json"] or {})
+                if not result:
+                    raise ModelResearchConflict("训练结果尚未写入，不能确认入库")
+                internal_model_version = int(
+                    config.get("planned_model_version") or 0
+                )
+                if internal_model_version <= 0:
                     raise ModelResearchConflict("任务缺少预留模型版本")
                 conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                    (f"model:{model_id}",),
+                    (f"model:{registered_model_id}",),
+                )
+                identity_changed = registered_model_id != internal_model_id
+                if identity_changed:
+                    version_row = conn.execute(
+                        """
+                        SELECT GREATEST(
+                            COALESCE((
+                                SELECT max(version)
+                                FROM model_versions
+                                WHERE model_id = %s
+                            ), 0),
+                            COALESCE((
+                                SELECT max(
+                                    (config_json ->> 'planned_model_version')::integer
+                                )
+                                FROM model_jobs
+                                WHERE model_id = %s
+                                  AND job_id <> %s
+                                  AND status NOT IN ('failed', 'canceled')
+                                  AND (config_json ->> 'planned_model_version')
+                                      ~ '^[0-9]+$'
+                            ), 0)
+                        ) + 1 AS version
+                        """,
+                        (
+                            registered_model_id,
+                            registered_model_id,
+                            job_id,
+                        ),
+                    ).fetchone()
+                    version = self._prediction_alias_version(
+                        target_model_id=registered_model_id,
+                        job_id=job_id,
+                        minimum_version=int(version_row["version"]),
+                    )
+                else:
+                    version = internal_model_version
+                prediction_alias = self._copy_training_prediction_identity(
+                    job_id=job_id,
+                    source_model_id=internal_model_id,
+                    source_model_version=internal_model_version,
+                    target_model_id=registered_model_id,
+                    target_model_version=version,
+                    expected_source_rows=int(
+                        dict(result.get("predictions") or {}).get("row_count")
+                        or 0
+                    ),
+                ) if identity_changed else {
+                    "copied": False,
+                    "source_rows": int(
+                        dict(result.get("predictions") or {}).get("row_count")
+                        or 0
+                    ),
+                    "target_rows": int(
+                        dict(result.get("predictions") or {}).get("row_count")
+                        or 0
+                    ),
+                }
+                config, result = _registration_payloads(
+                    job_id=job_id,
+                    config=config,
+                    result=result,
+                    training_model_id=internal_model_id,
+                    training_model_version=internal_model_version,
+                    registered_model_id=registered_model_id,
+                    registered_model_version=version,
+                    prediction_alias=prediction_alias,
+                    registered_at=now.isoformat(),
                 )
                 existing = conn.execute(
                     """
                     SELECT job_id FROM model_versions
                     WHERE model_id = %s AND version = %s
                     """,
-                    (model_id, version),
+                    (registered_model_id, version),
                 ).fetchone()
                 if existing and str(existing["job_id"]) != job_id:
                     raise ModelResearchConflict("预留模型版本已被其他任务占用")
-                result = dict(row["result_json"] or {})
-                if not result:
-                    raise ModelResearchConflict("训练结果尚未写入，不能确认入库")
                 registration = dict(result.get("registration") or {})
                 if str(registration.get("status") or "") == "declined":
                     raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
@@ -1705,7 +2226,7 @@ class ModelResearchRepository:
                         ) VALUES (%s, %s, %s, %s, %s, %s, 'candidate', %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            model_id, version, job_id, row["dataset_id"], row["title"],
+                            registered_model_id, version, job_id, row["dataset_id"], row["title"],
                             row["model_kind"], Jsonb(dict(result.get("metrics") or {})),
                             Jsonb(list(result.get("feature_importance") or [])),
                             Jsonb(dict(result.get("predictions") or {})),
@@ -1715,22 +2236,210 @@ class ModelResearchRepository:
                 conn.execute(
                     """
                     UPDATE model_jobs
-                    SET model_version = %s, updated_at = %s
+                    SET model_id = %s, model_version = %s,
+                        config_json = %s, result_json = %s, updated_at = %s
                     WHERE job_id = %s
                     """,
-                    (version, now, job_id),
+                    (
+                        registered_model_id,
+                        version,
+                        Jsonb(config),
+                        Jsonb(result),
+                        now,
+                        job_id,
+                    ),
                 )
                 conn.execute(
-                    "UPDATE model_artifacts SET model_version = %s WHERE job_id = %s",
-                    (version, job_id),
+                    """
+                    UPDATE model_artifacts
+                    SET model_id = %s, model_version = %s
+                    WHERE job_id = %s
+                    """,
+                    (registered_model_id, version, job_id),
                 )
                 if not existing:
                     self._event(
                         conn, job_id, "job.registered", stage="registered",
                         message="用户已确认训练结果入库",
-                        payload={"model_id": model_id, "model_version": version},
+                        payload={
+                            "model_id": registered_model_id,
+                            "model_version": version,
+                            "training_identity": dict(
+                                result.get("training_identity") or {}
+                            ),
+                        },
                     )
         return self.get_job(job_id)
+
+    @staticmethod
+    def _prediction_alias_version(
+        *,
+        target_model_id: str,
+        job_id: str,
+        minimum_version: int,
+    ) -> int:
+        """Skip immutable orphan aliases, while reusing this job's own alias."""
+
+        import clickhouse_connect
+
+        from factor_service.research.config import load_settings
+
+        settings = load_settings()
+        database = _clickhouse_identifier(
+            settings.model_database, "model_database",
+        )
+        client = clickhouse_connect.get_client(
+            host=settings.clickhouse_host,
+            port=settings.clickhouse_port,
+            username=settings.clickhouse_user,
+            password=settings.clickhouse_password,
+            autogenerate_session_id=False,
+        )
+        rows = client.query(
+            f"""
+            SELECT model_version, groupUniqArray(inference_run_id)
+            FROM {database}.model_predictions_daily FINAL
+            WHERE model_id = {{target_model_id:String}}
+            GROUP BY model_version
+            ORDER BY model_version DESC
+            LIMIT 1
+            """,
+            parameters={"target_model_id": str(target_model_id)},
+        ).result_rows
+        minimum = max(1, int(minimum_version))
+        if not rows:
+            return minimum
+        latest = int(rows[0][0])
+        run_ids = {str(item) for item in (rows[0][1] or [])}
+        if latest < minimum:
+            return minimum
+        if run_ids == {str(job_id)}:
+            return latest
+        return latest + 1
+
+    @staticmethod
+    def _copy_training_prediction_identity(
+        *,
+        job_id: str,
+        source_model_id: str,
+        source_model_version: int,
+        target_model_id: str,
+        target_model_version: int,
+        expected_source_rows: int,
+    ) -> dict[str, Any]:
+        """Create an idempotent ClickHouse alias without deleting provenance rows."""
+
+        if (
+            source_model_id == target_model_id
+            and int(source_model_version) == int(target_model_version)
+        ):
+            return {"copied": False, "source_rows": 0, "target_rows": 0}
+        import clickhouse_connect
+
+        from factor_service.research.config import load_settings
+
+        settings = load_settings()
+        database = _clickhouse_identifier(
+            settings.model_database, "model_database",
+        )
+        table = f"{database}.model_predictions_daily"
+        client = clickhouse_connect.get_client(
+            host=settings.clickhouse_host,
+            port=settings.clickhouse_port,
+            username=settings.clickhouse_user,
+            password=settings.clickhouse_password,
+            autogenerate_session_id=False,
+        )
+        source_parameters = {
+            "source_model_id": str(source_model_id),
+            "source_model_version": int(source_model_version),
+            "job_id": str(job_id),
+        }
+        source_rows = int(client.query(
+            f"""
+            SELECT count()
+            FROM {table} FINAL
+            WHERE model_id = {{source_model_id:String}}
+              AND model_version = {{source_model_version:UInt32}}
+              AND inference_run_id = {{job_id:String}}
+            """,
+            parameters=source_parameters,
+        ).result_rows[0][0])
+        if int(expected_source_rows) > 0 and source_rows != int(expected_source_rows):
+            raise ModelResearchConflict(
+                "注册模型身份的源预测校验失败："
+                f"训练结果声明{int(expected_source_rows)}行，实际{source_rows}行"
+            )
+        if source_rows <= 0:
+            return {"copied": False, "source_rows": 0, "target_rows": 0}
+        parameters = {
+            **source_parameters,
+            "target_model_id": str(target_model_id),
+            "target_model_version": int(target_model_version),
+        }
+        existing_row = client.query(
+            f"""
+            SELECT count(), groupUniqArray(inference_run_id)
+            FROM {table} FINAL
+            WHERE model_id = {{target_model_id:String}}
+              AND model_version = {{target_model_version:UInt32}}
+            """,
+            parameters=parameters,
+        ).result_rows[0]
+        existing_rows = int(existing_row[0])
+        existing_run_ids = {str(item) for item in (existing_row[1] or [])}
+        if existing_run_ids - {str(job_id)}:
+            raise ModelResearchConflict(
+                "注册模型身份的目标预测版本已被其他训练任务占用"
+            )
+        if existing_rows == source_rows and existing_run_ids == {str(job_id)}:
+            return {
+                "copied": False,
+                "source_rows": source_rows,
+                "target_rows": existing_rows,
+            }
+        client.command(
+            f"""
+            INSERT INTO {table} (
+                trade_date, entity_type, entity_code, model_id,
+                model_version, raw_prediction, rank_value, percentile,
+                score, feature_cutoff_at, computed_at, source_vintage,
+                dataset_hash, inference_run_id, updated_at
+            )
+            SELECT
+                trade_date, entity_type, entity_code,
+                {{target_model_id:String}},
+                {{target_model_version:UInt32}},
+                raw_prediction, rank_value, percentile, score,
+                feature_cutoff_at, computed_at, source_vintage,
+                dataset_hash, inference_run_id, updated_at
+            FROM {table} FINAL
+            WHERE model_id = {{source_model_id:String}}
+              AND model_version = {{source_model_version:UInt32}}
+              AND inference_run_id = {{job_id:String}}
+            """,
+            parameters=parameters,
+        )
+        target_rows = int(client.query(
+            f"""
+            SELECT count()
+            FROM {table} FINAL
+            WHERE model_id = {{target_model_id:String}}
+              AND model_version = {{target_model_version:UInt32}}
+              AND inference_run_id = {{job_id:String}}
+            """,
+            parameters=parameters,
+        ).result_rows[0][0])
+        if target_rows != source_rows:
+            raise ModelResearchConflict(
+                "注册模型身份的预测别名校验失败："
+                f"源{source_rows}行，目标{target_rows}行"
+            )
+        return {
+            "copied": True,
+            "source_rows": source_rows,
+            "target_rows": target_rows,
+        }
 
     def decline_training_result(self, job_id: str) -> dict[str, Any]:
         """Persist the user's decision to keep a completed result out of the registry."""
@@ -1866,6 +2575,16 @@ class ModelResearchRepository:
                         "prediction_rows": int(predictions.get("row_count") or 0),
                     },
                 )
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=int(row.get("attempt_count") or 0),
+                    status="succeeded",
+                    finished_at=now,
+                    error={},
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("推理Attempt审计记录不存在或已终止")
         return self.get_job(job_id)
 
     def fail_job(
@@ -1885,21 +2604,47 @@ class ModelResearchRepository:
                 canceled = bool(row["cancel_requested"])
                 can_retry = bool(retryable) and not canceled and int(row["attempt_count"]) < int(row["max_attempts"])
                 status = "queued" if can_retry else ("canceled" if canceled else "failed")
+                result = dict(row.get("result_json") or {})
+                result["failure"] = {
+                    "retryable": bool(retryable) and not canceled,
+                    "message": str(error_message)[:1000],
+                    "attempt_count": int(row.get("attempt_count") or 0),
+                    "recorded_at": now.isoformat(),
+                }
                 conn.execute(
                     """
                     UPDATE model_jobs
                     SET status = %s, error_message = %s, lease_owner = '',
                         lease_token = '', lease_expires_at = NULL,
+                        result_json = %s,
                         finished_at = CASE WHEN %s IN ('failed', 'canceled') THEN %s ELSE NULL END,
                         updated_at = %s
                     WHERE job_id = %s
                     """,
-                    (status, str(error_message)[:4000], status, now, now, job_id),
+                    (
+                        status, str(error_message)[:4000], Jsonb(result),
+                        status, now, now, job_id,
+                    ),
                 )
                 self._event(
                     conn, job_id, "job.retry_queued" if can_retry else f"job.{status}",
                     stage=status, message=str(error_message)[:1000],
+                    payload={"retryable": bool(retryable) and not canceled},
                 )
+                attempt_status = "canceled" if canceled else "failed"
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=int(row.get("attempt_count") or 0),
+                    status=attempt_status,
+                    finished_at=now,
+                    error={
+                        "message": str(error_message)[:4000],
+                        "retryable": bool(retryable) and not canceled,
+                    },
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("训练Attempt审计记录不存在或已终止")
         return self.get_job(job_id)
 
     def list_models(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -2654,25 +3399,43 @@ class ModelResearchRepository:
         job = self.get_job(job_id)
         artifact_id = f"artifact_{sha256(f'{job_id}:{artifact_kind}:{file_name}'.encode()).hexdigest()[:24]}"
         with self.database.connection() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO model_artifacts(
-                    artifact_id, job_id, model_id, model_version, artifact_kind,
-                    file_name, relative_path, sha256, size_bytes, dataset_hash
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT(job_id, artifact_kind, file_name) DO UPDATE SET
-                    relative_path = EXCLUDED.relative_path,
-                    sha256 = EXCLUDED.sha256,
-                    size_bytes = EXCLUDED.size_bytes,
-                    dataset_hash = EXCLUDED.dataset_hash
-                RETURNING *
-                """,
-                (
-                    artifact_id, job_id, job["model_id"], job.get("model_version"),
-                    artifact_kind, file_name, relative_path, digest, int(size_bytes),
-                    dataset_hash,
-                ),
-            ).fetchone()
+            with conn.transaction():
+                row = conn.execute(
+                    """
+                    INSERT INTO model_artifacts(
+                        artifact_id, job_id, model_id, model_version, artifact_kind,
+                        file_name, relative_path, sha256, size_bytes, dataset_hash
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(job_id, artifact_kind, file_name) DO UPDATE SET
+                        relative_path = EXCLUDED.relative_path,
+                        sha256 = EXCLUDED.sha256,
+                        size_bytes = EXCLUDED.size_bytes,
+                        dataset_hash = EXCLUDED.dataset_hash
+                    RETURNING *
+                    """,
+                    (
+                        artifact_id, job_id, job["model_id"], job.get("model_version"),
+                        artifact_kind, file_name, relative_path, digest, int(size_bytes),
+                        dataset_hash,
+                    ),
+                ).fetchone()
+                identity = {
+                    "artifact_id": str(row.get("artifact_id") or artifact_id),
+                    "artifact_kind": str(row.get("artifact_kind") or artifact_kind),
+                    "file_name": str(row.get("file_name") or file_name),
+                    "relative_path": str(row.get("relative_path") or relative_path),
+                    "sha256": str(row.get("sha256") or digest),
+                    "size_bytes": int(row.get("size_bytes") or size_bytes),
+                    "dataset_hash": str(row.get("dataset_hash") or dataset_hash),
+                }
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=int(job.get("attempt_count") or 0),
+                    artifact=identity,
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("模型产物缺少活动Attempt审计记录")
         return dict(row)
 
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
@@ -2716,33 +3479,77 @@ class ModelResearchRepository:
         ).fetchall()
         for row in rows:
             exhausted = int(row["attempt_count"]) >= int(row["max_attempts"])
-            status = "failed" if exhausted else "queued"
+            canceled = bool(row.get("cancel_requested"))
+            status = "canceled" if canceled else ("failed" if exhausted else "queued")
+            result = dict(row.get("result_json") or {})
+            result["failure"] = {
+                "retryable": not canceled,
+                "code": "lease_expired",
+                "message": "调度服务租约过期",
+                "attempt_count": int(row.get("attempt_count") or 0),
+                "recorded_at": now.isoformat(),
+            }
             conn.execute(
                 """
                 UPDATE model_jobs
                 SET status = %s, lease_owner = '', lease_token = '',
                     lease_expires_at = NULL,
                     error_message = '调度服务租约过期',
-                    finished_at = CASE WHEN %s = 'failed' THEN %s ELSE NULL END,
+                    result_json = %s,
+                    finished_at = CASE WHEN %s IN ('failed', 'canceled') THEN %s ELSE NULL END,
                     updated_at = %s
                 WHERE job_id = %s
                 """,
-                (status, status, now, now, row["job_id"]),
+                (status, Jsonb(result), status, now, now, row["job_id"]),
             )
-            self._event(conn, str(row["job_id"]), f"job.{status}", stage=status, message="调度服务租约过期")
+            self._event(
+                conn, str(row["job_id"]), f"job.{status}", stage=status,
+                message="调度服务租约过期", payload={"retryable": not canceled},
+            )
+            if not _update_attempt_audit_row(
+                conn,
+                job_id=str(row["job_id"]),
+                ordinal=int(row.get("attempt_count") or 0),
+                status="canceled" if canceled else "failed",
+                finished_at=now,
+                error={
+                    "code": "lease_expired",
+                    "message": "调度服务租约过期",
+                    "retryable": not canceled,
+                },
+                require_active=True,
+            ):
+                raise ModelResearchConflict("过期租约缺少Attempt审计记录")
 
     @staticmethod
     def _event(
         conn: Any, job_id: str, event_type: str, *, stage: str = "",
         message: str = "", payload: Mapping[str, Any] | None = None,
-    ) -> None:
-        conn.execute(
+    ) -> int:
+        _require_attempt_audit_schema(conn)
+        event = conn.execute(
             """
             INSERT INTO model_job_events(job_id, event_type, stage, message, payload_json)
             VALUES (%s, %s, %s, %s, %s)
+            RETURNING event_id
             """,
             (job_id, event_type, stage, message, Jsonb(dict(payload or {}))),
-        )
+        ).fetchone()
+        event_id = int((event or {}).get("event_id") or 0)
+        current = conn.execute(
+            "SELECT attempt_count FROM model_jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        ordinal = int((current or {}).get("attempt_count") or 0)
+        if event_id > 0 and ordinal > 0:
+            _update_attempt_audit_row(
+                conn,
+                job_id=job_id,
+                ordinal=ordinal,
+                event_cursor=event_id,
+                require_active=True,
+            )
+        return event_id
 
 
 def _horizon_search_values(search_source: Mapping[str, Any]) -> list[int]:
@@ -4094,6 +4901,7 @@ def _incremental_training_assessment(
         source_model.get("dataset_spec") or {},
     )
     source_config = dict(source_model.get("job_config_json") or {})
+    source_manifest = dict(source_model.get("manifest_json") or {})
     source_model_spec = _model_spec(source_config.get("model") or {})
     source_walk_forward = _walk_forward_spec(
         source_config.get("walk_forward") or {}
@@ -4204,12 +5012,29 @@ def _incremental_training_assessment(
     ]
     failed = [item["key"] for item in checks if item["passed"] is not True]
     passed = not failed
+    bundle_identity = dict(
+        source_manifest.get("bundle_identity")
+        or source_manifest.get("training_identity")
+        or {
+            "model_id": str(source_model.get("model_id") or ""),
+            "model_version": int(source_model.get("version") or 0),
+            "job_id": str(source_model.get("job_id") or ""),
+        }
+    )
     contract = {
         "schema_version": "alphablocks.incremental-training.v1",
         "mode": "lightgbm_append_trees_new_data_only",
         "source_model_id": str(source_model.get("model_id") or ""),
         "source_model_version": int(source_model.get("version") or 0),
         "source_job_id": str(source_model.get("job_id") or ""),
+        "source_bundle_identity": {
+            "model_id": str(bundle_identity.get("model_id") or ""),
+            "model_version": int(bundle_identity.get("model_version") or 0),
+            "job_id": str(
+                bundle_identity.get("job_id")
+                or source_model.get("job_id") or ""
+            ),
+        },
         "source_dataset_hash": str(source_model.get("dataset_hash") or ""),
         "source_date_end": source_end,
         "candidate_date_end": candidate_end,
@@ -4290,6 +5115,9 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         raise ModelResearchError(
             "训练目标只支持stock_selection或industry_rotation"
         )
+    target_ref = _target_capability_ref(
+        source.get("target_ref"), research_target=research_target,
+    )
     if (
         research_target == "industry_rotation"
         and date_start < SW2021_INDUSTRY_SAFE_START
@@ -4356,31 +5184,49 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             "industry_snapshot_date_eq_signal_date": True,
             "industry_classification_safe_start": SW2021_INDUSTRY_SAFE_START,
         })
-    raw_split = source.get("split") or {}
-    try:
-        valid_raw = raw_split.get("valid")
-        test_raw = raw_split.get("test")
-        valid_ratio = 0.2 if valid_raw is None else float(valid_raw)
-        test_ratio = 0.2 if test_raw is None else float(test_raw)
-    except (TypeError, ValueError) as exc:
-        raise ModelResearchError("验证集/测试集比例必须是数字") from exc
-    train_ratio = round(1.0 - valid_ratio - test_ratio, 6)
-    ratios = (train_ratio, valid_ratio, test_ratio)
-    if not all(math.isfinite(ratio) for ratio in ratios):
-        raise ModelResearchError("验证集/测试集比例必须是有效数字")
-    if valid_ratio < 0.05 or test_ratio < 0.05 or train_ratio < 0.3:
-        raise ModelResearchError(
-            "切分比例无效：验证集/测试集不低于5%，训练集不低于30%"
-        )
-    if abs(train_ratio + valid_ratio + test_ratio - 1.0) > 1e-6:
-        raise ModelResearchError("训练/验证/测试比例之和必须为100%")
+    split = _dataset_split_spec(
+        source.get("split") or {},
+        date_start=date_start,
+        date_end=date_end,
+        minimum_embargo_days=horizon,
+    )
     universe_id = str(source.get("universe_id") or "csi500").strip()
-    if universe_id not in UNIVERSES:
-        raise ModelResearchError(
-            f"不支持的股票池: {universe_id}，可选{', '.join(sorted(UNIVERSES))}"
+    try:
+        universe_source = normalize_universe_source(
+            source.get("universe_source"), allow_empty=True,
         )
-    index_code = UNIVERSES[universe_id]["index_code"]
-    benchmark_code = UNIVERSES[universe_id]["benchmark"]
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
+    source_kind = str(universe_source.get("source_kind") or "")
+    if source_kind == "configured_stock_pool":
+        if universe_id != universe_source["source_id"]:
+            raise ModelResearchError(
+                "universe_id必须等于冻结配置股票池source_id"
+            )
+        index_code = str(
+            dict(universe_source.get("selector") or {}).get("value") or ""
+        ).strip()
+        benchmark_code = str(
+            universe_source.get("benchmark_code") or ""
+        ).strip()
+        if not index_code or not benchmark_code:
+            raise ModelResearchError("配置股票池缺少选择值或基准代码")
+    elif universe_source:
+        if universe_id != universe_source["source_id"]:
+            raise ModelResearchError(
+                "universe_id必须等于冻结自定义成员资产source_id"
+            )
+        # The benchmark is reporting-only. Membership itself is always read
+        # from the frozen asset binding and never derived from this index.
+        index_code = UNIVERSES["csi500"]["index_code"]
+        benchmark_code = UNIVERSES["csi500"]["benchmark"]
+    else:
+        if universe_id not in UNIVERSES:
+            raise ModelResearchError(
+                f"不支持的股票池: {universe_id}，可选{', '.join(sorted(UNIVERSES))}"
+            )
+        index_code = UNIVERSES[universe_id]["index_code"]
+        benchmark_code = UNIVERSES[universe_id]["benchmark"]
     raw_sample_filters = source.get("sample_filters")
     legacy_without_sample_filters = (
         raw_sample_filters is None
@@ -4394,6 +5240,27 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         raw_sample_filters = {}
     if not isinstance(raw_sample_filters, Mapping):
         raise ModelResearchError("sample_filters必须是对象")
+    has_legacy_boolean_filters = any(
+        field in raw_sample_filters
+        for field in ("exclude_st", "exclude_delisting")
+    )
+    uses_entity_field_filters = (
+        bool(source.get("universe_field_filters"))
+        or (
+            "universe_field_filters" in source
+            and not has_legacy_boolean_filters
+        )
+    )
+    if uses_entity_field_filters:
+        unknown_sample_filters = sorted(
+            set(raw_sample_filters)
+            - {"minimum_listing_trading_days", "custom_formulas"}
+        )
+        if unknown_sample_filters:
+            raise ModelResearchError(
+                "实体资产股票池过滤不能再使用固定sample_filters字段: "
+                + ", ".join(unknown_sample_filters)
+            )
     try:
         minimum_listing_trading_days = int(
             raw_sample_filters.get(
@@ -4421,14 +5288,22 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
 
     sample_filters = {
         "minimum_listing_trading_days": minimum_listing_trading_days,
-        "exclude_st": sample_filter_switch(
-            "exclude_st", not legacy_without_sample_filters,
-        ),
-        "exclude_delisting": sample_filter_switch(
-            "exclude_delisting", not legacy_without_sample_filters,
-        ),
+        **({} if uses_entity_field_filters else {
+            "exclude_st": sample_filter_switch(
+                "exclude_st", not legacy_without_sample_filters,
+            ),
+            "exclude_delisting": sample_filter_switch(
+                "exclude_delisting", not legacy_without_sample_filters,
+            ),
+        }),
         "custom_formulas": custom_formulas,
     }
+    try:
+        universe_field_filters = normalize_universe_field_filters(
+            source.get("universe_field_filters")
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
     raw_preprocessing = source.get("preprocessing")
     legacy_without_preprocessing = (
         raw_preprocessing is None
@@ -4471,6 +5346,12 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise ModelResearchError(str(exc)) from exc
+    transform_refs = _capability_refs(
+        source.get("transform_refs"), field="transform_refs",
+    )
+    universe_rule_refs = _capability_refs(
+        source.get("universe_rule_refs"), field="universe_rule_refs",
+    )
     return {
         # Part of the immutable dataset identity. Bump this whenever label or
         # feature materialization semantics change so an older canonical
@@ -4478,16 +5359,21 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "pipeline_version": DATASET_PIPELINE_VERSION,
         "name": str(source.get("name") or f"{universe_id}因子数据集")[:160],
         "universe_id": universe_id,
+        **({"universe_source": universe_source} if universe_source else {}),
         "index_code": index_code,
         "benchmark_code": benchmark_code,
         "sample_filters": sample_filters,
+        "universe_field_filters": universe_field_filters,
         "preprocessing": preprocessing,
         "industry_feature": industry_feature,
+        "transform_refs": transform_refs,
+        "universe_rule_refs": universe_rule_refs,
         "data_bindings": data_bindings,
         "date_start": date_start,
         "date_end": date_end,
         "data_cutoff": data_cutoff,
         "research_target": research_target,
+        "target_ref": target_ref,
         "target_mode": target_mode,
         "prediction_scope": (
             "industry" if research_target == "industry_rotation"
@@ -4496,12 +5382,7 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "factors": normalized_factors,
         "feature_field": "score",
         "label": label,
-        "split": {
-            "train": train_ratio,
-            "valid": valid_ratio,
-            "test": test_ratio,
-            "embargo_days": horizon,
-        },
+        "split": split,
         "minimum_factor_coverage": 0.8,
         "materialization": {
             "mode": "on_demand",
@@ -4512,10 +5393,282 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _target_capability_ref(
+    source: Any,
+    *,
+    research_target: str,
+) -> dict[str, Any]:
+    raw = {"id": research_target, "version": 1} if source is None else source
+    if not isinstance(raw, Mapping):
+        raise ModelResearchError("target_ref必须是对象")
+    target_id = str(raw.get("id") or "").strip()
+    if target_id != research_target:
+        raise ModelResearchError("target_ref.id必须等于research_target")
+    try:
+        version = int(raw.get("version"))
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("target_ref.version必须是正整数") from exc
+    if version <= 0:
+        raise ModelResearchError("target_ref.version必须是正整数")
+    return {"id": target_id, "version": version}
+
+
+def _capability_refs(source: Any, *, field: str) -> list[dict[str, Any]]:
+    if source is None:
+        return []
+    if not isinstance(source, list):
+        raise ModelResearchError(f"{field}必须是数组")
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for index, item in enumerate(source):
+        if not isinstance(item, Mapping):
+            raise ModelResearchError(f"{field}[{index}]必须是对象")
+        capability_id = str(item.get("id") or "").strip()
+        if not capability_id:
+            raise ModelResearchError(f"{field}[{index}].id不能为空")
+        try:
+            version = int(item.get("version"))
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError(
+                f"{field}[{index}].version必须是正整数"
+            ) from exc
+        if version <= 0:
+            raise ModelResearchError(f"{field}[{index}].version必须是正整数")
+        identity = (capability_id, version)
+        if identity in seen:
+            raise ModelResearchError(
+                f"{field}不能重复声明{capability_id}@{version}"
+            )
+        seen.add(identity)
+        normalized_item: dict[str, Any] = {
+            "id": capability_id,
+            "version": version,
+        }
+        for key in ("implementation_hash", "fit_scope"):
+            if item.get(key) not in (None, ""):
+                normalized_item[key] = str(item[key])
+        if "params" in item:
+            if not isinstance(item.get("params"), Mapping):
+                raise ModelResearchError(f"{field}[{index}].params必须是对象")
+            normalized_item["params"] = dict(item.get("params") or {})
+        normalized.append(normalized_item)
+    return normalized
+
+
+def _dataset_split_spec(
+    source: Mapping[str, Any],
+    *,
+    date_start: str,
+    date_end: str,
+    minimum_embargo_days: int,
+) -> dict[str, Any]:
+    if not isinstance(source, Mapping):
+        raise ModelResearchError("split必须是对象")
+    mode = str(source.get("mode") or source.get("kind") or "").strip().lower()
+    validation_value = source.get("validation", source.get("valid"))
+    date_shaped = any(
+        isinstance(value, (list, tuple, Mapping))
+        for value in (source.get("train"), validation_value, source.get("test"))
+        if value is not None
+    )
+    mode = mode or ("dates" if date_shaped else "ratio")
+    if mode not in {"ratio", "dates"}:
+        raise ModelResearchError("split.mode只支持ratio或dates")
+    try:
+        embargo_days = int(
+            source.get("embargo_days")
+            if source.get("embargo_days") is not None
+            else minimum_embargo_days
+        )
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("split.embargo_days必须是整数") from exc
+    if embargo_days < int(minimum_embargo_days):
+        raise ModelResearchError(
+            f"split.embargo_days不得小于标签周期{minimum_embargo_days}"
+        )
+    if embargo_days > 250:
+        raise ModelResearchError("split.embargo_days不得超过250个交易日")
+    if mode == "dates":
+        train = _date_segment(source.get("train"), "split.train")
+        valid = _date_segment(validation_value, "split.validation")
+        test = _date_segment(source.get("test"), "split.test")
+        ordered = (train, valid, test)
+        if not (train[1] < valid[0] and valid[1] < test[0]):
+            raise ModelResearchError("训练/验证/测试日期必须严格有序且不得重叠")
+        if train[0] < date_start or test[1] > date_end:
+            raise ModelResearchError("切分日期必须位于Dataset日期范围内")
+        if any(start > end for start, end in ordered):
+            raise ModelResearchError("切分开始日期不得晚于结束日期")
+        result = {
+            "mode": "dates",
+            "train": list(train),
+            "valid": list(valid),
+            "test": list(test),
+            "embargo_days": embargo_days,
+        }
+        return _with_frozen_split_resolution(
+            result, source.get("resolved"),
+            label_horizon_trading_days=minimum_embargo_days,
+        )
+
+    try:
+        valid_raw = validation_value
+        test_raw = source.get("test")
+        valid_ratio = 0.2 if valid_raw is None else float(valid_raw)
+        test_ratio = 0.2 if test_raw is None else float(test_raw)
+        train_raw = source.get("train")
+        train_ratio = (
+            round(1.0 - valid_ratio - test_ratio, 6)
+            if train_raw is None
+            else float(train_raw)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("训练/验证/测试比例必须是数字") from exc
+    ratios = (train_ratio, valid_ratio, test_ratio)
+    if not all(math.isfinite(ratio) for ratio in ratios):
+        raise ModelResearchError("训练/验证/测试比例必须是有效数字")
+    if valid_ratio < 0.05 or test_ratio < 0.05 or train_ratio < 0.3:
+        raise ModelResearchError(
+            "切分比例无效：验证集/测试集不低于5%，训练集不低于30%"
+        )
+    if abs(train_ratio + valid_ratio + test_ratio - 1.0) > 1e-6:
+        raise ModelResearchError("训练/验证/测试比例之和必须为100%")
+    result = {
+        "mode": "ratio",
+        "train": train_ratio,
+        "valid": valid_ratio,
+        "test": test_ratio,
+        "embargo_days": embargo_days,
+    }
+    return _with_frozen_split_resolution(
+        result, source.get("resolved"),
+        label_horizon_trading_days=minimum_embargo_days,
+    )
+
+
+def _with_frozen_split_resolution(
+    split: dict[str, Any],
+    source: Any,
+    *,
+    label_horizon_trading_days: int,
+) -> dict[str, Any]:
+    if source is None:
+        return split
+    if not isinstance(source, Mapping):
+        raise ModelResearchError("split.resolved必须是对象")
+    if str(source.get("schema_version") or "") != (
+        DATASET_SPLIT_RESOLUTION_SCHEMA_VERSION
+    ):
+        raise ModelResearchError("split.resolved.schema_version不受支持")
+    raw_segments = source.get("segments")
+    if not isinstance(raw_segments, Mapping):
+        raise ModelResearchError("split.resolved.segments必须是对象")
+    segments = {
+        name: list(_date_segment(raw_segments.get(name), f"split.resolved.{name}"))
+        for name in ("train", "valid", "test")
+    }
+    if split["mode"] == "dates" and any(
+        segments[name] != split[name] for name in segments
+    ):
+        raise ModelResearchError("显式切分与split.resolved边界不一致")
+    raw_calendar = source.get("calendar")
+    if not isinstance(raw_calendar, Mapping):
+        raise ModelResearchError("split.resolved.calendar必须是对象")
+
+    def positive_integer(name: str) -> int:
+        try:
+            value = int(raw_calendar.get(name))
+        except (TypeError, ValueError) as exc:
+            raise ModelResearchError(
+                f"split.resolved.calendar.{name}必须是正整数"
+            ) from exc
+        if value <= 0:
+            raise ModelResearchError(
+                f"split.resolved.calendar.{name}必须是正整数"
+            )
+        return value
+
+    def fingerprint(name: str) -> str:
+        value = str(raw_calendar.get(name) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ModelResearchError(
+                f"split.resolved.calendar.{name}必须是SHA-256"
+            )
+        return value
+
+    calendar = {
+        "fingerprint": fingerprint("fingerprint"),
+        "session_count": positive_integer("session_count"),
+        "date_start": _iso_date(
+            raw_calendar.get("date_start"),
+            "split.resolved.calendar.date_start",
+        ),
+        "date_end": _iso_date(
+            raw_calendar.get("date_end"),
+            "split.resolved.calendar.date_end",
+        ),
+        "trainable_fingerprint": fingerprint("trainable_fingerprint"),
+        "trainable_session_count": positive_integer(
+            "trainable_session_count"
+        ),
+        "trainable_date_start": _iso_date(
+            raw_calendar.get("trainable_date_start"),
+            "split.resolved.calendar.trainable_date_start",
+        ),
+        "trainable_date_end": _iso_date(
+            raw_calendar.get("trainable_date_end"),
+            "split.resolved.calendar.trainable_date_end",
+        ),
+        "label_horizon_trading_days": positive_integer(
+            "label_horizon_trading_days"
+        ),
+        "embargo_days": positive_integer("embargo_days"),
+    }
+    if calendar["label_horizon_trading_days"] != int(
+        label_horizon_trading_days
+    ):
+        raise ModelResearchError("冻结切分的标签周期与Dataset不一致")
+    if calendar["embargo_days"] != int(split["embargo_days"]):
+        raise ModelResearchError("冻结切分的embargo与Dataset不一致")
+    if calendar["session_count"] - calendar["trainable_session_count"] != int(
+        label_horizon_trading_days
+    ):
+        raise ModelResearchError("冻结交易日历的可训练日期数量不一致")
+    return {
+        **split,
+        "resolved": {
+            "schema_version": DATASET_SPLIT_RESOLUTION_SCHEMA_VERSION,
+            "segments": segments,
+            "calendar": calendar,
+        },
+    }
+
+
+def _date_segment(value: Any, field: str) -> tuple[str, str]:
+    if isinstance(value, Mapping):
+        start_value = value.get("start") or value.get("date_start")
+        end_value = value.get("end") or value.get("date_end")
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        start_value, end_value = value
+    else:
+        raise ModelResearchError(f"{field}必须是[start, end]")
+    start = _iso_date(start_value, f"{field}.start")
+    end = _iso_date(end_value, f"{field}.end")
+    if start > end:
+        raise ModelResearchError(f"{field}开始日期不得晚于结束日期")
+    return start, end
+
+
 def _model_spec(
     source: Mapping[str, Any], *, target_mode: str | None = None,
 ) -> dict[str, Any]:
     kind = str(source.get("kind") or "lightgbm").strip().lower()
+    try:
+        version = int(source.get("version") or 1)
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("model.version必须是正整数") from exc
+    if version != 1:
+        raise ModelResearchError("当前模型执行合同只支持model.version=1")
     if kind == "stacking":
         base_sources = source.get("base_models")
         if (
@@ -4565,6 +5718,7 @@ def _model_spec(
             raise ModelResearchError("Metric必须与Objective一致")
         return {
             "kind": "stacking",
+            "version": version,
             "qlib_model": "factor_service.research.trainer.QlibStackingModel",
             "params": {
                 "n_folds": n_folds,
@@ -4871,7 +6025,12 @@ def _model_spec(
             raise ModelResearchError("d_model必须能被nhead整除")
         defaults["d_model"] = d_model
         defaults["nhead"] = nhead
-    return {"kind": kind, "qlib_model": definition["qlib_model"], "params": defaults}
+    return {
+        "kind": kind,
+        "version": version,
+        "qlib_model": definition["qlib_model"],
+        "params": defaults,
+    }
 
 
 def _execution_spec(source: Mapping[str, Any]) -> dict[str, Any]:
@@ -4978,6 +6137,130 @@ def _model_payload_references(
     return False
 
 
+def _job_execution_node(row: Mapping[str, Any]) -> str:
+    config = dict(row.get("config_json") or {})
+    execution = dict(config.get("execution") or {})
+    return str(execution.get("node_id") or "local")
+
+
+def _attempt_identity(job_id: str, ordinal: int) -> str:
+    digest = sha256(f"{job_id}:attempt:{int(ordinal)}".encode("utf-8")).hexdigest()
+    return f"model_attempt_{digest[:32]}"
+
+
+def _insert_attempt_audit_row(
+    conn: Any,
+    *,
+    row: Mapping[str, Any],
+    job_id: str,
+    ordinal: int,
+    started_at: datetime,
+) -> None:
+    _require_attempt_audit_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO model_job_attempts(
+            attempt_id, job_id, ordinal, status, execution_node_id,
+            started_at, created_at, updated_at
+        ) VALUES (%s, %s, %s, 'leased', %s, %s, %s, %s)
+        """,
+        (
+            _attempt_identity(job_id, ordinal), job_id, int(ordinal),
+            _job_execution_node(row), started_at, started_at, started_at,
+        ),
+    )
+
+
+def _update_attempt_audit_row(
+    conn: Any,
+    *,
+    job_id: str,
+    ordinal: int,
+    status: str | None = None,
+    finished_at: datetime | None = None,
+    error: Mapping[str, Any] | None = None,
+    event_cursor: int | None = None,
+    artifact: Mapping[str, Any] | None = None,
+    require_active: bool = False,
+) -> bool:
+    _require_attempt_audit_schema(conn)
+    assignments = ["updated_at = %s"]
+    values: list[Any] = [_utcnow()]
+    if status is not None:
+        assignments.append("status = %s")
+        values.append(str(status))
+    if finished_at is not None:
+        assignments.append("finished_at = %s")
+        values.append(finished_at)
+    if error is not None:
+        assignments.append("error_json = %s")
+        values.append(Jsonb(dict(error)))
+    if event_cursor is not None:
+        assignments.extend([
+            "log_start_event_id = COALESCE(log_start_event_id, %s)",
+            "log_end_event_id = %s",
+        ])
+        values.extend([int(event_cursor), int(event_cursor)])
+    if artifact is not None:
+        artifact_id = str(artifact.get("artifact_id") or "")
+        if not artifact_id:
+            raise ModelResearchError("Attempt产物身份缺少artifact_id")
+        assignments.append("artifact_refs_json = artifact_refs_json || %s")
+        values.append(Jsonb({artifact_id: dict(artifact)}))
+    values.extend([job_id, int(ordinal)])
+    active = " AND status IN ('leased', 'running', 'uploading')" if require_active else ""
+    updated = conn.execute(
+        f"""
+        UPDATE model_job_attempts
+        SET {', '.join(assignments)}
+        WHERE job_id = %s AND ordinal = %s{active}
+        RETURNING attempt_id
+        """,
+        tuple(values),
+    ).fetchone()
+    return bool(updated)
+
+
+def _attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    error = dict(item.get("error_json") or item.get("error") or {})
+    artifacts_source = item.get("artifact_refs_json") or item.get("artifacts") or {}
+    if isinstance(artifacts_source, Mapping):
+        artifacts = [
+            dict(value) for _, value in sorted(artifacts_source.items())
+            if isinstance(value, Mapping)
+        ]
+    else:
+        artifacts = [
+            dict(value) for value in artifacts_source or []
+            if isinstance(value, Mapping)
+        ]
+    logs = []
+    start_cursor = item.get("log_start_event_id")
+    end_cursor = item.get("log_end_event_id")
+    if start_cursor is not None or end_cursor is not None:
+        logs.append({
+            "kind": "event_stream",
+            "job_id": str(item.get("job_id") or ""),
+            "attempt_ordinal": int(item.get("ordinal") or 0),
+            "start_cursor": int(start_cursor or end_cursor or 0),
+            "end_cursor": int(end_cursor or start_cursor or 0),
+        })
+    return {
+        "schema_version": "alphablocks.model-job-attempt.v1",
+        "attempt_id": str(item.get("attempt_id") or ""),
+        "ordinal": int(item.get("ordinal") or 0),
+        "status": str(item.get("status") or ""),
+        "execution_node_id": str(item.get("execution_node_id") or ""),
+        "started_at": item.get("started_at"),
+        "finished_at": item.get("finished_at"),
+        "retryable": bool(error.get("retryable", False)),
+        "error": error,
+        "logs": logs,
+        "artifacts": artifacts,
+    }
+
+
 def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(row)
     result.pop("lease_token", None)
@@ -4987,6 +6270,18 @@ def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in tuple(result.items()):
         if isinstance(value, datetime):
             result[key] = value.isoformat()
+    stored_result = dict(result.get("result_json") or {})
+    attempts = result.pop("attempts_json", []) or []
+    result["attempts"] = [
+        _attempt_row(item) for item in attempts if isinstance(item, Mapping)
+    ]
+    failure = stored_result.get("failure") or {}
+    result["retryable"] = (
+        str(result.get("kind") or "train") == "train"
+        and str(result.get("status") or "") == "failed"
+        and isinstance(failure, Mapping)
+        and failure.get("retryable") is True
+    )
     if (
         str(result.get("kind") or "train") == "train"
         and str(result.get("status") or "") == "succeeded"
@@ -5039,6 +6334,133 @@ def _iso_datetime(value: Any, field: str) -> str:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _bounded_identity(value: Any, field: str) -> str:
+    clean = str(value or "").strip()
+    if len(clean) > 200:
+        raise ModelResearchError(f"{field}最长200字符")
+    return clean
+
+
+def _training_submission_identity(
+    payload: Mapping[str, Any],
+    *,
+    resource_kind: str,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    idempotency_key = _bounded_identity(
+        payload.get("idempotency_key"), "idempotency_key",
+    )
+    client_study_id = _bounded_identity(
+        payload.get("client_study_id"), "client_study_id",
+    )
+    if not idempotency_key and not client_study_id:
+        return {}
+    canonical_request = {
+        **dict(request),
+        "resource_kind": str(resource_kind),
+        "client_study_id": client_study_id,
+    }
+    return {
+        "schema_version": "alphablocks.training-submission.v1",
+        "scope": "training",
+        "resource_kind": str(resource_kind),
+        "idempotency_key": idempotency_key,
+        "client_study_id": client_study_id,
+        "request_hash": sha256(
+            _canonical_json(canonical_request).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _clickhouse_identifier(value: Any, field: str) -> str:
+    clean = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", clean):
+        raise ModelResearchError(f"{field}不是安全的ClickHouse标识符")
+    return clean
+
+
+def _registration_payloads(
+    *,
+    job_id: str,
+    config: Mapping[str, Any],
+    result: Mapping[str, Any],
+    training_model_id: str,
+    training_model_version: int,
+    registered_model_id: str,
+    registered_model_version: int,
+    prediction_alias: Mapping[str, Any],
+    registered_at: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Record the immutable training identity and its registered alias.
+
+    The artifact bundle and original prediction rows remain identified by the
+    training identity.  PostgreSQL registry rows and copied prediction rows use
+    the registration identity.  Keeping both identities in every persisted
+    payload makes retries and later bundle loading unambiguous.
+    """
+
+    training_identity = {
+        "model_id": str(training_model_id),
+        "model_version": int(training_model_version),
+        "job_id": str(job_id),
+    }
+    registration_identity = {
+        "model_id": str(registered_model_id),
+        "model_version": int(registered_model_version),
+        "job_id": str(job_id),
+    }
+    alias = {
+        **dict(prediction_alias),
+        "source_identity": dict(training_identity),
+        "target_identity": dict(registration_identity),
+        "source_retained": True,
+    }
+
+    registered_config = dict(config)
+    registered_config.update({
+        "planned_model_version": int(registered_model_version),
+        "training_identity": dict(training_identity),
+        "registration_identity": dict(registration_identity),
+        "bundle_identity": dict(training_identity),
+        "prediction_identity": dict(registration_identity),
+        "prediction_identity_alias": dict(alias),
+    })
+
+    registered_result = dict(result)
+    predictions = dict(registered_result.get("predictions") or {})
+    predictions.update({
+        "model_id": str(registered_model_id),
+        "model_version": int(registered_model_version),
+        "training_identity": dict(training_identity),
+        "identity_alias": dict(alias),
+    })
+    manifest = dict(registered_result.get("manifest") or {})
+    manifest.update({
+        "model_id": str(registered_model_id),
+        "model_version": int(registered_model_version),
+        "training_identity": dict(training_identity),
+        "registration_identity": dict(registration_identity),
+        "bundle_identity": dict(training_identity),
+        "prediction_identity": dict(registration_identity),
+        "prediction_identity_alias": dict(alias),
+    })
+    registered_result.update({
+        "predictions": predictions,
+        "manifest": manifest,
+        "training_identity": dict(training_identity),
+        "registration_identity": dict(registration_identity),
+        "bundle_identity": dict(training_identity),
+        "prediction_identity": dict(registration_identity),
+        "prediction_identity_alias": dict(alias),
+        "registration": {
+            "status": "registered",
+            "registered_at": str(registered_at),
+            **dict(registration_identity),
+        },
+    })
+    return registered_config, registered_result
 
 
 def _utcnow() -> datetime:

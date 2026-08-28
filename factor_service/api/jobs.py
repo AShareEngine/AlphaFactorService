@@ -51,3 +51,4 @@ def run_one_job(job_id: str) -> FactorJobOut:
         return run_job(job_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+

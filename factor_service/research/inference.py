@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import pickle
@@ -27,6 +27,9 @@ from factor_service.research.preprocessing import (
 )
 from factor_service.research.training_resource_settings import (
     normalize_frozen_training_data_bindings,
+)
+from factor_service.research.universe_source import (
+    normalize_universe_source,
 )
 from factor_service.research.trainer import (
     QlibStackingModel,
@@ -76,6 +79,19 @@ class DailyInferenceRunner:
             raise PermanentJobError(str(exc)) from exc
         model_kind = str(training_manifest.get("model_kind") or "lightgbm")
         dataset_spec = dict(job.get("dataset_spec") or config.get("dataset") or {})
+        try:
+            training_universe_source = normalize_universe_source(
+                training_manifest.get("universe_source"), allow_empty=True,
+            )
+            requested_universe_source = normalize_universe_source(
+                dataset_spec.get("universe_source"), allow_empty=True,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+        if requested_universe_source != training_universe_source:
+            raise PermanentJobError(
+                "每日推理股票池与训练模型的冻结成员来源不一致"
+            )
         requested_bindings = normalize_frozen_training_data_bindings(
             dataset_spec.get("data_bindings"), allow_empty=True,
         )
@@ -143,6 +159,8 @@ class DailyInferenceRunner:
         universe_id = str(dataset_spec.get("universe_id") or "csi500")
         index_code = str(dataset_spec.get("index_code") or "000905.SH")
         sample_filters = dataset_spec.get("sample_filters")
+        universe_field_filters = dataset_spec.get("universe_field_filters")
+        universe_source = training_universe_source
         universe_label = {
             "csi300": "沪深300", "csi500": "中证500", "csi800": "中证800",
             "csi1000": "中证1000", "all_a": "全A",
@@ -172,7 +190,10 @@ class DailyInferenceRunner:
         target_membership = self.dataset_builder._membership(
             trade_date, trade_date, universe_id=universe_id, index_code=index_code,
             sample_filters=sample_filters,
+            universe_field_filters=universe_field_filters,
             data_bindings=data_bindings,
+            universe_source=universe_source,
+            data_cutoff=data_cutoff.astimezone(timezone.utc).isoformat(),
         )
         if target_membership.empty:
             raise PermanentJobError(f"{trade_date}不是{universe_label}可推理交易日")
@@ -180,7 +201,10 @@ class DailyInferenceRunner:
             feature_date_start, trade_date,
             universe_id=universe_id, index_code=index_code,
             sample_filters=sample_filters,
+            universe_field_filters=universe_field_filters,
             data_bindings=data_bindings,
+            universe_source=universe_source,
+            data_cutoff=data_cutoff.astimezone(timezone.utc).isoformat(),
         )
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}

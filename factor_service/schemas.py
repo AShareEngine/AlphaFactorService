@@ -213,6 +213,26 @@ class FactorAnalysisJobCreate(BaseModel):
     max_loss: float = Field(default=0.9, ge=0, le=1)
 
 
+class FactorFormulaAnalysisRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    expression: str = Field(min_length=1, max_length=4000)
+    params: dict[str, Any] = Field(default_factory=dict)
+    preprocessing: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "winsorize": "quantile",
+            "standardize": "zscore",
+            "neutralize": [],
+        }
+    )
+    date_start: date
+    date_end: date
+    periods: list[int] = Field(default_factory=lambda: [1, 5, 10])
+    quantiles: int = Field(default=5, ge=2, le=20)
+    price_field: str = "close"
+    cumulative_returns: bool = True
+    max_loss: float = Field(default=0.9, ge=0, le=1)
+
+
 class FactorAnalysisJobOut(BaseModel):
     analysis_job_id: str
     factor_id: str

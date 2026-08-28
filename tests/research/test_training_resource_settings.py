@@ -9,6 +9,7 @@ from factor_service.research.training_resource_settings import (
     STOCK_STATUS_BINDING_ID,
     TRADING_CALENDAR_BINDING_ID,
     TRAINING_DATA_BINDING_SCHEMA_VERSION,
+    configured_stock_pool_sources,
     frozen_training_data_binding,
     frozen_training_data_bindings,
     normalize_frozen_training_data_binding,
@@ -56,6 +57,48 @@ def test_training_data_binding_defaults_are_canonical() -> None:
     assert binding["source_id"] == ""
     assert not training_data_binding_ready(binding)
     assert len(binding["fingerprint"]) == 64
+    assert settings["stock_pools"] == []
+
+
+def test_named_stock_pools_are_configured_from_index_membership_binding() -> None:
+    definition = BINDING_DEFINITIONS[INDEX_MEMBERSHIP_BINDING_ID]
+    settings = normalize_training_resource_settings({
+        "bindings": {
+            INDEX_MEMBERSHIP_BINDING_ID: {
+                "enabled": True,
+                "source_type": "node",
+                "source_id": "index_constituent_real",
+                "source_label": "指数成分关系",
+                "provider_node_id": "index_constituent_real",
+                "field_bindings": {
+                    role["id"]: role["hints"][0]
+                    for role in definition["roles"]
+                },
+                "catalog_updated_at": "",
+            },
+        },
+        "stock_pools": [{
+            "id": "csi500",
+            "label": "中证500",
+            "selector_value": "000905.SH",
+            "benchmark_code": "000905.SH",
+            "enabled": True,
+        }],
+    })
+    settings["revision"] = 9
+
+    sources = configured_stock_pool_sources(settings)
+
+    assert len(sources) == 1
+    assert sources[0]["source_id"] == "csi500"
+    assert sources[0]["version"] == 9
+    assert sources[0]["selector"] == {
+        "field_role": "index_code", "operator": "eq",
+        "value": "000905.SH",
+    }
+    assert sources[0]["binding_id"] == INDEX_MEMBERSHIP_BINDING_ID
+    assert sources[0]["available"] is True
+    assert len(sources[0]["config_fingerprint"]) == 64
 
 
 def test_retired_market_cap_binding_is_removed_from_legacy_settings() -> None:
