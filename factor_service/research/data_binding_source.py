@@ -224,6 +224,52 @@ def load_bound_stock_daily(
     ).sort_values(["trade_date", "instrument"], ignore_index=True)
 
 
+def load_bound_size_rotation_daily(
+    settings: Settings,
+    binding: Mapping[str, Any],
+    instruments: Sequence[str],
+    date_start: str,
+    date_end: str,
+    *,
+    data_cutoff: str = "",
+) -> pd.DataFrame:
+    fields = binding.get("field_bindings")
+    if not isinstance(fields, Mapping) or not str(
+        fields.get("float_market_cap") or ""
+    ).strip():
+        raise ValueError("大小盘轮动特征要求训练基础行情绑定float_market_cap")
+    frame = _query_daily_chunks(
+        settings=settings,
+        binding=binding,
+        roles=(
+            "trade_date", "instrument", "adjusted_close",
+            "float_market_cap",
+        ),
+        instruments=instruments,
+        date_start=date_start,
+        date_end=date_end,
+        data_cutoff=data_cutoff,
+    )
+    provenance = dict(frame.attrs.get("training_data_binding") or {})
+    if frame.empty:
+        return frame
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame["instrument"] = frame["instrument"].astype(str)
+    for column in ("adjusted_close", "float_market_cap"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=[
+        "trade_date", "instrument", "adjusted_close", "float_market_cap",
+    ])
+    frame = frame.loc[
+        (frame["adjusted_close"] > 0) & (frame["float_market_cap"] > 0)
+    ]
+    frame = frame.drop_duplicates(
+        ["trade_date", "instrument"], keep="last",
+    ).sort_values(["trade_date", "instrument"], ignore_index=True)
+    frame.attrs["training_data_binding"] = provenance
+    return frame
+
+
 def load_bound_stock_status(
     settings: Settings,
     binding: Mapping[str, Any],
@@ -828,6 +874,7 @@ __all__ = [
     "load_bound_registered_membership",
     "load_bound_industry_membership",
     "load_bound_security_master",
+    "load_bound_size_rotation_daily",
     "load_bound_stock_daily",
     "load_bound_stock_status",
     "load_bound_universe_filter_membership",

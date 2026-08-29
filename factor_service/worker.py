@@ -58,6 +58,8 @@ class PostprocessConfig:
     winsorize: str
     standardize: str
     neutralize: tuple[str, ...]
+    quantiles: int
+    direction: str
 
 
 def run_pending_jobs(limit: int = 5) -> list[FactorJobOut]:
@@ -380,13 +382,24 @@ def _postprocess_config(factor: FactorOut) -> PostprocessConfig:
     is_boolean = factor.output_type == "boolean"
     winsorize = "none" if is_boolean else str(configured.get("winsorize") or "quantile").strip().lower()
     standardize = "none" if is_boolean else str(configured.get("standardize") or "zscore").strip().lower()
+    legacy_quantile5 = standardize == "quantile5"
+    if legacy_quantile5:
+        standardize = "quantile"
+    quantiles_raw = 5 if legacy_quantile5 else configured.get("quantiles", 5)
+    if isinstance(quantiles_raw, bool) or not isinstance(quantiles_raw, int) or not 2 <= quantiles_raw <= 20:
+        raise ValueError("data_processing.quantiles 必须是 2 到 20 的整数")
+    direction = str(configured.get("direction") or "asc").strip().lower()
+    if standardize not in {"rank", "quantile"}:
+        direction = "asc"
+    elif direction not in {"asc", "desc"}:
+        raise ValueError("data_processing.direction 必须是 asc 或 desc")
     neutralize_raw = configured.get("neutralize") or []
     if not isinstance(neutralize_raw, list):
         raise ValueError("data_processing.neutralize 必须是数组")
     neutralize = tuple(str(item).strip().lower() for item in neutralize_raw if str(item).strip())
 
     allowed_winsorize = {"none", "median", "mad", "quantile"}
-    allowed_standardize = {"none", "zscore", "rank"}
+    allowed_standardize = {"none", "zscore", "rank", "quantile"}
     if winsorize not in allowed_winsorize:
         raise ValueError(f"不支持的去极值方式: {winsorize}")
     if standardize not in allowed_standardize:
@@ -400,6 +413,8 @@ def _postprocess_config(factor: FactorOut) -> PostprocessConfig:
         winsorize=winsorize,
         standardize=standardize,
         neutralize=neutralize,
+        quantiles=quantiles_raw,
+        direction=direction,
     )
 
 
@@ -512,12 +527,18 @@ def _build_postprocessed_sql(
 
     if output_type == "boolean":
         score_sql = "raw_value"
+    elif processing.standardize == "quantile":
+        score_sql = (
+            f"least(floor(percentile * {processing.quantiles}) + 1, "
+            f"{processing.quantiles})"
+        )
     elif processing.standardize == "rank":
         score_sql = "percentile"
     elif processing.standardize == "none":
         score_sql = "processed_value"
     else:
         score_sql = "if(processed_stddev = 0, 0.0, (processed_value - processed_mean) / processed_stddev)"
+    percentile_order = "ASC" if processing.direction == "asc" else "DESC"
 
     return f"""
     WITH
@@ -530,7 +551,7 @@ def _build_postprocessed_sql(
             raw_value,
             processed_value,
             toUInt32(rank() OVER (PARTITION BY trade_date ORDER BY raw_value DESC)) AS rank_value,
-            toFloat64(percent_rank() OVER (PARTITION BY trade_date ORDER BY raw_value ASC)) AS percentile
+            toFloat64(percent_rank() OVER (PARTITION BY trade_date ORDER BY raw_value {percentile_order})) AS percentile
         FROM processed_values
     ),
     scored_values AS (

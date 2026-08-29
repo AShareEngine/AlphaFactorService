@@ -64,8 +64,8 @@ raw_value -> rank_value -> percentile -> score
 
 - `raw_value` 是公式原始结果。
 - `rank_value` 是当日横截面降序名次，原值最大者排名 1，并列值使用相同名次。
-- `percentile` 是当日横截面百分位，范围 0 到 1，原值越大越接近 1。
-- `score` 是模型输入值。布尔因子保留 0/1；连续因子默认使用 1%/99% 缩尾后的横截面 Z-score，也可由因子的 `data_processing` 配置改为 MAD/中位数去极值、rank 标准化或不标准化。
+- `percentile` 是当日横截面百分位，范围 0 到 1。默认升序时原值越大越接近 1；rank 或分位分层配置为降序时原值越大越接近 0。
+- `score` 是模型输入值。布尔因子保留 0/1；连续因子默认使用 1%/99% 缩尾后的横截面 Z-score，也可由因子的 `data_processing` 配置改为 MAD/中位数去极值、rank 标准化、每日横截面分位分层或不标准化。分位分层使用 `{"standardize":"quantile","quantiles":5,"direction":"asc"}`，其中 `quantiles` 可配置为 2 至 20；`direction` 可配置为 `asc`（原始值从小到大，第 1 档为低值端）或 `desc`（原始值从大到小，第 1 档为高值端）。旧的 `quantile5` 仍兼容为 5 档升序分层。
 
 新批次成功落库后，worker 会清理同一因子版本、参数、实体和日期范围内的旧批次，避免重算后同时读到旧原始值与新标准分。写入失败时不会提前删除旧结果。
 

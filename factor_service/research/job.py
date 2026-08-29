@@ -31,7 +31,12 @@ from factor_service.research.preprocessing import (
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+)
 from factor_service.research.training_resource_settings import (
+    INDEX_MEMBERSHIP_BINDING_ID,
+    STOCK_DAILY_BINDING_ID,
     frozen_data_binding,
     normalize_frozen_training_data_bindings,
     required_training_data_binding_ids,
@@ -295,6 +300,26 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             raise PermanentJobError(
                 "dataset_spec.industry_feature不是规范化冻结规格"
             )
+    size_rotation_feature = spec.get("size_rotation_feature")
+    if size_rotation_feature is None:
+        normalized_size_rotation_feature = normalize_size_rotation_feature(
+            None, default_enabled=False,
+        )
+    else:
+        if not isinstance(size_rotation_feature, dict):
+            raise PermanentJobError(
+                "dataset_spec.size_rotation_feature必须是对象"
+            )
+        try:
+            normalized_size_rotation_feature = normalize_size_rotation_feature(
+                size_rotation_feature, default_enabled=False,
+            )
+        except ValueError as exc:
+            raise PermanentJobError(str(exc)) from exc
+        if normalized_size_rotation_feature != size_rotation_feature:
+            raise PermanentJobError(
+                "dataset_spec.size_rotation_feature不是规范化冻结规格"
+            )
     kind = str(payload.get("kind") or "train")
     if kind not in {"train", "infer"}:
         raise PermanentJobError("任务kind只允许train或infer")
@@ -310,6 +335,10 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
                 "行业编码特征仅支持2021-12-13及以后；"
                 "更早历史包含申万2021版回溯重分类"
             )
+    if normalized_size_rotation_feature["enabled"] and str(
+        spec.get("research_target") or "stock_selection"
+    ) != "stock_selection":
+        raise PermanentJobError("大小盘轮动特征仅支持个股选股训练目标")
     if pipeline_version == DATASET_PIPELINE_VERSION:
         try:
             data_bindings = normalize_frozen_training_data_bindings(
@@ -327,6 +356,29 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
                 "dataset_spec.data_bindings缺少冻结绑定: "
                 + ", ".join(missing_bindings)
             )
+        if normalized_size_rotation_feature["enabled"]:
+            daily_binding = frozen_data_binding(
+                data_bindings, STOCK_DAILY_BINDING_ID,
+            )
+            daily_fields = dict(
+                (daily_binding or {}).get("field_bindings") or {}
+            )
+            if not str(daily_fields.get("float_market_cap") or "").strip():
+                raise PermanentJobError(
+                    "大小盘轮动特征要求训练基础行情绑定float_market_cap"
+                )
+            membership_binding = frozen_data_binding(
+                data_bindings, INDEX_MEMBERSHIP_BINDING_ID,
+            )
+            binding_fingerprint = str(
+                (membership_binding or {}).get("fingerprint") or ""
+            )
+            for pool_name in ("large_pool", "small_pool"):
+                pool = normalized_size_rotation_feature[pool_name]
+                if str(pool["binding_fingerprint"]) != binding_fingerprint:
+                    raise PermanentJobError(
+                        "大小盘轮动股票池与冻结指数成分绑定版本不一致"
+                    )
     cutoff = _datetime(spec.get("data_cutoff"), "data_cutoff")
     factors = spec.get("factors")
     if not isinstance(factors, list) or not 1 <= len(factors) <= 100:

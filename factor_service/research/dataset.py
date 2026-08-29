@@ -31,6 +31,7 @@ from factor_service.research.data_binding_source import (
     load_bound_industry_membership,
     load_bound_registered_membership,
     load_bound_security_master,
+    load_bound_size_rotation_daily,
     load_bound_stock_daily,
     load_bound_stock_status,
     load_bound_trading_calendar,
@@ -40,6 +41,11 @@ from factor_service.research.preprocessing import (
     LEGACY_DATASET_PIPELINE_VERSIONS,
     normalize_feature_preprocessing,
     preprocess_feature_panel,
+)
+from factor_service.research.size_rotation_feature import (
+    append_size_rotation_features,
+    normalize_size_rotation_feature,
+    size_rotation_lookback_sessions,
 )
 from factor_service.research.sample_filter_formula import (
     compile_sample_filter_formula,
@@ -248,6 +254,12 @@ class DatasetBuilder:
         industry_feature_details: dict[str, Any] = {
             "feature_names": [], "mapped_coverage": None,
         }
+        size_rotation_feature = normalize_size_rotation_feature(
+            spec.get("size_rotation_feature"), default_enabled=False,
+        )
+        size_rotation_feature_details: dict[str, Any] = {
+            "feature_names": [], "coverage": {}, "signal_date_count": 0,
+        }
         legacy_labeled_panel_medians = (
             spec.get("preprocessing") is None
             and str(spec.get("pipeline_version") or "")
@@ -316,6 +328,36 @@ class DatasetBuilder:
         features = expected.copy()
         for frame in feature_frames:
             features = features.merge(frame, on=["trade_date", "instrument"], how="left")
+        if size_rotation_feature["enabled"]:
+            if str(spec.get("research_target") or "stock_selection") != "stock_selection":
+                raise ValueError("大小盘轮动特征仅支持个股选股训练目标")
+            features, size_rotation_feature_details = self._size_rotation_features(
+                features,
+                date_start=date_start,
+                date_end=date_end,
+                index_code=index_code,
+                universe_id=universe_id,
+                size_rotation_feature=size_rotation_feature,
+                data_bindings=data_bindings,
+                data_cutoff=str(spec["data_cutoff"]),
+            )
+            size_names = list(
+                size_rotation_feature_details.get("feature_names") or []
+            )
+            size_coverages = dict(
+                size_rotation_feature_details.get("coverage") or {}
+            )
+            low_size = [
+                name for name in size_names
+                if float(size_coverages.get(name) or 0.0) < minimum_coverage
+            ]
+            if low_size:
+                raise ValueError(
+                    "大小盘轮动特征覆盖率低于"
+                    f"{minimum_coverage:.0%}: " + ", ".join(low_size)
+                )
+            feature_names.extend(size_names)
+            coverage.update(size_coverages)
         _progress(progress, "loading_prices", 38, {"instrument_count": int(features["instrument"].nunique())})
         prices = self._adjusted_close(
             sorted(features["instrument"].unique()), date_start, date_end,
@@ -531,6 +573,13 @@ class DatasetBuilder:
                 "frozen 31-category one-hot vocabulary plus one unknown bucket",
                 "industry one-hot columns are already complete and excluded from winsorization and z-score transforms",
             ])
+        if size_rotation_feature["enabled"]:
+            future_function_guards.extend([
+                "large and small baskets use exact-date frozen configured stock-pool membership",
+                "basket returns use only signal-date and backward adjusted-close history",
+                "size exposure uses same-date target-universe float-market-cap cross-sections",
+                "rotation interactions share one implementation between training and inference",
+            ])
         if research_target == "industry_rotation":
             future_function_guards.append(
                 "industry membership uses exact-date SW2021 weight snapshots no earlier than 2021-12-13"
@@ -553,8 +602,10 @@ class DatasetBuilder:
                 preprocessing_excluded_features,
             ),
             "industry_feature": industry_feature,
+            "size_rotation_feature": size_rotation_feature,
             "data_bindings": data_bindings,
             "industry_feature_details": industry_feature_details,
+            "size_rotation_feature_details": size_rotation_feature_details,
             "segments": segments,
             "data_cutoff": cutoff.isoformat(),
             "target_contract": target_contract,
@@ -583,6 +634,78 @@ class DatasetBuilder:
             indexed, segments, feature_names, coverage, medians, manifest,
             raw_frame=raw_indexed,
         )
+
+    def _size_rotation_features(
+        self,
+        observations: pd.DataFrame,
+        *,
+        date_start: str,
+        date_end: str,
+        index_code: str,
+        universe_id: str,
+        size_rotation_feature: dict[str, Any],
+        data_bindings: dict[str, Any] | None,
+        data_cutoff: str,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        lookback = size_rotation_lookback_sessions(size_rotation_feature)
+        history_start = self.trading_dates_ending_at(
+            date_start,
+            lookback,
+            index_code=index_code,
+            universe_id=universe_id,
+            data_bindings=data_bindings,
+        )[0]
+
+        def pool_membership(pool: dict[str, Any]) -> pd.DataFrame:
+            selector = dict(pool["selector"])
+            return self._membership(
+                history_start,
+                date_end,
+                universe_id=str(pool["source_id"]),
+                index_code=str(selector["value"]),
+                sample_filters={},
+                universe_field_filters=[],
+                data_bindings=data_bindings,
+                universe_source=pool,
+                data_cutoff=data_cutoff,
+            )
+
+        large_membership = pool_membership(size_rotation_feature["large_pool"])
+        small_membership = pool_membership(size_rotation_feature["small_pool"])
+        instruments = sorted(set(
+            observations["instrument"].astype(str)
+        ).union(
+            large_membership["instrument"].astype(str)
+        ).union(
+            small_membership["instrument"].astype(str)
+        ))
+        daily_binding = frozen_data_binding(
+            data_bindings, STOCK_DAILY_BINDING_ID,
+        )
+        if daily_binding is None:
+            raise ValueError("大小盘轮动特征缺少冻结的训练基础行情绑定")
+        daily = load_bound_size_rotation_daily(
+            self.settings,
+            daily_binding,
+            instruments,
+            history_start,
+            date_end,
+            data_cutoff=data_cutoff,
+        )
+        result, details = append_size_rotation_features(
+            observations,
+            daily,
+            large_membership,
+            small_membership,
+            size_rotation_feature,
+        )
+        source_details = dict(
+            daily.attrs.get("training_data_binding") or {}
+        )
+        if source_details:
+            details["data_binding"] = source_details
+        details["history_start"] = history_start
+        return result, details
 
     def _membership(
         self,

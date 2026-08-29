@@ -46,6 +46,8 @@ def test_continuous_factor_defaults_to_quantile_winsorized_zscore():
         winsorize="quantile",
         standardize="zscore",
         neutralize=(),
+        quantiles=5,
+        direction="asc",
     )
 
 
@@ -62,10 +64,12 @@ def test_boolean_factor_keeps_binary_score():
     assert "ORDER BY raw_value DESC" in sql
 
 
-def test_rank_standardization_uses_percentile_as_score():
+@pytest.mark.parametrize(("direction", "order"), [("asc", "ASC"), ("desc", "DESC")])
+def test_rank_standardization_uses_configured_direction(direction, order):
     config = _postprocess_config(factor(processing={
         "winsorize": "none",
         "standardize": "rank",
+        "direction": direction,
         "neutralize": [],
     }))
     sql = _build_postprocessed_sql(
@@ -75,7 +79,73 @@ def test_rank_standardization_uses_percentile_as_score():
     )
 
     assert "toFloat64(percentile) AS score" in sql
-    assert "percent_rank()" in sql
+    assert f"percent_rank() OVER (PARTITION BY trade_date ORDER BY raw_value {order})" in sql
+
+
+@pytest.mark.parametrize(
+    ("quantiles", "direction", "order"),
+    [(3, "asc", "ASC"), (5, "desc", "DESC"), (10, "asc", "ASC")],
+)
+def test_quantile_standardization_uses_configured_buckets_and_direction(quantiles, direction, order):
+    config = _postprocess_config(factor(
+        output_type="category",
+        processing={
+            "winsorize": "none",
+            "standardize": "quantile",
+            "quantiles": quantiles,
+            "direction": direction,
+            "neutralize": [],
+        },
+    ))
+    sql = _build_postprocessed_sql(
+        "SELECT trade_date, entity_code, raw_value FROM source",
+        output_type="category",
+        processing=config,
+    )
+
+    assert config.standardize == "quantile"
+    assert config.quantiles == quantiles
+    assert config.direction == direction
+    assert f"percent_rank() OVER (PARTITION BY trade_date ORDER BY raw_value {order})" in sql
+    assert (
+        f"toFloat64(least(floor(percentile * {quantiles}) + 1, {quantiles})) AS score"
+        in sql
+    )
+
+
+def test_quantile5_legacy_value_remains_a_five_bucket_alias():
+    config = _postprocess_config(factor(processing={
+        "winsorize": "none",
+        "standardize": "quantile5",
+        "neutralize": [],
+    }))
+
+    assert config.standardize == "quantile"
+    assert config.quantiles == 5
+    assert config.direction == "asc"
+
+
+@pytest.mark.parametrize("quantiles", [True, 1, 21, 5.0, "5"])
+def test_quantile_count_must_be_an_integer_between_two_and_twenty(quantiles):
+    with pytest.raises(ValueError, match="quantiles 必须是 2 到 20 的整数"):
+        _postprocess_config(factor(processing={
+            "winsorize": "none",
+            "standardize": "quantile",
+            "quantiles": quantiles,
+            "neutralize": [],
+        }))
+
+
+@pytest.mark.parametrize("direction", ["ascending", "descending", 1])
+def test_rank_and_quantile_direction_must_be_asc_or_desc(direction):
+    with pytest.raises(ValueError, match="direction 必须是 asc 或 desc"):
+        _postprocess_config(factor(processing={
+            "winsorize": "none",
+            "standardize": "quantile",
+            "quantiles": 5,
+            "direction": direction,
+            "neutralize": [],
+        }))
 
 
 def test_neutralization_is_rejected_until_exposures_are_bound():

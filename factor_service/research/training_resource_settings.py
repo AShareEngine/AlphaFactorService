@@ -72,6 +72,8 @@ BINDING_DEFINITIONS: dict[str, dict[str, Any]] = {
                   hints=("code", "market_code", "instrument")),
             _role("adjusted_close", "后复权收盘价", required=True,
                   hints=("close_adj", "adjusted_close")),
+            _role("float_market_cap", "流通市值", required=False,
+                  hints=("float_market_cap",)),
         ],
         "parameters": [],
     },
@@ -364,6 +366,9 @@ def required_training_data_binding_ids(
         isinstance(industry, Mapping) and industry.get("enabled") is True
     ):
         required.append(INDUSTRY_FEATURE_BINDING_ID)
+    size_rotation = spec.get("size_rotation_feature")
+    if isinstance(size_rotation, Mapping) and size_rotation.get("enabled") is True:
+        required.append(INDEX_MEMBERSHIP_BINDING_ID)
     return list(dict.fromkeys(required))
 
 

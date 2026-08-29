@@ -25,6 +25,10 @@ from factor_service.research.preprocessing import (
     normalize_feature_preprocessing,
     preprocess_feature_panel,
 )
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+    size_rotation_feature_names,
+)
 from factor_service.research.training_resource_settings import (
     normalize_frozen_training_data_bindings,
 )
@@ -147,10 +151,30 @@ class DailyInferenceRunner:
             )
             if requested_industry_feature != industry_feature:
                 raise PermanentJobError("每日推理数据集与训练模型的行业特征口径不一致")
+        size_rotation_feature = normalize_size_rotation_feature(
+            training_manifest.get("size_rotation_feature"),
+            default_enabled=False,
+        )
+        if dataset_spec.get("size_rotation_feature") is not None:
+            requested_size_rotation_feature = normalize_size_rotation_feature(
+                dataset_spec.get("size_rotation_feature"),
+                default_enabled=False,
+            )
+            if requested_size_rotation_feature != size_rotation_feature:
+                raise PermanentJobError(
+                    "每日推理数据集与训练模型的大小盘轮动特征口径不一致"
+                )
         factors = list(job["dataset_spec"]["factors"])
         factor_feature_names = [_feature_name(item) for item in factors]
+        expected_size_rotation_names = size_rotation_feature_names(
+            size_rotation_feature,
+        )
         expected_industry_names = industry_feature_names(industry_feature)
-        actual_names = [*factor_feature_names, *expected_industry_names]
+        actual_names = [
+            *factor_feature_names,
+            *expected_size_rotation_names,
+            *expected_industry_names,
+        ]
         if actual_names != expected_names or any(name not in medians for name in expected_names):
             raise PermanentJobError("模型产物中的特征顺序或训练中位数与冻结因子不一致")
 
@@ -232,6 +256,39 @@ class DailyInferenceRunner:
                 eligible_values[["trade_date", "instrument", feature_name]],
                 on=["trade_date", "instrument"], how="left",
             )
+        if size_rotation_feature["enabled"]:
+            if research_target != "stock_selection":
+                raise PermanentJobError("大小盘轮动特征仅支持个股选股每日推理")
+            try:
+                features, size_rotation_details = (
+                    self.dataset_builder._size_rotation_features(
+                        features,
+                        date_start=feature_date_start,
+                        date_end=trade_date,
+                        index_code=index_code,
+                        universe_id=universe_id,
+                        size_rotation_feature=size_rotation_feature,
+                        data_bindings=data_bindings,
+                        data_cutoff=data_cutoff.astimezone(
+                            timezone.utc,
+                        ).isoformat(),
+                    )
+                )
+            except ValueError as exc:
+                raise PermanentJobError(str(exc)) from exc
+            actual_size_names = list(
+                size_rotation_details.get("feature_names") or []
+            )
+            if actual_size_names != expected_size_rotation_names:
+                raise PermanentJobError(
+                    "每日推理大小盘轮动特征顺序与训练模型不一致"
+                )
+            coverages.update({
+                name: float(value)
+                for name, value in dict(
+                    size_rotation_details.get("coverage") or {}
+                ).items()
+            })
         minimum = float(job["dataset_spec"].get("minimum_factor_coverage") or 0.8)
         low = [name for name, coverage in coverages.items() if coverage < minimum]
         if low:
