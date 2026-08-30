@@ -795,11 +795,13 @@ def _without_retired_bindings(
     if isinstance(daily_source, Mapping):
         daily = dict(daily_source)
         fields_source = daily.get("field_bindings")
-        if isinstance(fields_source, Mapping) and "close" in fields_source:
+        if isinstance(fields_source, Mapping):
             fields = dict(fields_source)
+            changed = "close" in fields or "float_market_cap" not in fields
             fields.pop("close", None)
-            daily["field_bindings"] = fields
-            daily.pop("fingerprint", None)
+            if changed:
+                daily["field_bindings"] = fields
+                daily.pop("fingerprint", None)
         bindings[STOCK_DAILY_BINDING_ID] = daily
     return bindings
 

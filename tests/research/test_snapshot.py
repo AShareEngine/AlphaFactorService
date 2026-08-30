@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from factor_service.research.dataset import PreparedDataset, _frame_fingerprint
@@ -83,3 +84,25 @@ def test_snapshot_reuses_canonical_parquet_without_recomputing_factors(tmp_path)
 
     assert reused.reused is True
     assert reused.prepared.manifest["dataset_spec_hash"] == job["dataset_hash"]
+
+
+def test_snapshot_fingerprints_persisted_nan_representation(tmp_path) -> None:
+    job = valid_job()
+    prepared = _prepared(job)
+    prepared.raw_frame.iloc[0, 0] = np.array(
+        [0x7FF8000000000001], dtype=np.uint64,
+    ).view(np.float64)[0]
+
+    store = DatasetSnapshotStore(tmp_path / "artifacts")
+    result = store.get_or_create(
+        job, tmp_path / "work",
+        type(
+            "Builder", (),
+            {"build": lambda self, *_args, **_kwargs: prepared},
+        )(),
+    )
+
+    assert result.prepared.raw_frame.equals(prepared.raw_frame)
+    assert result.prepared.manifest["raw_content_fingerprint"] == (
+        _frame_fingerprint(result.prepared.raw_frame)
+    )

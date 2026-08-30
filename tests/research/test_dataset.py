@@ -23,9 +23,72 @@ from factor_service.research.industry_feature import (
     industry_feature_names,
     normalize_industry_feature,
 )
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+)
 from factor_service.research.job import CancellationToken
 from factor_service.entity_field_feature import normalize_entity_field_feature
 from tests.research.utils import valid_job
+
+
+def _configured_rotation_pool(source_id: str, index_code: str) -> dict:
+    return {
+        "schema_version": "alphablocks.configured-stock-pool-source.v1",
+        "source_id": source_id,
+        "source_kind": "configured_stock_pool",
+        "label": source_id,
+        "version": 1,
+        "available": True,
+        "pit": True,
+        "settings_revision": 1,
+        "binding_id": "index_membership",
+        "binding_fingerprint": "a" * 64,
+        "selector": {
+            "field_role": "index_code",
+            "operator": "eq",
+            "value": index_code,
+        },
+        "benchmark_code": index_code,
+        "config_fingerprint": source_id[0] * 64,
+    }
+
+
+def test_size_rotation_lookback_uses_first_observed_trading_date() -> None:
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    observed = pd.DataFrame([{
+        "trade_date": pd.Timestamp("2025-02-05"),
+        "instrument": "A",
+    }])
+    calls = []
+    builder.trading_dates_ending_at = lambda value, count, **_kwargs: (
+        calls.append((value, count)) or ["2024-10-22"]
+    )
+    builder._membership = lambda *_args, **_kwargs: pd.DataFrame([{
+        "trade_date": pd.Timestamp("2025-02-05"),
+        "instrument": "A",
+    }])
+    config = normalize_size_rotation_feature({
+        "enabled": True,
+        "large_pool": _configured_rotation_pool("large", "LARGE.INDEX"),
+        "small_pool": _configured_rotation_pool("small", "SMALL.INDEX"),
+        "return_window": 10,
+        "basket_size": 20,
+        "regime_window": 60,
+    }, default_enabled=False)
+
+    with pytest.raises(ValueError, match="冻结的训练基础行情绑定"):
+        builder._size_rotation_features(
+            observed,
+            date_start="2025-02-03",
+            date_end="2025-02-05",
+            index_code="000905.SH",
+            universe_id="csi500",
+            size_rotation_feature=config,
+            data_bindings=None,
+            data_cutoff="2026-08-30T00:00:00+08:00",
+        )
+
+    assert calls == [("2025-02-05", 70)]
 
 
 def test_future_five_day_label_is_cross_sectional_and_centered() -> None:
@@ -870,6 +933,109 @@ def test_factor_query_chunks_long_ranges_without_losing_boundaries(monkeypatch) 
     for left, right in zip(builder.client.calls, builder.client.calls[1:]):
         assert left["date_end"] + pd.Timedelta(days=1) == right["date_start"]
     assert len(frame) == 6
+
+
+def test_entity_asset_batch_stages_same_source_once(monkeypatch) -> None:
+    class _Client:
+        def query(self, query, parameters):
+            if "SELECT DISTINCT toDate(trade_time)" in query:
+                return SimpleNamespace(result_rows=[
+                    (pd.Timestamp("2024-01-02"),),
+                    (pd.Timestamp("2024-01-03"),),
+                ])
+            score = float(parameters["score"])
+            return SimpleNamespace(result_rows=[
+                (pd.Timestamp("2024-01-03"), "000001.SZ", score),
+            ])
+
+    builder = DatasetBuilder.__new__(DatasetBuilder)
+    builder.settings = SimpleNamespace(
+        source_database="source",
+        stock_daily_table="stock_daily",
+        factor_database="factor",
+        data_sdk_api_base_url="http://data.test",
+        data_sdk_query_timeout_seconds=30,
+        data_sdk_query_concurrency=2,
+    )
+    builder.client = _Client()
+    builder.factor_query_chunk_days = 90
+    staged_calls = []
+
+    def fake_staged_source(**kwargs):
+        staged_calls.append(kwargs)
+        return nullcontext(SimpleNamespace(
+            database="factor",
+            table="staged",
+            code_column="code",
+            date_column="trade_time",
+            source_vintage="test",
+            date_start=kwargs["date_start"],
+            date_end=kwargs["date_end"],
+        ))
+
+    monkeypatch.setattr(
+        dataset_module, "staged_entity_asset_source", fake_staged_source,
+    )
+    monkeypatch.setattr(
+        dataset_module, "compile_qlib_formula",
+        lambda *_args, **_kwargs: SimpleNamespace(max_window=20),
+    )
+    monkeypatch.setattr(
+        dataset_module, "build_factor_query_plan",
+        lambda factor, **_kwargs: SimpleNamespace(
+            sql="SELECT score",
+            params={"score": 1 if factor.factor_id == "factor_a" else 2},
+            params_hash="a" * 64 if factor.factor_id == "factor_a" else "b" * 64,
+        ),
+    )
+    factors = [
+        SimpleNamespace(
+            factor_id="factor_a", expression="$close",
+            entity_type="stock",
+            required_fields=["close"],
+        ),
+        SimpleNamespace(
+            factor_id="factor_b", expression="$amount / $volume",
+            entity_type="stock",
+            required_fields=["amount", "volume"],
+        ),
+    ]
+    items = [
+        ({
+            "factor_id": "factor_a", "params": {},
+            "params_hash": "a" * 64,
+        }, factors[0]),
+        ({
+            "factor_id": "factor_b", "params": {},
+            "params_hash": "b" * 64,
+        }, factors[1]),
+    ]
+
+    frames = builder._factor_values_batch(
+        items,
+        pd.Timestamp("2024-01-03 15:00:00").to_pydatetime(),
+        "2024-01-02",
+        "2024-01-03",
+    )
+
+    assert len(staged_calls) == 1
+    assert staged_calls[0]["fields"] == ["amount", "close", "volume"]
+    assert frames[("factor_a", "a" * 64)]["value"].tolist() == [1.0]
+    assert frames[("factor_b", "b" * 64)]["value"].tolist() == [2.0]
+
+
+def test_entity_asset_batch_groups_stock_composite_assets() -> None:
+    daily = SimpleNamespace(
+        entity_type="stock",
+        params={"_source_asset": "asset_stock_daily"},
+    )
+    fundamentals = SimpleNamespace(
+        entity_type="stock",
+        params={"_source_asset": "asset_fundamentals_pit"},
+    )
+
+    assert dataset_module._entity_asset_batch_key(daily) == "stock"
+    assert dataset_module._entity_asset_batch_key(fundamentals) == "stock"
 
 
 def test_factor_query_rejects_changed_frozen_params(monkeypatch) -> None:

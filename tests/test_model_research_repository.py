@@ -32,6 +32,9 @@ from factor_service.model_research_repository import (
     _walk_forward_spec,
 )
 from factor_service.research.industry_feature import normalize_industry_feature
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+)
 
 
 def _source() -> dict:
@@ -358,6 +361,57 @@ def test_dataset_contract_freezes_industry_one_hot_and_changes_hash() -> None:
             **base,
             "research_target": "industry_rotation",
             "industry_feature": {"enabled": True},
+        })
+
+
+def test_dataset_contract_freezes_size_rotation_and_changes_hash() -> None:
+    def pool(source_id: str, selector_value: str) -> dict:
+        return {
+            "schema_version": "alphablocks.configured-stock-pool-source.v1",
+            "source_id": source_id,
+            "source_kind": "configured_stock_pool",
+            "label": source_id,
+            "version": 10,
+            "available": True,
+            "pit": True,
+            "settings_revision": 10,
+            "binding_id": "index_membership",
+            "binding_fingerprint": "a" * 64,
+            "selector": {
+                "field_role": "index_code",
+                "operator": "eq",
+                "value": selector_value,
+            },
+            "benchmark_code": selector_value,
+            "config_fingerprint": "b" * 64,
+        }
+
+    source = {
+        "enabled": True,
+        "large_pool": pool("large", "large-selector"),
+        "small_pool": pool("small", "small-selector"),
+        "return_window": 10,
+        "basket_size": 20,
+        "regime_window": 60,
+    }
+    enabled = _dataset_spec({**_source(), "size_rotation_feature": source})
+    disabled = _dataset_spec({
+        **_source(), "size_rotation_feature": {"enabled": False},
+    })
+
+    assert enabled["size_rotation_feature"] == normalize_size_rotation_feature(
+        source, default_enabled=False,
+    )
+    assert disabled["size_rotation_feature"]["enabled"] is False
+    assert sha256(_canonical_json(enabled).encode("utf-8")).hexdigest() != (
+        sha256(_canonical_json(disabled).encode("utf-8")).hexdigest()
+    )
+    with pytest.raises(ModelResearchError, match="仅支持个股选股"):
+        _dataset_spec({
+            **_source(),
+            "research_target": "industry_rotation",
+            "date_start": "2022-01-04",
+            "size_rotation_feature": source,
         })
 
 

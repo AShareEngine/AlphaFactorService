@@ -72,12 +72,17 @@ class DatasetSnapshotStore:
         prepared.frame.to_parquet(staged_dataset)
         raw_frame = prepared.raw_frame if prepared.raw_frame is not None else prepared.frame
         raw_frame.to_parquet(staged_raw)
+        # Parquet canonicalizes semantically equivalent NaN payloads. Fingerprint
+        # the persisted representation so a valid round trip remains verifiable.
+        persisted_frame = pd.read_parquet(staged_dataset)
+        persisted_raw_frame = pd.read_parquet(staged_raw)
         snapshot_manifest = {
             **prepared.manifest,
             "schema_version": "alphablocks.qlib-dataset-snapshot.v1",
             "dataset_hash": dataset_hash,
             "dataset_spec_hash": dataset_hash,
-            "raw_content_fingerprint": _frame_fingerprint(raw_frame),
+            "content_fingerprint": _frame_fingerprint(persisted_frame),
+            "raw_content_fingerprint": _frame_fingerprint(persisted_raw_frame),
             "files": {
                 "dataset.parquet": {"sha256": _file_sha256(staged_dataset)},
                 "dataset_raw.parquet": {"sha256": _file_sha256(staged_raw)},

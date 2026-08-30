@@ -56,6 +56,9 @@ from factor_service.research.sample_filter_formula import (
     MAX_SAMPLE_FILTER_WINDOW,
     normalize_custom_sample_filters,
 )
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+)
 from factor_service.research.trainer import SEQUENCE_MODEL_KINDS
 from factor_service.research.training_resource_settings import (
     TrainingResourceRevisionConflict,
@@ -340,6 +343,30 @@ def _freeze_training_data_bindings(payload: dict[str, Any]) -> None:
             raise ModelResearchConflict(
                 "模型训练股票池配置已变更，请重新校验Draft"
             )
+    rotation_source = dataset.get("size_rotation_feature")
+    try:
+        rotation = normalize_size_rotation_feature(
+            rotation_source, default_enabled=False,
+        )
+    except ValueError as exc:
+        raise ModelResearchConflict(str(exc)) from exc
+    if rotation_source is not None and rotation != rotation_source:
+        raise ModelResearchConflict(
+            "模型训练大小盘轮动特征不是规范化冻结规格"
+        )
+    dataset["size_rotation_feature"] = rotation
+    if rotation["enabled"]:
+        settings = settings or get_training_resource_settings()
+        current_sources = {
+            str(item.get("source_id") or ""): item
+            for item in configured_stock_pool_sources(settings)
+        }
+        for pool_name in ("large_pool", "small_pool"):
+            pool = rotation[pool_name]
+            if current_sources.get(str(pool["source_id"])) != pool:
+                raise ModelResearchConflict(
+                    "大小盘轮动股票池配置已变更，请重新选择股票池"
+                )
     if dataset.get("data_bindings"):
         try:
             frozen = normalize_frozen_training_data_bindings(

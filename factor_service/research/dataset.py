@@ -14,11 +14,14 @@ import numpy as np
 import pandas as pd
 
 from factor_service import repository as factor_repository
+from factor_service.config import load_settings as load_factor_settings
+from factor_service.entity_asset_source import staged_entity_asset_source
 from factor_service.entity_field_feature import (
     is_entity_field_feature,
     virtual_entity_field_factor,
 )
 from factor_service.factor_backtest import UNIVERSES
+from factor_service.qlib_formula import compile_qlib_formula
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.research.industry_feature import (
@@ -297,18 +300,42 @@ class DatasetBuilder:
         minimum_coverage = float(
             spec.get("minimum_factor_coverage") or 0.8
         )
+        resolved_factors = [self._factor_definition(item) for item in factors]
+        entity_asset_groups: dict[str, list[tuple[dict[str, Any], FactorOut]]] = {}
+        for item, factor in zip(factors, resolved_factors, strict=True):
+            group_key = _entity_asset_batch_key(factor)
+            if group_key:
+                entity_asset_groups.setdefault(group_key, []).append((item, factor))
+        batched_frames: dict[tuple[str, str], pd.DataFrame] = {}
+        loaded_groups: set[str] = set()
         for index, item in enumerate(factors, start=1):
             _checkpoint(cancellation)
             name = str(item["factor_id"])
             _progress(progress, "loading_factors", 8 + int(26 * (index - 1) / len(factors)), {
                 "factor_id": name, "factor_index": index, "factor_count": len(factors),
             })
-            factor = self._factor_definition(item)
-            frame = self._factor_values(
-                item, cutoff_for_clickhouse, date_start, date_end,
-                cancellation=cancellation,
-                resolved_factor=factor,
-            )
+            factor = resolved_factors[index - 1]
+            group_key = _entity_asset_batch_key(factor)
+            group = entity_asset_groups.get(group_key, [])
+            frame_key = (name, str(item.get("params_hash") or ""))
+            if group_key and len(group) > 1:
+                if group_key not in loaded_groups:
+                    batched_frames.update(self._factor_values_batch(
+                        group,
+                        cutoff_for_clickhouse,
+                        date_start,
+                        date_end,
+                        cancellation=cancellation,
+                        progress=progress,
+                    ))
+                    loaded_groups.add(group_key)
+                frame = batched_frames[frame_key]
+            else:
+                frame = self._factor_values(
+                    item, cutoff_for_clickhouse, date_start, date_end,
+                    cancellation=cancellation,
+                    resolved_factor=factor,
+                )
             frame = frame.merge(expected, on=["trade_date", "instrument"], how="inner")
             actual_coverage = frame[["trade_date", "instrument"]].drop_duplicates().shape[0] / expected_count
             coverage[name] = actual_coverage
@@ -648,8 +675,14 @@ class DatasetBuilder:
         data_cutoff: str,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         lookback = size_rotation_lookback_sessions(size_rotation_feature)
+        observed_dates = pd.to_datetime(
+            observations.get("trade_date"), errors="coerce",
+        ).dropna()
+        if observed_dates.empty:
+            raise ValueError("大小盘轮动目标样本不包含有效交易日")
+        first_observation_date = observed_dates.min().date().isoformat()
         history_start = self.trading_dates_ending_at(
-            date_start,
+            first_observation_date,
             lookback,
             index_code=index_code,
             universe_id=universe_id,
@@ -1519,6 +1552,156 @@ class DatasetBuilder:
             frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
         return frame
 
+    def _factor_values_batch(
+        self,
+        items: list[tuple[dict[str, Any], FactorOut]],
+        cutoff: datetime,
+        date_start: str,
+        date_end: str,
+        *,
+        cancellation: CancellationToken | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[tuple[str, str], pd.DataFrame]:
+        """Stage one composite entity asset once for all same-source factors."""
+        signal_close = datetime.combine(
+            pd.Timestamp(date_end).date(), datetime.min.time(),
+        ).replace(hour=15)
+        if cutoff < signal_close:
+            raise ValueError("批量因子的数据截止时间早于信号日收盘")
+        fields = sorted({
+            str(field)
+            for _item, factor in items
+            for field in factor.required_fields
+            if str(field).strip()
+        })
+        if not fields:
+            raise ValueError("批量实体资产因子缺少公式字段")
+        lookback_days = 90
+        for item, factor in items:
+            params = item.get("params")
+            if not isinstance(params, dict):
+                raise ValueError(f"冻结因子{item['factor_id']}缺少params")
+            compiled = compile_qlib_formula(
+                factor.expression,
+                params={**params, "window": params.get("window", 20)},
+                code_column="code",
+                date_column="trade_time",
+            )
+            lookback_days = max(
+                lookback_days, compiled.max_window * 4 + 20,
+            )
+        rows_by_factor: dict[tuple[str, str], list[tuple[Any, ...]]] = {
+            (
+                str(item["factor_id"]),
+                str(item.get("params_hash") or ""),
+            ): []
+            for item, _factor in items
+        }
+        chunk_start = pd.Timestamp(date_start).date()
+        final_end = pd.Timestamp(date_end).date()
+        # A wider chunk keeps rolling lookback overlap bounded while the
+        # staged table remains small enough for one year of all-A daily data.
+        chunk_days = max(366, int(self.factor_query_chunk_days))
+        chunk_count = max(
+            1,
+            math.ceil(((final_end - chunk_start).days + 1) / chunk_days),
+        )
+        chunk_index = 0
+        factor_settings = load_factor_settings()
+        source_database = _sql_identifier(
+            str(factor_settings.source_database), "source_database",
+        )
+        source_table = _sql_identifier(
+            str(factor_settings.stock_daily_table), "stock_daily_table",
+        )
+        while chunk_start <= final_end:
+            _checkpoint(cancellation)
+            chunk_index += 1
+            chunk_end = min(
+                chunk_start + timedelta(days=chunk_days - 1), final_end,
+            )
+            source_start = chunk_start - timedelta(days=lookback_days)
+            trading_rows = self.client.query(
+                f"""
+                SELECT DISTINCT toDate(trade_time) AS trade_date
+                FROM {source_database}.{source_table}
+                WHERE toDate(trade_time) >= {{date_start:Date}}
+                  AND toDate(trade_time) <= {{date_end:Date}}
+                ORDER BY trade_date
+                """,
+                parameters={
+                    "date_start": source_start,
+                    "date_end": chunk_end,
+                },
+            ).result_rows
+            trading_dates = [
+                pd.Timestamp(row[0]).date() for row in trading_rows
+            ]
+            _progress(progress, "loading_factor_source_batch", 8, {
+                "factor_ids": [
+                    str(item["factor_id"]) for item, _factor in items
+                ],
+                "field_count": len(fields),
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+            })
+            with staged_entity_asset_source(
+                db_client=self.client,
+                database=self.settings.factor_database,
+                api_base_url=self.settings.data_sdk_api_base_url,
+                timeout_seconds=self.settings.data_sdk_query_timeout_seconds,
+                concurrency=self.settings.data_sdk_query_concurrency,
+                entity_id="stock",
+                fields=fields,
+                trading_dates=trading_dates,
+                date_start=chunk_start,
+                date_end=chunk_end,
+                job_id="model-dataset-batch",
+            ) as source_binding:
+                for item, factor in items:
+                    _checkpoint(cancellation)
+                    params = dict(item["params"])
+                    plan = build_factor_query_plan(
+                        factor,
+                        overrides=params,
+                        entity_type="stock",
+                        date_start=chunk_start,
+                        date_end=chunk_end,
+                        job_id="model-dataset",
+                        source_binding=source_binding,
+                    )
+                    expected_hash = str(
+                        item.get("params_hash") or ""
+                    ).strip().lower()
+                    if plan.params_hash != expected_hash:
+                        raise ValueError(
+                            f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
+                        )
+                    values = self.client.query(
+                        f"""
+                        SELECT trade_date, entity_code, score AS value
+                        FROM ({plan.sql})
+                        """,
+                        parameters=plan.params,
+                    ).result_rows
+                    rows_by_factor[(
+                        str(item["factor_id"]), expected_hash,
+                    )].extend(values)
+            chunk_start = chunk_end + timedelta(days=1)
+        frames: dict[tuple[str, str], pd.DataFrame] = {}
+        for key, rows in rows_by_factor.items():
+            frame = pd.DataFrame(
+                rows, columns=["trade_date", "instrument", "value"],
+            )
+            if not frame.empty:
+                frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+                frame["value"] = pd.to_numeric(
+                    frame["value"], errors="coerce",
+                )
+                frame = frame.dropna(subset=["value"])
+            frames[key] = frame
+        return frames
+
     @staticmethod
     def _factor_definition(item: dict[str, Any]) -> FactorOut:
         if is_entity_field_feature(item):
@@ -1714,6 +1897,18 @@ def _expand_membership_intervals(
     return pd.concat(parts, ignore_index=True).drop_duplicates(
         ["trade_date", "instrument"], keep="last",
     ).sort_values(["trade_date", "instrument"], ignore_index=True)
+
+
+def _entity_asset_batch_key(factor: FactorOut) -> str:
+    raw_params = getattr(factor, "params", None)
+    params = raw_params if isinstance(raw_params, dict) else {}
+    source_asset = str(params.get("_source_asset") or "").strip()
+    if not source_asset:
+        return ""
+    # The Data SDK stock daily view is a composite PIT projection. Factors
+    # backed by different stock assets can therefore share one staged panel.
+    entity_type = str(getattr(factor, "entity_type", "") or "").strip()
+    return entity_type if entity_type else ""
 
 
 def _future_rank_label(prices: pd.DataFrame, horizon: int) -> pd.DataFrame:

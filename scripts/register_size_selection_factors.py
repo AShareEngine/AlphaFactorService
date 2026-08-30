@@ -39,7 +39,9 @@ def _request(
         return exc.code, response
 
 
-def register(base_url: str) -> list[dict[str, Any]]:
+def register(
+    base_url: str, *, update_existing: bool = False,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for payload in size_selection_factor_payloads():
         factor_id = str(payload["factor_id"])
@@ -72,7 +74,27 @@ def register(base_url: str) -> list[dict[str, Any]]:
                 for key in desired
             }
             if comparable != desired:
-                raise RuntimeError(f"{factor_id}已存在但定义不同，拒绝覆盖")
+                if not update_existing:
+                    raise RuntimeError(
+                        f"{factor_id}已存在但定义不同，拒绝覆盖"
+                    )
+                update_status, updated = _request(
+                    base_url,
+                    "PUT",
+                    f"/factors/{quote(factor_id, safe='')}",
+                    {
+                        key: value for key, value in desired.items()
+                        if key != "factor_id"
+                    },
+                )
+                if update_status != 200:
+                    raise RuntimeError(f"更新{factor_id}失败: {updated}")
+                results.append({
+                    "factor_id": factor_id,
+                    "action": "updated",
+                    "version": int(updated.get("version") or 0),
+                })
+                continue
             results.append({
                 "factor_id": factor_id,
                 "action": "unchanged",
@@ -99,8 +121,17 @@ def main() -> None:
     parser.add_argument(
         "--base-url", default="http://127.0.0.1:8100",
     )
+    parser.add_argument(
+        "--update-existing",
+        action="store_true",
+        help="Create a new factor version when the registered definition differs.",
+    )
     args = parser.parse_args()
-    print(json.dumps(register(args.base_url), ensure_ascii=False, indent=2))
+    print(json.dumps(
+        register(args.base_url, update_existing=args.update_existing),
+        ensure_ascii=False,
+        indent=2,
+    ))
 
 
 if __name__ == "__main__":

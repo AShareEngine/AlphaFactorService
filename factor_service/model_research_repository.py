@@ -36,6 +36,9 @@ from factor_service.research.preprocessing import (
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
+from factor_service.research.size_rotation_feature import (
+    normalize_size_rotation_feature,
+)
 from factor_service.research.training_resource_settings import (
     normalize_frozen_training_data_bindings,
 )
@@ -5340,6 +5343,19 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
                 "行业编码特征仅支持2021-12-13及以后；"
                 "更早历史包含申万2021版回溯重分类"
             )
+    raw_size_rotation_feature = source.get("size_rotation_feature")
+    if raw_size_rotation_feature is None:
+        raw_size_rotation_feature = {}
+    if not isinstance(raw_size_rotation_feature, Mapping):
+        raise ModelResearchError("size_rotation_feature必须是对象")
+    try:
+        size_rotation_feature = normalize_size_rotation_feature(
+            raw_size_rotation_feature, default_enabled=False,
+        )
+    except ValueError as exc:
+        raise ModelResearchError(str(exc)) from exc
+    if size_rotation_feature["enabled"] and research_target != "stock_selection":
+        raise ModelResearchError("大小盘轮动特征仅支持个股选股训练目标")
     try:
         data_bindings = normalize_frozen_training_data_bindings(
             source.get("data_bindings"), allow_empty=True,
@@ -5366,6 +5382,7 @@ def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "universe_field_filters": universe_field_filters,
         "preprocessing": preprocessing,
         "industry_feature": industry_feature,
+        "size_rotation_feature": size_rotation_feature,
         "transform_refs": transform_refs,
         "universe_rule_refs": universe_rule_refs,
         "data_bindings": data_bindings,

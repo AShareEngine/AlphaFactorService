@@ -20,6 +20,9 @@ def test_size_selection_factor_bundle_compiles_and_uses_expected_assets() -> Non
     assert by_id["current_ratio_pit"]["params"][
         "_force_entity_asset_source"
     ] is True
+    assert by_id["momentum_10_adj"]["params"]["_source_asset"] == (
+        "asset_stock_daily_stock_daily_real"
+    )
     for payload in payloads:
         compiled = compile_qlib_formula(
             payload["expression"],

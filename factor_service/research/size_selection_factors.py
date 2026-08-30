@@ -22,6 +22,7 @@ def size_selection_factor_payloads() -> Iterator[dict[str, Any]]:
         "source_node_id": "fundamentals_pit_real",
     }
     daily_processing = {
+        "_source_asset": "asset_stock_daily_stock_daily_real",
         "data_processing": {
             "winsorize": "quantile",
             "standardize": "zscore",

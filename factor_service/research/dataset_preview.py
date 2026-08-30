@@ -21,6 +21,8 @@ from factor_service.model_research_repository import (
 )
 from factor_service.research.config import load_settings
 from factor_service.research.dataset import DatasetBuilder, PreparedDataset
+from factor_service.research.errors import JobCanceled
+from factor_service.research.job import CancellationToken
 from factor_service.research.snapshot import DatasetSnapshotStore
 
 
@@ -183,6 +185,15 @@ class DatasetPreviewService:
     def run(self, preview_id: str) -> None:
         try:
             job = self._preview_job(preview_id)
+            cancellation = CancellationToken()
+
+            def progress(stage: str, percent: int, details: dict[str, Any]) -> None:
+                current = self._preview_job(preview_id)
+                if current.get("cancel_requested") is True:
+                    cancellation.cancel("Dataset Preview 已请求取消")
+                cancellation.checkpoint()
+                self._progress(preview_id, stage, percent, details)
+
             settings = load_settings()
             work_dir = Path(settings.work_root) / preview_id
             snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
@@ -197,9 +208,8 @@ class DatasetPreviewService:
                 job,
                 work_dir,
                 builder,
-                progress=lambda stage, percent, details: self._progress(
-                    preview_id, stage, percent, details,
-                ),
+                cancellation=cancellation,
+                progress=progress,
             )
             request_spec = dict(
                 (job.get("config_json") or {}).get("preview") or {}
@@ -246,6 +256,8 @@ class DatasetPreviewService:
                             "sample_rows": int(sample["row_count"]),
                         },
                     )
+        except JobCanceled as exc:
+            self._fail(preview_id, str(exc), canceled=True)
         except Exception as exc:
             self._fail(preview_id, str(exc))
 
@@ -301,26 +313,35 @@ class DatasetPreviewService:
                     payload=progress,
                 )
 
-    def _fail(self, preview_id: str, message: str) -> None:
+    def _fail(
+        self, preview_id: str, message: str, *, canceled: bool = False,
+    ) -> None:
         now = _utcnow()
         with self.database.connection() as conn:
             with conn.transaction():
                 row = conn.execute(
-                    "SELECT job_id FROM model_jobs WHERE job_id = %s AND kind = %s",
+                    """
+                    SELECT job_id, cancel_requested
+                    FROM model_jobs
+                    WHERE job_id = %s AND kind = %s
+                    """,
                     (preview_id, PREVIEW_KIND),
                 ).fetchone()
                 if not row:
                     return
+                was_canceled = canceled or bool(row.get("cancel_requested"))
+                status = "canceled" if was_canceled else "failed"
                 conn.execute(
                     """
                     UPDATE model_jobs
-                    SET status = 'failed', error_message = %s,
+                    SET status = %s, error_message = %s,
                         progress_json = %s, finished_at = %s, updated_at = %s
                     WHERE job_id = %s
                     """,
                     (
-                        str(message)[:4000],
-                        Jsonb({"stage": "failed", "progress": 100}),
+                        status,
+                        "" if was_canceled else str(message)[:4000],
+                        Jsonb({"stage": status, "progress": 100}),
                         now,
                         now,
                         preview_id,
@@ -329,8 +350,8 @@ class DatasetPreviewService:
                 self._event(
                     conn,
                     preview_id,
-                    "preview.failed",
-                    stage="failed",
+                    f"preview.{status}",
+                    stage=status,
                     message=str(message)[:1000],
                 )
 

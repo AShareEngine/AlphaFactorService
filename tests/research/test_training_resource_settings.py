@@ -122,6 +122,32 @@ def test_retired_market_cap_binding_is_removed_from_legacy_settings() -> None:
     ]
 
 
+def test_stock_daily_optional_float_cap_role_upgrades_old_fingerprint() -> None:
+    original = {
+        "enabled": True,
+        "source_type": "node",
+        "source_id": "stock_daily_real",
+        "source_label": "股票日线",
+        "provider_node_id": "stock_daily_real",
+        "field_bindings": {
+            "trade_date": "trade_time",
+            "instrument": "code",
+            "adjusted_close": "close_adj",
+        },
+        "catalog_updated_at": "",
+        "fingerprint": "legacy-fingerprint",
+    }
+
+    settings = normalize_training_resource_settings({
+        "bindings": {STOCK_DAILY_BINDING_ID: original},
+    })
+
+    binding = settings["bindings"][STOCK_DAILY_BINDING_ID]
+    assert binding["field_bindings"]["float_market_cap"] == ""
+    assert len(binding["fingerprint"]) == 64
+    assert binding["fingerprint"] != original["fingerprint"]
+
+
 def test_industry_binding_is_normalized_fingerprinted_and_frozen() -> None:
     settings = normalize_training_resource_settings({
         "bindings": {INDUSTRY_FEATURE_BINDING_ID: _configured_binding()},
