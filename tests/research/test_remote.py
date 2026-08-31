@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
+from factor_service.research import remote as remote_module
 from factor_service.research.config import Settings
+from factor_service.research.job import CancellationToken
 from factor_service.research.remote import (
+    RemoteResearchExecutor,
     RemoteTransport,
     _effective_remote_thread_count,
     _load_remote_result,
@@ -148,6 +153,30 @@ def test_remote_transport_ssh_includes_target_once(
     assert captured[-1] == "printf ok"
 
 
+def test_remote_transport_drains_large_stdout_and_stderr() -> None:
+    transport = object.__new__(RemoteTransport)
+    transport.node = SimpleNamespace(password_env="")
+    size = 1_000_000
+
+    completed = transport._run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                f"sys.stdout.write('o' * {size}); "
+                f"sys.stderr.write('e' * {size})"
+            ),
+        ],
+        timeout=5,
+        cancellation=None,
+    )
+
+    assert completed.returncode == 0
+    assert len(completed.stdout) == size
+    assert len(completed.stderr) == size
+
+
 def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -178,6 +207,83 @@ def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     assert captured[-1] == (
         "root@gpu.example.test:/root/alphablocks-research/dataset.parquet"
     )
+
+
+def test_remote_progress_reads_only_unseen_lines() -> None:
+    payloads = [
+        "\n".join([
+            json.dumps({
+                "stage": "training", "percent": 64, "details": {"step": 1},
+            }),
+            json.dumps({
+                "stage": "training", "percent": 65, "details": {"step": 2},
+            }),
+        ]),
+        json.dumps({
+            "stage": "training", "percent": 66, "details": {"step": 3},
+        }),
+    ]
+
+    class Transport:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def ssh(self, command, *, timeout, cancellation):
+            self.commands.append(command)
+            return subprocess.CompletedProcess([], 0, payloads.pop(0), "")
+
+    executor = object.__new__(RemoteResearchExecutor)
+    executor.transport = Transport()
+    executor.node = SimpleNamespace(node_id="autodl-test")
+    events: list[tuple[str, int, dict]] = []
+
+    def progress(stage, percent, details) -> None:
+        events.append((stage, percent, details))
+
+    seen = executor._forward_progress(
+        "/root/run", 0,
+        cancellation=CancellationToken(), progress=progress,
+    )
+    seen = executor._forward_progress(
+        "/root/run", seen,
+        cancellation=CancellationToken(), progress=progress,
+    )
+
+    assert seen == 3
+    assert "tail -n +1 --" in executor.transport.commands[0]
+    assert "tail -n +3 --" in executor.transport.commands[1]
+    assert [event[2]["step"] for event in events] == [1, 2, 3]
+
+
+def test_remote_poll_recovers_from_one_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(remote_module, "_REMOTE_POLL_RETRY_SECONDS", 0)
+    executor = object.__new__(RemoteResearchExecutor)
+    executor.node = SimpleNamespace(node_id="autodl-test")
+    calls = 0
+    events: list[tuple[str, int, dict]] = []
+
+    def operation() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary SSH timeout")
+        return "recovered"
+
+    result = executor._poll_with_recovery(
+        operation,
+        cancellation=CancellationToken(),
+        progress=lambda stage, percent, details: events.append(
+            (stage, percent, details),
+        ),
+    )
+
+    assert result == "recovered"
+    assert calls == 2
+    assert [event[0] for event in events] == [
+        "remote_poll_degraded", "remote_poll_recovered",
+    ]
 
 
 def test_remote_resource_planner_uses_large_node_without_oversubscription() -> None:

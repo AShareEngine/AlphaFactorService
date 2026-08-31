@@ -41,6 +41,8 @@ _LIFECYCLE_PROVIDERS = {"", "autodl_pro"}
 _REMOTE_MAX_THREADS = 32
 _REMOTE_VALIDATION_SAMPLE_ROWS = 200_000
 _REMOTE_TRAIN_METRIC_SAMPLE_ROWS = 200_000
+_REMOTE_POLL_RECOVERY_SECONDS = 90
+_REMOTE_POLL_RETRY_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -388,15 +390,24 @@ class RemoteTransport:
         )
         deadline = time.monotonic() + max(1, int(timeout))
         try:
-            while process.poll() is None:
+            while True:
                 if cancellation is not None:
                     cancellation.checkpoint()
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     process.terminate()
                     raise TimeoutError(f"远程命令超时: {args[-1][:160]}")
-                time.sleep(0.2)
-            stdout, stderr = process.communicate()
-            return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                try:
+                    # Short communicate calls drain both pipes while preserving
+                    # cancellation checks for long-running SSH and rsync commands.
+                    stdout, stderr = process.communicate(
+                        timeout=min(0.2, remaining),
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+                return subprocess.CompletedProcess(
+                    args, process.returncode, stdout, stderr,
+                )
         except BaseException:
             if process.poll() is None:
                 process.terminate()
@@ -893,19 +904,28 @@ class RemoteResearchExecutor:
                 raise TimeoutError(
                     f"远程训练超过{self.node.max_runtime_minutes}分钟上限",
                 )
-            seen = self._forward_progress(
-                remote_root, seen, cancellation=cancellation, progress=progress,
-            )
-            state = self.transport.ssh(
-                f"if test -f {exit_path}; then printf 'exited '; cat {exit_path}; "
-                f"elif test -f {pid_path} && kill -0 $(cat {pid_path}) 2>/dev/null; "
-                "then printf 'running -1'; else printf 'missing -1'; fi",
-                timeout=30, cancellation=cancellation,
-            )
-            if state.returncode != 0:
-                raise RetryableJobError(
-                    "远程训练状态检查失败: " + state.stderr.strip()[-1000:],
+            def poll_process() -> tuple[int, subprocess.CompletedProcess[str]]:
+                next_seen = self._forward_progress(
+                    remote_root, seen,
+                    cancellation=cancellation, progress=progress,
                 )
+                state = self.transport.ssh(
+                    f"if test -f {exit_path}; then printf 'exited '; cat {exit_path}; "
+                    f"elif test -f {pid_path} && kill -0 $(cat {pid_path}) 2>/dev/null; "
+                    "then printf 'running -1'; else printf 'missing -1'; fi",
+                    timeout=30, cancellation=cancellation,
+                )
+                if state.returncode != 0:
+                    raise RetryableJobError(
+                        "远程训练状态检查失败: " + state.stderr.strip()[-1000:],
+                    )
+                return next_seen, state
+
+            seen, state = self._poll_with_recovery(
+                poll_process,
+                cancellation=cancellation,
+                progress=progress,
+            )
             values = state.stdout.strip().split()
             process_state = values[0] if values else "missing"
             exit_code = values[1] if len(values) > 1 else "-1"
@@ -954,18 +974,27 @@ class RemoteResearchExecutor:
                 raise TimeoutError(
                     f"远程训练超过{self.node.max_runtime_minutes}分钟上限",
                 )
-            seen = self._forward_progress(
-                remote_root, seen, cancellation=cancellation, progress=progress,
-            )
-            inspect = self.transport.ssh(
-                "docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "
-                f"{shlex.quote(container)} 2>/dev/null || printf 'missing -1'",
-                timeout=30, cancellation=cancellation,
-            )
-            if inspect.returncode != 0:
-                raise RetryableJobError(
-                    "远程训练状态检查失败: " + inspect.stderr.strip()[-1000:],
+            def poll_container() -> tuple[int, subprocess.CompletedProcess[str]]:
+                next_seen = self._forward_progress(
+                    remote_root, seen,
+                    cancellation=cancellation, progress=progress,
                 )
+                inspect = self.transport.ssh(
+                    "docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' "
+                    f"{shlex.quote(container)} 2>/dev/null || printf 'missing -1'",
+                    timeout=30, cancellation=cancellation,
+                )
+                if inspect.returncode != 0:
+                    raise RetryableJobError(
+                        "远程训练状态检查失败: " + inspect.stderr.strip()[-1000:],
+                    )
+                return next_seen, inspect
+
+            seen, inspect = self._poll_with_recovery(
+                poll_container,
+                cancellation=cancellation,
+                progress=progress,
+            )
             state = inspect.stdout.strip().split()
             status = state[0] if state else "missing"
             exit_code = state[1] if len(state) > 1 else "-1"
@@ -994,6 +1023,48 @@ class RemoteResearchExecutor:
                 )
             time.sleep(2)
 
+    def _poll_with_recovery(
+        self,
+        operation: Callable[[], Any],
+        *,
+        cancellation: CancellationToken,
+        progress: Callable[[str, int, dict[str, Any]], None],
+    ) -> Any:
+        failure_started_at: float | None = None
+        failure_count = 0
+        while True:
+            cancellation.checkpoint()
+            try:
+                result = operation()
+            except (TimeoutError, RetryableJobError) as exc:
+                now = time.monotonic()
+                failure_started_at = failure_started_at or now
+                failure_count += 1
+                elapsed = now - failure_started_at
+                if elapsed >= _REMOTE_POLL_RECOVERY_SECONDS:
+                    raise RetryableJobError(
+                        "远程训练监控连续失败"
+                        f"{int(elapsed)}秒({failure_count}次): {exc}"
+                    ) from exc
+                progress("remote_poll_degraded", 63, {
+                    "node_id": self.node.node_id,
+                    "failure_count": failure_count,
+                    "recovery_window_seconds": _REMOTE_POLL_RECOVERY_SECONDS,
+                    "error": str(exc)[:500],
+                })
+                time.sleep(_REMOTE_POLL_RETRY_SECONDS)
+                continue
+            if failure_count:
+                progress("remote_poll_recovered", 63, {
+                    "node_id": self.node.node_id,
+                    "failure_count": failure_count,
+                    "degraded_seconds": round(
+                        time.monotonic() - (failure_started_at or time.monotonic()),
+                        3,
+                    ),
+                })
+            return result
+
     def _forward_progress(
         self,
         remote_root: str,
@@ -1002,22 +1073,26 @@ class RemoteResearchExecutor:
         cancellation: CancellationToken,
         progress: Callable[[str, int, dict[str, Any]], None],
     ) -> int:
+        start_line = max(1, int(seen) + 1)
         progress_result = self.transport.ssh(
-            f"cat {shlex.quote(remote_root + '/progress.jsonl')} 2>/dev/null || true",
+            f"tail -n +{start_line} -- "
+            f"{shlex.quote(remote_root + '/progress.jsonl')} 2>/dev/null || true",
             timeout=30, cancellation=cancellation,
         )
         lines = [line for line in progress_result.stdout.splitlines() if line.strip()]
-        for line in lines[seen:]:
+        consumed = 0
+        for line in lines:
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
-                continue
+                break
             progress(
                 f"remote.{item.get('stage') or 'training'}",
                 min(88, max(63, int(item.get("percent") or 0))),
                 {"node_id": self.node.node_id, **dict(item.get("details") or {})},
             )
-        return len(lines)
+            consumed += 1
+        return seen + consumed
 
 
 def _remote_result_is_complete(
