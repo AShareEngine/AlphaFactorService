@@ -7,7 +7,8 @@ from typing import Any, Callable, TypeVar
 
 from psycopg import OperationalError
 
-from factor_service.model_artifacts import ModelArtifactStore
+from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
+from factor_service.model_object_store import ModelObjectStore
 from factor_service.model_research_repository import (
     ModelResearchConflict,
     ModelResearchError,
@@ -34,9 +35,11 @@ class ResearchControl:
         self,
         repository: ModelResearchRepository,
         artifact_store: ModelArtifactStore,
+        model_object_store: ModelObjectStore | None = None,
     ) -> None:
         self.repository = repository
         self.artifact_store = artifact_store
+        self.model_object_store = model_object_store or ModelObjectStore()
 
     def check(self) -> dict[str, Any]:
         self._call(self.repository.list_jobs, limit=1)
@@ -45,13 +48,7 @@ class ResearchControl:
     def download_artifact(
         self, artifact_id: str, destination: Path, expected_sha256: str,
     ) -> Path:
-        artifact = self._call(self.repository.get_artifact, artifact_id)
-        source = self.artifact_store.resolve(str(artifact["relative_path"]))
-        actual = _file_sha256(source)
-        if actual != str(expected_sha256).lower() or actual != str(artifact["sha256"]).lower():
-            raise ResearchControlError(
-                "模型产物SHA256不一致", retryable=False, code="artifact_hash_mismatch",
-            )
+        source = self.resolve_artifact(artifact_id, expected_sha256)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".part")
         try:
@@ -60,6 +57,61 @@ class ResearchControl:
             return destination
         finally:
             temporary.unlink(missing_ok=True)
+
+    def resolve_artifact(
+        self,
+        artifact_id: str,
+        expected_sha256: str = "",
+    ) -> Path:
+        """Resolve a verified local artifact, hydrating it from MinIO when absent."""
+        artifact = self._call(self.repository.get_artifact, artifact_id)
+        recorded = str(artifact["sha256"] or "").strip().lower()
+        expected = str(expected_sha256 or recorded).strip().lower()
+        if expected != recorded:
+            raise ResearchControlError(
+                "模型产物SHA256与模型清单不一致",
+                retryable=False,
+                code="artifact_hash_mismatch",
+            )
+        try:
+            source = self.artifact_store.resolve(str(artifact["relative_path"]))
+        except ArtifactError:
+            source = self._download_object_store_artifact(artifact, recorded)
+        actual = _file_sha256(source)
+        if actual != expected:
+            raise ResearchControlError(
+                "模型产物SHA256不一致", retryable=False, code="artifact_hash_mismatch",
+            )
+        return source
+
+    def _download_object_store_artifact(
+        self,
+        artifact: dict[str, Any],
+        expected_sha256: str,
+    ) -> Path:
+        object_uri = str(artifact.get("object_store_uri") or "").strip()
+        remote_sha256 = str(
+            artifact.get("object_store_sha256") or ""
+        ).strip().lower()
+        if not object_uri or remote_sha256 != expected_sha256:
+            raise ResearchControlError(
+                "本机缺少模型制品，PostgreSQL中也没有可校验的MinIO对象地址",
+                retryable=False,
+                code="artifact_remote_identity_missing",
+            )
+        cache_path = self.artifact_store.object_cache_path(
+            expected_sha256,
+            str(artifact.get("file_name") or "model-artifact.bin"),
+        )
+        if cache_path.is_file() and _file_sha256(cache_path) == expected_sha256:
+            return cache_path
+        return self.model_object_store.download_file(
+            object_uri=object_uri,
+            version_id=str(artifact.get("object_store_version_id") or ""),
+            destination=cache_path,
+            digest=expected_sha256,
+            size_bytes=int(artifact.get("size_bytes") or 0),
+        )
 
     def renew(
         self, job_id: str, lease_token: str, progress: dict[str, Any],
@@ -108,6 +160,9 @@ class ResearchControl:
         digest: str,
         size_bytes: int,
         dataset_hash: str = "",
+        object_store_uri: str = "",
+        object_store_version_id: str = "",
+        object_store_sha256: str = "",
     ) -> dict[str, Any]:
         self._call(self.repository.worker_control, job_id, lease_token=lease_token)
         artifact = self._call(
@@ -119,6 +174,9 @@ class ResearchControl:
             digest=digest,
             size_bytes=size_bytes,
             dataset_hash=dataset_hash,
+            object_store_uri=object_store_uri,
+            object_store_version_id=object_store_version_id,
+            object_store_sha256=object_store_sha256,
         )
         return {"ok": True, "artifact": artifact}
 
@@ -131,6 +189,8 @@ class ResearchControl:
             lease_token=lease_token,
             result=result,
         )
+        if str(job.get("kind") or "train") == "train":
+            job = self._call(self.repository.finalize_training_result, job_id)
         return {"ok": True, "job": job}
 
     def fail(

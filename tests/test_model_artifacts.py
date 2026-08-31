@@ -155,3 +155,69 @@ def test_model_delete_removes_job_artifacts_but_preserves_shared_dataset(tmp_pat
     assert (store.root / "datasets" / dataset_hash / "dataset.parquet").exists()
     assert store.delete_dataset_artifacts(dataset_hash) is True
     assert not (store.root / "datasets" / dataset_hash).exists()
+
+
+def test_dataset_cache_prunes_only_expired_unprotected_snapshots(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    expired_hash = "1" * 64
+    protected_hash = "2" * 64
+    fresh_hash = "3" * 64
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"temporary training dataset")
+    for dataset_hash in (expired_hash, protected_hash, fresh_hash):
+        store.publish_file(
+            job_id="job-cache", artifact_kind="dataset",
+            source_path=source, dataset_hash=dataset_hash,
+        )
+    store.touch_dataset(expired_hash, used_at=100)
+    store.touch_dataset(protected_hash, used_at=100)
+    store.touch_dataset(fresh_hash, used_at=200)
+
+    result = store.prune_dataset_cache(
+        retention_seconds=100,
+        protected_hashes={protected_hash},
+        now=250,
+    )
+
+    assert result["deleted"] == [expired_hash]
+    assert result["protected"] == 1
+    assert result["reclaimed_bytes"] >= len(source.read_bytes())
+    assert not (store.root / "datasets" / expired_hash).exists()
+    assert (store.root / "datasets" / protected_hash).is_dir()
+    assert (store.root / "datasets" / fresh_hash).is_dir()
+
+
+def test_dataset_cache_skips_snapshot_held_by_active_file_lock(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    dataset_hash = "4" * 64
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"in-use dataset")
+    store.publish_file(
+        job_id="job-active", artifact_kind="dataset",
+        source_path=source, dataset_hash=dataset_hash,
+    )
+    store.touch_dataset(dataset_hash, used_at=100)
+
+    with store.dataset_lock(dataset_hash):
+        result = store.prune_dataset_cache(retention_seconds=100, now=250)
+
+    assert result["deleted"] == []
+    assert result["locked"] == 1
+    assert (store.root / "datasets" / dataset_hash).is_dir()
+
+
+def test_resolving_dataset_artifact_refreshes_last_used_marker(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    dataset_hash = "7" * 64
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"diagnostic dataset")
+    published = store.publish_file(
+        job_id="job-diagnostic", artifact_kind="dataset",
+        source_path=source, dataset_hash=dataset_hash,
+    )
+    marker = store.touch_dataset(dataset_hash, used_at=100)
+
+    resolved = store.resolve(str(published["relative_path"]))
+
+    assert resolved.read_bytes() == b"diagnostic dataset"
+    assert marker.stat().st_mtime > 100

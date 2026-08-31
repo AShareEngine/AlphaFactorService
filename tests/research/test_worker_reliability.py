@@ -25,6 +25,7 @@ class _Api:
         self.failed: list[tuple[str, bool]] = []
         self.failure_messages: list[str] = []
         self.completed: list[str] = []
+        self.completed_results: list[dict] = []
         self.artifacts: list[dict] = []
         self.renewals: list[dict] = []
 
@@ -44,6 +45,7 @@ class _Api:
 
     def complete(self, job_id, _lease_token, _result):
         self.completed.append(job_id)
+        self.completed_results.append(dict(_result))
         return {"ok": True}
 
     def fail(self, job_id, _lease_token, _error, retryable=True):
@@ -95,6 +97,77 @@ def test_successful_job_publishes_artifact_locally_then_records_metadata(tmp_pat
     assert registered["file_name"] == "qlib_experiment.tar.gz"
     assert registered["relative_path"].endswith("bundle/qlib_experiment.tar.gz")
     assert worker.artifact_store.resolve(registered["relative_path"]).read_bytes() == b"formal model bundle"
+
+
+def test_worker_cleanup_protects_dataset_reserved_by_active_job(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "work")
+    settings.dataset_cache_retention_hours = 24
+    worker = ResearchWorker(settings)
+    protected_hash = "5" * 64
+    expired_hash = "6" * 64
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"factor training data")
+    for dataset_hash in (protected_hash, expired_hash):
+        worker.artifact_store.publish_file(
+            job_id="job-cleanup", artifact_kind="dataset",
+            source_path=source, dataset_hash=dataset_hash,
+        )
+        worker.artifact_store.touch_dataset(dataset_hash, used_at=100)
+    worker.repository = SimpleNamespace(
+        active_dataset_hashes=lambda: {protected_hash},
+    )
+
+    result = worker._run_dataset_cache_cleanup()
+
+    assert result["deleted"] == [expired_hash]
+    assert result["protected"] == 1
+    assert worker.dataset_cache_last_error == ""
+    assert worker.dataset_cache_last_cleanup_at
+    assert (worker.artifact_store.root / "datasets" / protected_hash).is_dir()
+
+
+def test_successful_job_archives_final_model_before_registering_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "qlib_experiment.tar.gz"
+    predictions = tmp_path / "predictions.parquet"
+    artifact.write_bytes(b"formal model bundle")
+    predictions.write_bytes(b"")
+    worker = ResearchWorker(_settings(tmp_path / "work"))
+    api = _Api()
+    worker.control = api
+    worker.trainer = _SuccessfulTrainer(artifact, predictions)
+
+    class _ObjectStore:
+        config = SimpleNamespace(bucket="alphablocks-models")
+        calls: list[dict] = []
+
+        @staticmethod
+        def enabled_for(kind):
+            return kind == "bundle"
+
+        def publish_file(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            return {
+                "object_uri": "s3://alphablocks-models/models/test_model/bundle.tgz",
+                "version_id": "minio-version-1",
+                "sha256": kwargs["digest"],
+            }
+
+        @staticmethod
+        def public_config():
+            return {"provider": "s3", "bucket": "alphablocks-models"}
+
+    object_store = _ObjectStore()
+    worker.model_object_store = object_store
+
+    worker._run_job(valid_job())
+
+    assert api.completed == ["model_job_test"]
+    assert len(object_store.calls) == 1
+    assert object_store.calls[0]["model_version"] == 1
+    assert api.artifacts[0]["object_store_uri"].startswith("s3://alphablocks-models/")
+    assert api.artifacts[0]["object_store_version_id"] == "minio-version-1"
+    assert api.artifacts[0]["object_store_sha256"] == object_store.calls[0]["digest"]
+    assert api.completed_results[0]["object_storage"]["bucket"] == "alphablocks-models"
 
 
 def test_retry_attempt_creates_fresh_work_directory(tmp_path: Path) -> None:

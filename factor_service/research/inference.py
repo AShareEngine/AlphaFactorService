@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
 import pickle
@@ -25,6 +26,7 @@ from factor_service.research.preprocessing import (
     normalize_feature_preprocessing,
     preprocess_feature_panel,
 )
+from factor_service.research.rolling import effective_rolling_window
 from factor_service.research.size_rotation_feature import (
     normalize_size_rotation_feature,
     size_rotation_feature_names,
@@ -74,7 +76,13 @@ class DailyInferenceRunner:
             str(source["artifact_sha256"]),
         )
         _checkpoint(cancellation)
-        model, training_manifest = _load_bundle(bundle_path)
+        root_model, training_manifest = _load_bundle(bundle_path)
+        model, training_manifest, rolling_model = _load_model_for_trade_date(
+            bundle_path,
+            root_model,
+            training_manifest,
+            trade_date,
+        )
         try:
             data_bindings = normalize_frozen_training_data_bindings(
                 training_manifest.get("data_bindings"), allow_empty=True,
@@ -451,6 +459,10 @@ class DailyInferenceRunner:
             "historical index membership",
             "causal per-instrument history ending at signal date",
         ]
+        if rolling_model is not None:
+            future_function_guards.append(
+                "exact-date immutable rolling window model selected before inference"
+            )
         if preprocessing["enabled"]:
             future_function_guards.append(
                 "training-identical same-date cross-sectional median, 1/99 winsorization and z-score"
@@ -476,6 +488,7 @@ class DailyInferenceRunner:
             "prediction_scope": prediction_scope,
             "dataset_hash": job["dataset_hash"],
             "training_job_id": source["training_job_id"],
+            "rolling_model": rolling_model,
             "trade_date": trade_date,
             "feature_date_start": feature_date_start,
             "lookback_window": lookback_window,
@@ -605,6 +618,97 @@ def _load_bundle(path: Path) -> tuple[Any, dict[str, Any]]:
     if not isinstance(manifest, dict):
         raise PermanentJobError("训练manifest必须是JSON对象")
     return model, manifest
+
+
+def _load_model_for_trade_date(
+    path: Path,
+    root_model: Any,
+    root_manifest: dict[str, Any],
+    trade_date: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any] | None]:
+    """Load the immutable window model whose OOS interval contains trade_date."""
+
+    try:
+        selected = effective_rolling_window(
+            root_manifest.get("walk_forward"), trade_date,
+        )
+    except ValueError as exc:
+        raise PermanentJobError(str(exc)) from exc
+    if selected is None:
+        return root_model, root_manifest, None
+
+    artifact = dict(selected.get("artifact") or {})
+    relative_root = str(artifact.get("path") or "").strip("/")
+    if not relative_root.startswith("walk_forward/window_"):
+        raise PermanentJobError("滚动模型窗口产物路径无效")
+    model_member = f"{relative_root}/model.pkl"
+    manifest_member = f"{relative_root}/manifest.json"
+    payloads: dict[str, bytes] = {}
+    with tarfile.open(path, "r:gz") as archive:
+        for member_name in (model_member, manifest_member):
+            try:
+                member = archive.getmember(member_name)
+            except KeyError as exc:
+                raise PermanentJobError(
+                    f"训练Bundle缺少滚动窗口产物{member_name}"
+                ) from exc
+            if (
+                not member.isfile()
+                or member.size <= 0
+                or member.size > 256 * 1024 * 1024
+            ):
+                raise PermanentJobError(f"滚动窗口产物{member_name}无效")
+            source = archive.extractfile(member)
+            if source is None:
+                raise PermanentJobError(f"滚动窗口产物{member_name}不可读")
+            payloads[member_name] = source.read()
+    try:
+        window_manifest = json.loads(payloads[manifest_member].decode("utf-8"))
+        model = pickle.loads(payloads[model_member])
+    except Exception as exc:
+        raise PermanentJobError(f"滚动窗口模型解析失败: {exc}") from exc
+    if not isinstance(window_manifest, dict):
+        raise PermanentJobError("滚动窗口manifest必须是JSON对象")
+
+    expected_model_sha256 = str(
+        window_manifest.get("model_sha256")
+        or artifact.get("model_sha256")
+        or ""
+    ).lower()
+    actual_model_sha256 = sha256(payloads[model_member]).hexdigest()
+    if expected_model_sha256 != actual_model_sha256:
+        raise PermanentJobError("滚动窗口模型SHA256与序列合同不一致")
+    if (
+        str(window_manifest.get("series_id") or "")
+        != str(root_manifest.get("model_id") or "")
+        or int(window_manifest.get("series_revision") or 0)
+        != int(root_manifest.get("model_version") or 0)
+    ):
+        raise PermanentJobError("滚动窗口模型身份与根manifest不一致")
+    if (
+        str(window_manifest.get("effective_date_start") or "")[:10]
+        != str(selected.get("effective_date_start") or "")[:10]
+        or str(window_manifest.get("effective_date_end") or "")[:10]
+        != str(selected.get("effective_date_end") or "")[:10]
+    ):
+        raise PermanentJobError("滚动窗口生效区间与序列合同不一致")
+
+    merged_manifest = dict(root_manifest)
+    merged_manifest["medians"] = dict(
+        window_manifest.get("train_medians") or {}
+    )
+    merged_manifest["active_rolling_window"] = window_manifest
+    routing = {
+        "series_id": str(window_manifest["series_id"]),
+        "series_revision": int(window_manifest["series_revision"]),
+        "window": int(window_manifest["window"]),
+        "effective_date_start": str(window_manifest["effective_date_start"]),
+        "effective_date_end": str(window_manifest["effective_date_end"]),
+        "qlib_recorder_id": str(window_manifest.get("qlib_recorder_id") or ""),
+        "model_sha256": actual_model_sha256,
+        "routing_policy": "exact_effective_date_interval",
+    }
+    return model, merged_manifest, routing
 
 
 def _checkpoint(cancellation: CancellationToken | None) -> None:

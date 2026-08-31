@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
+import shutil
+import time
 from typing import Any
 
 import pandas as pd
@@ -44,71 +46,78 @@ class DatasetSnapshotStore:
         manifest_path = canonical_dir / "dataset_manifest.json"
         _checkpoint(cancellation)
         _progress(progress, "checking_dataset_snapshot", 4, {"dataset_hash": dataset_hash})
-        if manifest_path.is_file():
-            prepared = self._load(
-                dataset_hash, dataset_path, raw_dataset_path, manifest_path,
-            )
-            _progress(progress, "dataset_ready", 56, {
+        with self.artifacts.dataset_lock(dataset_hash):
+            if manifest_path.is_file():
+                prepared = self._load(
+                    dataset_hash, dataset_path, raw_dataset_path, manifest_path,
+                )
+                self.artifacts.touch_dataset(dataset_hash)
+                _progress(progress, "dataset_ready", 56, {
+                    "dataset_hash": dataset_hash,
+                    "row_count": len(prepared.frame),
+                    "feature_count": len(prepared.feature_names),
+                    "snapshot_reused": True,
+                })
+                return DatasetSnapshot(
+                    prepared, dataset_path, raw_dataset_path, manifest_path, True,
+                )
+
+            if builder is None:
+                raise ValueError("冻结数据集快照不存在，且当前执行器不能访问源数据")
+
+            _progress(progress, "materializing_dataset", 5, {"dataset_hash": dataset_hash})
+            prepared = builder.build(job, cancellation=cancellation, progress=progress)
+            _checkpoint(cancellation)
+            staging_dir = work_dir / "dataset_staging"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_dataset = staging_dir / "dataset.parquet"
+            staged_raw = staging_dir / "dataset_raw.parquet"
+            staged_manifest = staging_dir / "dataset_manifest.json"
+            prepared.frame.to_parquet(staged_dataset)
+            raw_frame = prepared.raw_frame if prepared.raw_frame is not None else prepared.frame
+            raw_frame.to_parquet(staged_raw)
+            # Parquet canonicalizes semantically equivalent NaN payloads. Fingerprint
+            # the persisted representation so a valid round trip remains verifiable.
+            persisted_frame = pd.read_parquet(staged_dataset)
+            persisted_raw_frame = pd.read_parquet(staged_raw)
+            snapshot_manifest = {
+                **prepared.manifest,
+                "schema_version": "alphablocks.qlib-dataset-snapshot.v1",
                 "dataset_hash": dataset_hash,
-                "row_count": len(prepared.frame),
-                "feature_count": len(prepared.feature_names),
-                "snapshot_reused": True,
-            })
-            return DatasetSnapshot(
-                prepared, dataset_path, raw_dataset_path, manifest_path, True,
+                "dataset_spec_hash": dataset_hash,
+                "content_fingerprint": _frame_fingerprint(persisted_frame),
+                "raw_content_fingerprint": _frame_fingerprint(persisted_raw_frame),
+                "files": {
+                    "dataset.parquet": {"sha256": _file_sha256(staged_dataset)},
+                    "dataset_raw.parquet": {"sha256": _file_sha256(staged_raw)},
+                },
+            }
+            staged_manifest.write_text(
+                json.dumps(snapshot_manifest, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
             )
-
-        if builder is None:
-            raise ValueError("冻结数据集快照不存在，且当前执行器不能访问源数据")
-
-        _progress(progress, "materializing_dataset", 5, {"dataset_hash": dataset_hash})
-        prepared = builder.build(job, cancellation=cancellation, progress=progress)
-        _checkpoint(cancellation)
-        staging_dir = work_dir / "dataset_staging"
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        staged_dataset = staging_dir / "dataset.parquet"
-        staged_raw = staging_dir / "dataset_raw.parquet"
-        staged_manifest = staging_dir / "dataset_manifest.json"
-        prepared.frame.to_parquet(staged_dataset)
-        raw_frame = prepared.raw_frame if prepared.raw_frame is not None else prepared.frame
-        raw_frame.to_parquet(staged_raw)
-        # Parquet canonicalizes semantically equivalent NaN payloads. Fingerprint
-        # the persisted representation so a valid round trip remains verifiable.
-        persisted_frame = pd.read_parquet(staged_dataset)
-        persisted_raw_frame = pd.read_parquet(staged_raw)
-        snapshot_manifest = {
-            **prepared.manifest,
-            "schema_version": "alphablocks.qlib-dataset-snapshot.v1",
-            "dataset_hash": dataset_hash,
-            "dataset_spec_hash": dataset_hash,
-            "content_fingerprint": _frame_fingerprint(persisted_frame),
-            "raw_content_fingerprint": _frame_fingerprint(persisted_raw_frame),
-            "files": {
-                "dataset.parquet": {"sha256": _file_sha256(staged_dataset)},
-                "dataset_raw.parquet": {"sha256": _file_sha256(staged_raw)},
-            },
-        }
-        staged_manifest.write_text(
-            json.dumps(snapshot_manifest, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        _checkpoint(cancellation)
-        _progress(progress, "publishing_dataset_snapshot", 55, {"dataset_hash": dataset_hash})
-        for kind, path in (
-            ("dataset", staged_dataset),
-            ("dataset_raw", staged_raw),
-            ("dataset_manifest", staged_manifest),
-        ):
-            self.artifacts.publish_file(
-                job_id=str(job["job_id"]),
-                artifact_kind=kind,
-                source_path=path,
-                dataset_hash=dataset_hash,
-            )
-        # Reloading from canonical files is intentional: DatasetH must consume the
-        # immutable artifact, never the in-memory frame used to create it.
-        loaded = self._load(dataset_hash, dataset_path, raw_dataset_path, manifest_path)
-        return DatasetSnapshot(loaded, dataset_path, raw_dataset_path, manifest_path, False)
+            _checkpoint(cancellation)
+            _progress(progress, "publishing_dataset_snapshot", 55, {"dataset_hash": dataset_hash})
+            for kind, path in (
+                ("dataset", staged_dataset),
+                ("dataset_raw", staged_raw),
+                ("dataset_manifest", staged_manifest),
+            ):
+                self.artifacts.publish_file(
+                    job_id=str(job["job_id"]),
+                    artifact_kind=kind,
+                    source_path=path,
+                    dataset_hash=dataset_hash,
+                )
+            # Reloading from canonical files is intentional: DatasetH must consume the
+            # immutable artifact, never the in-memory frame used to create it.
+            loaded = self._load(dataset_hash, dataset_path, raw_dataset_path, manifest_path)
+            self.artifacts.touch_dataset(dataset_hash)
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError:
+                pass
+            return DatasetSnapshot(loaded, dataset_path, raw_dataset_path, manifest_path, False)
 
     @staticmethod
     def _load(
@@ -173,4 +182,53 @@ def _progress(
         callback(stage, percent, details)
 
 
-__all__ = ["DatasetSnapshot", "DatasetSnapshotStore"]
+def prune_stale_dataset_staging(
+    work_root: str | Path,
+    *,
+    retention_seconds: float = 24 * 60 * 60,
+    now: float | None = None,
+) -> dict[str, object]:
+    """Remove interrupted dataset staging copies after their recovery window."""
+
+    retention = float(retention_seconds)
+    if retention <= 0:
+        raise ValueError("训练数据暂存保留时间必须大于0")
+    root = Path(work_root).resolve()
+    result: dict[str, object] = {
+        "scanned": 0,
+        "deleted": 0,
+        "reclaimed_bytes": 0,
+    }
+    if not root.is_dir():
+        return result
+    cutoff = (time.time() if now is None else float(now)) - retention
+    for directory in sorted(root.rglob("dataset_staging")):
+        resolved = directory.resolve()
+        if (
+            directory.is_symlink()
+            or not directory.is_dir()
+            or directory.name != "dataset_staging"
+            or root not in resolved.parents
+        ):
+            continue
+        result["scanned"] = int(result["scanned"]) + 1
+        timestamps = [directory.stat().st_mtime]
+        timestamps.extend(
+            path.stat().st_mtime for path in directory.rglob("*") if path.is_file()
+        )
+        if max(timestamps) > cutoff:
+            continue
+        size_bytes = sum(
+            path.stat().st_size for path in directory.rglob("*") if path.is_file()
+        )
+        shutil.rmtree(directory)
+        result["deleted"] = int(result["deleted"]) + 1
+        result["reclaimed_bytes"] = int(result["reclaimed_bytes"]) + size_bytes
+    return result
+
+
+__all__ = [
+    "DatasetSnapshot",
+    "DatasetSnapshotStore",
+    "prune_stale_dataset_staging",
+]

@@ -813,9 +813,11 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
         import pandas as pd
         import qlib
         from qlib.data.dataset import DataHandlerLP, DatasetH
-        from qlib.workflow import R
         from factor_service.research.dataset import PreparedDataset
-        from factor_service.research.trainer import _run_walk_forward
+        from factor_service.research.trainer import (
+            _prepare_recorder_experiment,
+            _run_walk_forward,
+        )
 
         root = Path(tempfile.mkdtemp())
         os.chdir(root)
@@ -837,31 +839,37 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
         provider = root / "provider"
         provider.mkdir()
         qlib.init(provider_uri=str(provider), expression_cache=None, dataset_cache=None)
-        with R.start(
-            experiment_name="walk_forward_test", recorder_name="smoke",
-            uri=f"sqlite:///{(root / 'mlflow.db').as_posix()}",
-        ):
-            prediction, report = _run_walk_forward(
-                prepared,
-                {
-                    "enabled": True, "strategy": "rolling", "train_sessions": 252,
-                    "valid_sessions": 21, "test_sessions": 21, "step_sessions": 21,
-                    "embargo_sessions": 5,
-                    "oos_date_start": dates[300].date().isoformat(),
-                    "oos_date_end": dates[320].date().isoformat(),
-                },
-                work_dir=root, model_id="walk_forward_test", model_version=1,
-                model_kind="lightgbm",
-                raw_params={"n_estimators": 2, "early_stopping_rounds": 1, "num_threads": 1},
-                DataHandlerLP=DataHandlerLP, DatasetH=DatasetH,
-                cancellation=None, progress=None,
-            )
+        recorder_uri = f"sqlite:///{(root / 'mlflow.db').as_posix()}"
+        _prepare_recorder_experiment(
+            recorder_uri, "walk_forward_test", root / "mlruns",
+        )
+        result = _run_walk_forward(
+            prepared,
+            {
+                "enabled": True, "strategy": "rolling", "train_sessions": 252,
+                "valid_sessions": 21, "test_sessions": 21, "step_sessions": 21,
+                "embargo_sessions": 5,
+                "oos_date_start": dates[300].date().isoformat(),
+                "oos_date_end": dates[320].date().isoformat(),
+            },
+            work_dir=root, model_id="walk_forward_test", model_version=1,
+            model_kind="lightgbm",
+            raw_params={"n_estimators": 2, "early_stopping_rounds": 1, "num_threads": 1},
+            DataHandlerLP=DataHandlerLP, DatasetH=DatasetH,
+            recorder_uri=recorder_uri, experiment_name="walk_forward_test",
+            cancellation=None, progress=None,
+        )
+        prediction = result.prediction
+        report = result.report
         assert len(prediction) == 84
         assert not prediction.index.duplicated().any()
         assert report["window_count"] == 1
         assert report["aggregate"]["test_days"] == 21
         assert report["stability"]["status"] == "insufficient_windows"
         assert report["stability"]["passed"] is False
+        assert report["orchestration"]["task_generator"].endswith("RollingGen")
+        assert report["orchestration"]["trainer"].endswith("TrainerR")
+        assert report["windows"][0]["qlib_recorder_id"]
     """
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

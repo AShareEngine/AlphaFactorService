@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from factor_service.model_artifacts import ModelArtifactStore
+from factor_service.model_object_store import ModelObjectStore
 from factor_service.model_research_repository import ModelResearchRepository
 from factor_service.research.control import ResearchControl
 from factor_service.research.config import load_settings
@@ -28,6 +29,7 @@ def main() -> None:
             ResearchControl(
                 ModelResearchRepository(),
                 ModelArtifactStore(settings.model_artifacts_root),
+                ModelObjectStore(settings.model_object_store),
             ),
         ).run(job, args.work_dir)
     else:

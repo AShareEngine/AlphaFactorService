@@ -147,15 +147,41 @@ research:
   storage:
     work_root: /Volumes/QuantData/alphafactor/research-work
     model_artifacts_root: /Volumes/QuantData/alphafactor/model-artifacts
+    dataset_cache_retention_hours: 24
+    dataset_cache_cleanup_interval_seconds: 3600
 ```
 
 每日推理计划由同一个AlphaFactorService进程按`research.scheduler.refresh_seconds`检查，
 不需要AlphaBlocks再运行独立的模型推理调度进程。
 
 `research.storage.work_root`只保存训练暂存文件、预测Parquet、MLflow记录、日志和任务状态；
+`research.storage.model_artifacts_root`保存FactorService本地正式制品。可选的
+`research.storage.object_store`会在本地SHA256校验完成后，把`bundle`和
+`walk_forward_series`自动归档到S3兼容对象存储。只有远端上传及二次校验成功后，训练任务
+才会进入成功状态；对象URI、Bucket版本号和SHA256会随模型制品登记到PostgreSQL。成功的
+普通训练会直接登记为不可变`candidate`模型版本，不再等待用户确认；参数实验只自动登记验证集
+入选trial。模型验证、默认版本、自动推理和交易发布仍分别受原有门槛控制。
+
+推理机器优先读取`model_artifacts_root`中的本地正式制品；本机缺失时会使用PostgreSQL登记的
+对象URI和版本号从MinIO下载到`.object-cache/{sha256}`，并校验登记大小、远端元数据SHA256和
+下载内容SHA256。多台FactorService只需配置同一个控制库、MinIO endpoint、Bucket和读取凭据，
+不需要挂载训练主机的本地模型目录。
+
+对象存储凭据放在Git忽略的文件中，例如：
+
+```dotenv
+MINIO_APP_ACCESS_KEY=service-account
+MINIO_APP_SECRET_KEY=replace-me
+S3_ENDPOINT=http://10.126.126.5:9000
+S3_BUCKET=alphablocks-models
+S3_REGION=us-east-1
+```
 `research.storage.model_artifacts_root`保存经过SHA256校验并原子发布的正式模型产物，以及
-`datasets/{dataset_hash}`下不可变的训练Parquet快照。Qlib训练只读取正式快照，不读取暂存文件。
-两者都由AlphaFactorService管理。相对路径从项目根目录解析；需要
+`datasets/{dataset_hash}`下按内容寻址的训练Parquet缓存。Qlib训练只读取已校验快照，不读取暂存文件。
+数据集成功生成或复用时会刷新最后使用时间；默认连续24小时未被使用后由后台任务删除，排队中和
+执行中的任务会保护其数据集不被清理。下次训练仍按PostgreSQL中的冻结Dataset Spec和相同Hash重新
+生成。成功发布后的`dataset_staging`重复副本会立即删除；异常中断遗留的暂存副本也会在24小时后清理。
+模型Bundle继续自动归档到对象存储，不受数据集缓存清理影响。相对路径从项目根目录解析；需要
 放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 
 AlphaBlocks只配置`external_services.factor_service.base_url`。没有单独的研究服务地址或端口。

@@ -15,6 +15,7 @@ from typing import Any
 
 from factor_service.research import __version__
 from factor_service.model_artifacts import ModelArtifactStore
+from factor_service.model_object_store import ModelObjectStore, ModelObjectStoreConfig
 from factor_service.model_research_repository import ModelResearchRepository
 from factor_service.research.control import ResearchControl, ResearchControlError
 from factor_service.research.config import Settings
@@ -27,6 +28,7 @@ from factor_service.research.job import (
     validate_job,
 )
 from factor_service.research.state import JobStateStore
+from factor_service.research.snapshot import prune_stale_dataset_staging
 from factor_service.research.trainer import QlibTrainer, TrainingResult
 
 
@@ -57,6 +59,7 @@ PERSISTED_PROGRESS_STAGES = frozenset({
     "remote_powering_off",
     "remote_power_off_failed",
     "remote_kept_alive",
+    "uploading_model_archive",
 })
 
 
@@ -67,8 +70,15 @@ class ResearchWorker:
         if not self.settings.work_root.is_dir():
             raise ValueError(f"研究存储根目录无效: {self.settings.work_root}")
         self.artifact_store = ModelArtifactStore(self.settings.model_artifacts_root)
+        self.model_object_store = ModelObjectStore(
+            getattr(self.settings, "model_object_store", ModelObjectStoreConfig()),
+        )
         self.repository = ModelResearchRepository()
-        self.control = ResearchControl(self.repository, self.artifact_store)
+        self.control = ResearchControl(
+            self.repository,
+            self.artifact_store,
+            self.model_object_store,
+        )
         self.trainer: QlibTrainer | None = None
         self.inference_runner: DailyInferenceRunner | None = None
         self.state_store = JobStateStore(settings.work_root)
@@ -82,6 +92,9 @@ class ResearchWorker:
         self.scheduler_last_error = ""
         self.scheduler_last_tick_at = ""
         self.scheduler_last_result: dict[str, Any] = {}
+        self.dataset_cache_last_error = ""
+        self.dataset_cache_last_cleanup_at = ""
+        self.dataset_cache_last_result: dict[str, Any] = {}
         self.current_progress: dict[str, Any] = {}
         self.started_at = datetime.now(timezone.utc).isoformat()
         self._shutdown_event = threading.Event()
@@ -90,6 +103,8 @@ class ResearchWorker:
         self._recovery_thread: threading.Thread | None = None
         self._scheduler_thread: threading.Thread | None = None
         self._experiment_queue_thread: threading.Thread | None = None
+        self._registration_recovery_thread: threading.Thread | None = None
+        self._dataset_cache_cleanup_thread: threading.Thread | None = None
         self._active_cancellation: CancellationToken | None = None
 
     def capabilities(self) -> dict[str, object]:
@@ -129,6 +144,18 @@ class ResearchWorker:
         if self.stopping:
             raise RuntimeError("研究调度器已经关闭")
         self._start_recovery_if_needed()
+        self._registration_recovery_thread = threading.Thread(
+            target=self._registration_recovery_loop,
+            name="model-registration-recovery",
+            daemon=True,
+        )
+        self._registration_recovery_thread.start()
+        self._dataset_cache_cleanup_thread = threading.Thread(
+            target=self._dataset_cache_cleanup_loop,
+            name="dataset-cache-cleanup",
+            daemon=True,
+        )
+        self._dataset_cache_cleanup_thread.start()
         if bool(getattr(self.settings, "scheduler_enabled", True)):
             self._scheduler_thread = threading.Thread(
                 target=self._schedule_loop,
@@ -168,6 +195,12 @@ class ResearchWorker:
         experiment_thread = self._experiment_queue_thread
         if experiment_thread is not None and experiment_thread.is_alive():
             experiment_thread.join(timeout=6)
+        registration_thread = self._registration_recovery_thread
+        if registration_thread is not None and registration_thread.is_alive():
+            registration_thread.join(timeout=6)
+        dataset_cleanup_thread = self._dataset_cache_cleanup_thread
+        if dataset_cleanup_thread is not None and dataset_cleanup_thread.is_alive():
+            dataset_cleanup_thread.join(timeout=6)
 
     def submit(self, payload: dict[str, Any]) -> dict[str, object]:
         """Validate and accept one centrally leased job without blocking HTTP."""
@@ -254,6 +287,14 @@ class ResearchWorker:
                     "last_error": self.scheduler_last_error,
                     "last_result": dict(self.scheduler_last_result),
                 },
+                "dataset_cache": {
+                    "retention_hours": float(getattr(
+                        self.settings, "dataset_cache_retention_hours", 24.0,
+                    )),
+                    "last_cleanup_at": self.dataset_cache_last_cleanup_at,
+                    "last_error": self.dataset_cache_last_error,
+                    "last_result": dict(self.dataset_cache_last_result),
+                },
                 "progress": dict(self.current_progress),
                 "started_at": self.started_at,
                 "capabilities": self.capabilities(),
@@ -284,6 +325,67 @@ class ResearchWorker:
                         pass
                 print(f"研究实验队列暂不可用: {exc}", file=sys.stderr, flush=True)
                 self._shutdown_event.wait(2.0)
+
+    def _registration_recovery_loop(self) -> None:
+        """Retry only results explicitly marked for automatic candidate registration."""
+        while not self._shutdown_event.is_set():
+            try:
+                result = self.repository.reconcile_pending_training_results(limit=100)
+                if int(result.get("finalized") or 0) > 0:
+                    print(
+                        "自动候选模型入库恢复: "
+                        + json.dumps(result, ensure_ascii=False),
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"自动候选模型入库恢复暂不可用: {exc}", file=sys.stderr, flush=True)
+            self._shutdown_event.wait(30.0)
+
+    def _dataset_cache_cleanup_loop(self) -> None:
+        interval = max(
+            60.0,
+            float(getattr(
+                self.settings, "dataset_cache_cleanup_interval_seconds", 3600.0,
+            )),
+        )
+        while not self._shutdown_event.is_set():
+            try:
+                self._run_dataset_cache_cleanup()
+            except Exception as exc:
+                with self._state_lock:
+                    self.dataset_cache_last_cleanup_at = datetime.now(
+                        timezone.utc,
+                    ).isoformat()
+                    self.dataset_cache_last_error = str(exc)
+                print(f"训练数据集缓存清理暂不可用: {exc}", file=sys.stderr, flush=True)
+            self._shutdown_event.wait(interval)
+
+    def _run_dataset_cache_cleanup(self) -> dict[str, Any]:
+        retention_hours = float(getattr(
+            self.settings, "dataset_cache_retention_hours", 24.0,
+        ))
+        protected_hashes = self.repository.active_dataset_hashes()
+        result = self.artifact_store.prune_dataset_cache(
+            retention_seconds=retention_hours * 60 * 60,
+            protected_hashes=protected_hashes,
+        )
+        result["staging"] = prune_stale_dataset_staging(
+            self.settings.work_root,
+            retention_seconds=retention_hours * 60 * 60,
+        )
+        with self._state_lock:
+            self.dataset_cache_last_cleanup_at = datetime.now(
+                timezone.utc,
+            ).isoformat()
+            self.dataset_cache_last_error = ""
+            self.dataset_cache_last_result = dict(result)
+        if result.get("deleted"):
+            print(
+                "已清理超过保留期的训练数据集缓存: "
+                + json.dumps(result, ensure_ascii=False),
+                flush=True,
+            )
+        return result
 
     def _schedule_loop(self) -> None:
         from factor_service.research.schedule import run_inference_schedule_tick
@@ -387,6 +489,7 @@ class ResearchWorker:
                 "artifact_count": len(trained.artifacts),
             })
             artifact_count = max(1, len(trained.artifacts))
+            remote_artifacts: list[dict[str, object]] = []
             for artifact_index, (kind, path) in enumerate(trained.artifacts):
                 cancellation.checkpoint()
                 saved = self.artifact_store.publish_file(
@@ -395,6 +498,30 @@ class ResearchWorker:
                     source_path=path,
                     dataset_hash=str(job.get("dataset_hash") or ""),
                 )
+                remote = None
+                if self.model_object_store.enabled_for(kind):
+                    self._report_progress(
+                        job,
+                        cancellation,
+                        "uploading_model_archive",
+                        min(96, 90 + int(6 * artifact_index / artifact_count)),
+                        {"artifact": kind, "bucket": self.model_object_store.config.bucket},
+                    )
+                    remote = self.model_object_store.publish_file(
+                        job_id=job_id,
+                        model_id=str(job["model_id"]),
+                        model_version=int(
+                            job.get("model_version")
+                            or (job.get("config_json") or {}).get("planned_model_version")
+                            or 0
+                        ),
+                        artifact_kind=kind,
+                        source_path=saved["path"],
+                        digest=str(saved["sha256"]),
+                        size_bytes=int(saved["size_bytes"]),
+                    )
+                    if remote is not None:
+                        remote_artifacts.append(dict(remote))
                 self.control.record_artifact(
                     job_id,
                     lease_token,
@@ -404,6 +531,9 @@ class ResearchWorker:
                     digest=str(saved["sha256"]),
                     size_bytes=int(saved["size_bytes"]),
                     dataset_hash=str(job.get("dataset_hash") or ""),
+                    object_store_uri=str((remote or {}).get("object_uri") or ""),
+                    object_store_version_id=str((remote or {}).get("version_id") or ""),
+                    object_store_sha256=str((remote or {}).get("sha256") or ""),
                 )
                 self._report_progress(
                     job,
@@ -416,6 +546,11 @@ class ResearchWorker:
                         "artifact_count": artifact_count,
                     },
                 )
+            if remote_artifacts:
+                trained.result["object_storage"] = {
+                    **self.model_object_store.public_config(),
+                    "artifacts": remote_artifacts,
+                }
             self._report_progress(job, cancellation, "publishing_predictions", 97, {})
             publisher = self.trainer or QlibTrainer(self.settings)
             inserted = publisher.publish_predictions(

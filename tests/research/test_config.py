@@ -24,6 +24,8 @@ def _runtime(
             "storage": {
                 "work_root": work_root,
                 "model_artifacts_root": model_artifacts_root,
+                "dataset_cache_retention_hours": 24,
+                "dataset_cache_cleanup_interval_seconds": 1800,
             },
         },
     }
@@ -43,6 +45,8 @@ def test_research_settings_are_loaded_from_runtime_yaml(monkeypatch) -> None:
     assert settings.source_database == "market_source"
     assert settings.scheduler_enabled is True
     assert settings.scheduler_refresh_seconds == 45
+    assert settings.dataset_cache_retention_hours == 24
+    assert settings.dataset_cache_cleanup_interval_seconds == 1800
 
 
 def test_relative_storage_root_is_resolved_from_project_root(monkeypatch, tmp_path) -> None:
@@ -83,3 +87,33 @@ def test_formal_model_artifact_root_is_independent_from_work_root(monkeypatch, t
 
     assert settings.model_artifacts_root == artifact_root.resolve()
     assert settings.model_artifacts_root != settings.work_root
+
+
+def test_model_object_store_loads_credentials_from_protected_file(monkeypatch, tmp_path) -> None:
+    credentials = tmp_path / "minio.env"
+    credentials.write_text(
+        "MINIO_APP_ACCESS_KEY=app-user\n"
+        "MINIO_APP_SECRET_KEY=app-secret\n"
+        "S3_ENDPOINT=http://10.126.126.5:9000\n"
+        "S3_BUCKET=alphablocks-models\n"
+        "S3_REGION=us-east-1\n",
+        encoding="utf-8",
+    )
+    runtime = _runtime()
+    runtime["research"]["storage"]["object_store"] = {
+        "enabled": True,
+        "credentials_file": str(credentials),
+        "prefix": "final-models",
+        "artifact_kinds": ["bundle"],
+    }
+    monkeypatch.setattr(config, "load_runtime_config", lambda: runtime)
+
+    settings = config.load_settings()
+
+    assert settings.model_object_store.enabled is True
+    assert settings.model_object_store.endpoint_url == "http://10.126.126.5:9000"
+    assert settings.model_object_store.bucket == "alphablocks-models"
+    assert settings.model_object_store.access_key == "app-user"
+    assert settings.model_object_store.secret_key == "app-secret"
+    assert settings.model_object_store.prefix == "final-models"
+    assert settings.model_object_store.artifact_kinds == ("bundle",)

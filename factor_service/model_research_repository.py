@@ -33,6 +33,7 @@ from factor_service.research.preprocessing import (
     LEGACY_DATASET_PIPELINE_VERSIONS,
     normalize_feature_preprocessing,
 )
+from factor_service.research.rolling import effective_rolling_window
 from factor_service.research.sample_filter_formula import (
     normalize_custom_sample_filters,
 )
@@ -1389,6 +1390,13 @@ class ModelResearchRepository:
         """Create one idempotent daily inference job for a registered model."""
         model = self.get_model(model_id, version)
         trade_date = _iso_date(payload.get("trade_date"), "trade_date")
+        try:
+            effective_rolling_window(
+                (model.get("manifest_json") or {}).get("walk_forward"),
+                trade_date,
+            )
+        except ValueError as exc:
+            raise ModelResearchConflict(str(exc)) from exc
         data_cutoff = _iso_datetime(
             payload.get("data_cutoff") or _utcnow().isoformat(), "data_cutoff",
         )
@@ -1524,6 +1532,24 @@ class ModelResearchRepository:
                 tuple(values),
             ).fetchall()
         return [_job_row(row) for row in rows]
+
+    def active_dataset_hashes(self) -> set[str]:
+        """Return dataset snapshots reserved by queued or executing jobs."""
+
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT specs.spec_hash AS dataset_hash
+                FROM model_jobs jobs
+                JOIN model_dataset_specs specs USING(dataset_id)
+                WHERE jobs.status IN ('queued', 'leased', 'running', 'uploading')
+                """,
+            ).fetchall()
+        return {
+            str(row["dataset_hash"]).strip().lower()
+            for row in rows
+            if row.get("dataset_hash")
+        }
 
     def list_inference_runs(
         self, *, status: str = "", model_id: str = "",
@@ -2028,6 +2054,12 @@ class ModelResearchRepository:
                 version = int(config.get("planned_model_version") or 0)
                 if version <= 0:
                     raise ModelResearchConflict("任务缺少预留模型版本")
+                stored_result = dict(result)
+                stored_result["registration"] = {
+                    "status": "automatic_pending",
+                    "mode": "automatic",
+                    "queued_at": now.isoformat(),
+                }
                 conn.execute(
                     """
                     UPDATE model_jobs
@@ -2035,15 +2067,15 @@ class ModelResearchRepository:
                         lease_expires_at = NULL, finished_at = %s, updated_at = %s
                     WHERE job_id = %s
                     """,
-                    (Jsonb(dict(result)), now, now, job_id),
+                    (Jsonb(stored_result), now, now, job_id),
                 )
                 self._event(
                     conn, job_id, "job.succeeded", stage="succeeded",
-                    message="训练完成，等待用户确认入库",
+                    message="训练完成，已进入自动候选模型入库流程",
                     payload={
                         "model_id": model_id,
                         "planned_model_version": version,
-                        "registration_status": "pending_confirmation",
+                        "registration_status": "automatic_pending",
                     },
                 )
                 if not _update_attempt_audit_row(
@@ -2058,21 +2090,139 @@ class ModelResearchRepository:
                     raise ModelResearchConflict("训练Attempt审计记录不存在或已终止")
         return self.get_job(job_id)
 
+    def finalize_training_result(self, job_id: str) -> dict[str, Any]:
+        """Automatically register a standalone result or the selected experiment trial."""
+        current = self.get_job(job_id)
+        if str(current.get("kind") or "train") != "train":
+            return current
+        if str(current.get("status") or "") != "succeeded":
+            raise ModelResearchConflict("只有训练完成的任务可以自动入库")
+        if int(current.get("model_version") or 0) > 0:
+            return current
+        registration = dict((current.get("result_json") or {}).get("registration") or {})
+        registration_status = str(registration.get("status") or "")
+        if registration_status in {"declined", "experiment_not_selected"}:
+            return current
+        experiment = dict((current.get("config_json") or {}).get("experiment") or {})
+        if not experiment:
+            return self.register_training_result(job_id)
+
+        summary = self.get_training_experiment(
+            str(experiment.get("experiment_id") or ""),
+        )
+        selection = dict(summary.get("selection") or {})
+        if not bool(selection.get("complete")):
+            return current
+        selected_job_id = str(selection.get("selected_job_id") or "")
+        if selected_job_id:
+            self.register_training_result(selected_job_id)
+        self._close_experiment_registration(summary, selected_job_id=selected_job_id)
+        return self.get_job(job_id)
+
+    def reconcile_pending_training_results(self, *, limit: int = 100) -> dict[str, Any]:
+        """Retry durable automatic registrations after a worker or database interruption."""
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT job_id
+                FROM model_jobs
+                WHERE kind = 'train'
+                  AND status = 'succeeded'
+                  AND model_version IS NULL
+                  AND result_json -> 'registration' ->> 'status' = 'automatic_pending'
+                ORDER BY updated_at, job_id
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        pending_job_ids = [str(row["job_id"]) for row in rows]
+        finalized = 0
+        for pending_job_id in pending_job_ids:
+            updated = self.finalize_training_result(pending_job_id)
+            status = str(
+                dict((updated.get("result_json") or {}).get("registration") or {}).get("status")
+                or ""
+            )
+            if int(updated.get("model_version") or 0) > 0 or status == "experiment_not_selected":
+                finalized += 1
+        return {"pending": len(pending_job_ids), "finalized": finalized}
+
+    def _close_experiment_registration(
+        self,
+        summary: Mapping[str, Any],
+        *,
+        selected_job_id: str,
+    ) -> None:
+        now = _utcnow()
+        selection = dict(summary.get("selection") or {})
+        with self.database.connection() as conn:
+            with conn.transaction():
+                for source in summary.get("jobs") or []:
+                    item = dict(source)
+                    trial_job_id = str(item.get("job_id") or "")
+                    if (
+                        not trial_job_id
+                        or trial_job_id == selected_job_id
+                        or str(item.get("status") or "") != "succeeded"
+                        or int(item.get("model_version") or 0) > 0
+                    ):
+                        continue
+                    result = dict(item.get("result_json") or {})
+                    registration = dict(result.get("registration") or {})
+                    if str(registration.get("status") or "") == "experiment_not_selected":
+                        continue
+                    result["registration"] = {
+                        "status": "experiment_not_selected",
+                        "mode": "automatic",
+                        "decided_at": now.isoformat(),
+                        "selected_job_id": selected_job_id,
+                        "selection_status": str(selection.get("status") or ""),
+                    }
+                    updated = conn.execute(
+                        """
+                        UPDATE model_jobs
+                        SET result_json = %s, updated_at = %s
+                        WHERE job_id = %s AND status = 'succeeded'
+                          AND model_version IS NULL
+                          AND COALESCE(
+                              result_json -> 'registration' ->> 'status', ''
+                          ) <> 'experiment_not_selected'
+                        RETURNING job_id
+                        """,
+                        (Jsonb(result), now, trial_job_id),
+                    ).fetchone()
+                    if not updated:
+                        continue
+                    self._event(
+                        conn,
+                        trial_job_id,
+                        "job.registration_skipped",
+                        stage="registration_skipped",
+                        message="参数实验结果未入选，模型制品已保留在MinIO",
+                        payload={
+                            "registration_status": "experiment_not_selected",
+                            "selected_job_id": selected_job_id,
+                            "selection_status": str(selection.get("status") or ""),
+                        },
+                    )
+
     def register_training_result(
         self,
         job_id: str,
         *,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        """Register one completed training result only after explicit user confirmation."""
+        """Register one completed training result as an immutable candidate version."""
         current = self.get_job(job_id)
         if str(current.get("kind") or "train") != "train":
-            raise ModelResearchConflict("只有训练任务结果可以确认入库")
+            raise ModelResearchConflict("只有训练任务结果可以登记模型版本")
         registration = dict(
             (current.get("result_json") or {}).get("registration") or {}
         )
-        if str(registration.get("status") or "") == "declined":
-            raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
+        if str(registration.get("status") or "") in {
+            "declined", "experiment_not_selected",
+        }:
+            raise ModelResearchConflict("该训练结果已被排除入库，请重新训练")
         requested_model_id = (
             _required_identifier(str(model_id), "model_id")
             if model_id is not None
@@ -2092,7 +2242,7 @@ class ModelResearchRepository:
             if str(selection.get("status") or "") != "selected":
                 raise ModelResearchConflict("参数实验尚未选出可入库版本")
             if str(selection.get("selected_job_id") or "") != job_id:
-                raise ModelResearchConflict("参数实验只允许验证集入选版本确认入库")
+                raise ModelResearchConflict("参数实验只允许登记验证集入选版本")
 
         now = _utcnow()
         with self.database.connection() as conn:
@@ -2104,9 +2254,9 @@ class ModelResearchRepository:
                 if not row:
                     raise ModelResearchNotFound("模型任务不存在")
                 if str(row["kind"] or "train") != "train":
-                    raise ModelResearchConflict("只有训练任务结果可以确认入库")
+                    raise ModelResearchConflict("只有训练任务结果可以登记模型版本")
                 if str(row["status"] or "") != "succeeded":
-                    raise ModelResearchConflict("只有训练完成的任务可以确认入库")
+                    raise ModelResearchConflict("只有训练完成的任务可以登记模型版本")
                 # A concurrent request may have completed registration while
                 # this caller was waiting for the row lock.  Re-check the
                 # durable identity inside the transaction instead of applying
@@ -2129,7 +2279,7 @@ class ModelResearchRepository:
                 config = dict(row["config_json"] or {})
                 result = dict(row["result_json"] or {})
                 if not result:
-                    raise ModelResearchConflict("训练结果尚未写入，不能确认入库")
+                    raise ModelResearchConflict("训练结果尚未写入，不能登记模型版本")
                 internal_model_version = int(
                     config.get("planned_model_version") or 0
                 )
@@ -2217,8 +2367,10 @@ class ModelResearchRepository:
                 if existing and str(existing["job_id"]) != job_id:
                     raise ModelResearchConflict("预留模型版本已被其他任务占用")
                 registration = dict(result.get("registration") or {})
-                if str(registration.get("status") or "") == "declined":
-                    raise ModelResearchConflict("该训练结果已选择不入库，请重新训练")
+                if str(registration.get("status") or "") in {
+                    "declined", "experiment_not_selected",
+                }:
+                    raise ModelResearchConflict("该训练结果已被排除入库，请重新训练")
                 if not existing:
                     conn.execute(
                         """
@@ -2263,7 +2415,7 @@ class ModelResearchRepository:
                 if not existing:
                     self._event(
                         conn, job_id, "job.registered", stage="registered",
-                        message="用户已确认训练结果入库",
+                        message="训练结果已自动登记为候选模型版本",
                         payload={
                             "model_id": registered_model_id,
                             "model_version": version,
@@ -3444,6 +3596,8 @@ class ModelResearchRepository:
     def record_artifact(
         self, *, job_id: str, artifact_kind: str, file_name: str,
         relative_path: str, digest: str, size_bytes: int, dataset_hash: str = "",
+        object_store_uri: str = "", object_store_version_id: str = "",
+        object_store_sha256: str = "",
     ) -> dict[str, Any]:
         job = self.get_job(job_id)
         artifact_id = f"artifact_{sha256(f'{job_id}:{artifact_kind}:{file_name}'.encode()).hexdigest()[:24]}"
@@ -3453,19 +3607,24 @@ class ModelResearchRepository:
                     """
                     INSERT INTO model_artifacts(
                         artifact_id, job_id, model_id, model_version, artifact_kind,
-                        file_name, relative_path, sha256, size_bytes, dataset_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        file_name, relative_path, sha256, size_bytes, dataset_hash,
+                        object_store_uri, object_store_version_id, object_store_sha256
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT(job_id, artifact_kind, file_name) DO UPDATE SET
                         relative_path = EXCLUDED.relative_path,
                         sha256 = EXCLUDED.sha256,
                         size_bytes = EXCLUDED.size_bytes,
-                        dataset_hash = EXCLUDED.dataset_hash
+                        dataset_hash = EXCLUDED.dataset_hash,
+                        object_store_uri = EXCLUDED.object_store_uri,
+                        object_store_version_id = EXCLUDED.object_store_version_id,
+                        object_store_sha256 = EXCLUDED.object_store_sha256
                     RETURNING *
                     """,
                     (
                         artifact_id, job_id, job["model_id"], job.get("model_version"),
                         artifact_kind, file_name, relative_path, digest, int(size_bytes),
                         dataset_hash,
+                        object_store_uri, object_store_version_id, object_store_sha256,
                     ),
                 ).fetchone()
                 identity = {
@@ -3476,6 +3635,13 @@ class ModelResearchRepository:
                     "sha256": str(row.get("sha256") or digest),
                     "size_bytes": int(row.get("size_bytes") or size_bytes),
                     "dataset_hash": str(row.get("dataset_hash") or dataset_hash),
+                    "object_store_uri": str(row.get("object_store_uri") or object_store_uri),
+                    "object_store_version_id": str(
+                        row.get("object_store_version_id") or object_store_version_id
+                    ),
+                    "object_store_sha256": str(
+                        row.get("object_store_sha256") or object_store_sha256
+                    ),
                 }
                 if not _update_attempt_audit_row(
                     conn,
@@ -3505,6 +3671,78 @@ class ModelResearchRepository:
         if not row:
             raise ModelResearchNotFound("模型产物不存在")
         return dict(row)
+
+    def attach_artifact_object_storage(
+        self,
+        artifact_id: str,
+        *,
+        object_store_uri: str,
+        object_store_version_id: str,
+        object_store_sha256: str,
+    ) -> dict[str, Any]:
+        uri = str(object_store_uri or "").strip()
+        version_id = str(object_store_version_id or "").strip()
+        digest = str(object_store_sha256 or "").strip().lower()
+        if not uri.startswith("s3://") or not version_id:
+            raise ModelResearchError("模型产物对象存储身份不完整")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ModelResearchError("模型产物对象存储SHA256无效")
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_artifacts WHERE artifact_id = %s FOR UPDATE",
+                    (artifact_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型产物不存在")
+                artifact = dict(row)
+                if digest != str(artifact.get("sha256") or "").lower():
+                    raise ModelResearchConflict("对象存储SHA256与本地模型产物不一致")
+                existing = (
+                    str(artifact.get("object_store_uri") or ""),
+                    str(artifact.get("object_store_version_id") or ""),
+                    str(artifact.get("object_store_sha256") or ""),
+                )
+                requested = (uri, version_id, digest)
+                if any(existing) and existing != requested:
+                    raise ModelResearchConflict("模型产物已绑定不同的对象存储身份")
+                updated = conn.execute(
+                    """
+                    UPDATE model_artifacts
+                    SET object_store_uri = %s,
+                        object_store_version_id = %s,
+                        object_store_sha256 = %s
+                    WHERE artifact_id = %s
+                    RETURNING *
+                    """,
+                    (uri, version_id, digest, artifact_id),
+                ).fetchone()
+                job = conn.execute(
+                    "SELECT attempt_count FROM model_jobs WHERE job_id = %s",
+                    (artifact["job_id"],),
+                ).fetchone()
+                if not job:
+                    raise ModelResearchNotFound("模型训练任务不存在")
+                identity = {
+                    "artifact_id": str(updated["artifact_id"]),
+                    "artifact_kind": str(updated["artifact_kind"]),
+                    "file_name": str(updated["file_name"]),
+                    "relative_path": str(updated["relative_path"]),
+                    "sha256": str(updated["sha256"]),
+                    "size_bytes": int(updated["size_bytes"]),
+                    "dataset_hash": str(updated.get("dataset_hash") or ""),
+                    "object_store_uri": uri,
+                    "object_store_version_id": version_id,
+                    "object_store_sha256": digest,
+                }
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=str(artifact["job_id"]),
+                    ordinal=int(job["attempt_count"]),
+                    artifact=identity,
+                ):
+                    raise ModelResearchConflict("模型产物缺少Attempt审计记录")
+        return dict(updated)
 
     @staticmethod
     def _assert_lease(row: Mapping[str, Any], lease_token: str) -> None:
@@ -6364,15 +6602,14 @@ def _job_row(row: Mapping[str, Any]) -> dict[str, Any]:
         result["planned_model_version"] = int(
             config.get("planned_model_version") or 0
         )
+        stored_registration_status = str(
+            ((result.get("result_json") or {}).get("registration") or {}).get("status")
+            or ""
+        )
         result["registration_status"] = (
             "registered"
             if int(result.get("model_version") or 0) > 0
-            else "declined"
-            if str(
-                ((result.get("result_json") or {}).get("registration") or {}).get("status")
-                or ""
-            ) == "declined"
-            else "pending_confirmation"
+            else stored_registration_status or "legacy_pending_confirmation"
         )
     return result
 

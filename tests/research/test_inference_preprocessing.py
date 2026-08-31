@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from hashlib import sha256
+import json
 from pathlib import Path
+import pickle
+import tarfile
 from typing import Any
 
 import numpy as np
@@ -8,7 +12,11 @@ import pandas as pd
 import pytest
 
 from factor_service.research.errors import PermanentJobError
-from factor_service.research.inference import DailyInferenceRunner
+from factor_service.research.inference import (
+    DailyInferenceRunner,
+    _load_bundle,
+    _load_model_for_trade_date,
+)
 from factor_service.research.industry_feature import (
     industry_feature_names,
     normalize_industry_feature,
@@ -100,6 +108,107 @@ def _training_manifest(
         "preprocessing_excluded_features": industry_names,
         "industry_feature": industry_feature,
     }
+
+
+def test_rolling_bundle_routes_exact_trade_date_to_window_model(
+    tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    windows = []
+    for index, (start, end) in enumerate([
+        ("2024-01-02", "2024-01-31"),
+        ("2024-02-01", "2024-02-29"),
+    ], start=1):
+        window_root = bundle_root / "walk_forward" / f"window_{index:04d}"
+        window_root.mkdir(parents=True)
+        model_bytes = pickle.dumps({"window": index})
+        (window_root / "model.pkl").write_bytes(model_bytes)
+        window_manifest = {
+            "schema_version": "alphablocks.qlib-rolling-window.v2",
+            "series_id": "test_model",
+            "series_revision": 7,
+            "window": index,
+            "effective_date_start": start,
+            "effective_date_end": end,
+            "train_medians": {"factor": float(index)},
+            "model_sha256": sha256(model_bytes).hexdigest(),
+            "qlib_recorder_id": f"recorder-{index}",
+        }
+        (window_root / "manifest.json").write_text(
+            json.dumps(window_manifest), encoding="utf-8",
+        )
+        windows.append({
+            "window": index,
+            "effective_date_start": start,
+            "effective_date_end": end,
+            "artifact": {
+                "path": f"walk_forward/window_{index:04d}",
+                "model_sha256": window_manifest["model_sha256"],
+            },
+        })
+    root_manifest = {
+        "model_id": "test_model",
+        "model_version": 7,
+        "medians": {"factor": 999.0},
+        "walk_forward": {
+            "enabled": True,
+            "prediction_date_start": "2024-01-02",
+            "prediction_date_end": "2024-02-29",
+            "windows": windows,
+        },
+    }
+    (bundle_root / "manifest.json").write_text(
+        json.dumps(root_manifest), encoding="utf-8",
+    )
+    (bundle_root / "model.pkl").write_bytes(pickle.dumps({"root": True}))
+    bundle = tmp_path / "model.tar.gz"
+    with tarfile.open(bundle, "w:gz") as archive:
+        archive.add(bundle_root / "manifest.json", arcname="manifest.json")
+        archive.add(bundle_root / "model.pkl", arcname="model.pkl")
+        archive.add(bundle_root / "walk_forward", arcname="walk_forward")
+
+    root_model, loaded_manifest = _load_bundle(bundle)
+    model, active_manifest, routing = _load_model_for_trade_date(
+        bundle, root_model, loaded_manifest, "2024-02-14",
+    )
+
+    assert model == {"window": 2}
+    assert active_manifest["medians"] == {"factor": 2.0}
+    assert routing == {
+        "series_id": "test_model",
+        "series_revision": 7,
+        "window": 2,
+        "effective_date_start": "2024-02-01",
+        "effective_date_end": "2024-02-29",
+        "qlib_recorder_id": "recorder-2",
+        "model_sha256": windows[1]["artifact"]["model_sha256"],
+        "routing_policy": "exact_effective_date_interval",
+    }
+
+
+def test_rolling_bundle_rejects_date_outside_published_sequence(
+    tmp_path: Path,
+) -> None:
+    manifest = {
+        "walk_forward": {
+            "enabled": True,
+            "prediction_date_start": "2024-01-02",
+            "prediction_date_end": "2024-01-31",
+            "windows": [{
+                "effective_date_start": "2024-01-02",
+                "effective_date_end": "2024-01-31",
+            }],
+        },
+    }
+
+    with pytest.raises(PermanentJobError, match="必须先训练并发布"):
+        _load_model_for_trade_date(
+            tmp_path / "unused.tar.gz",
+            object(),
+            manifest,
+            "2024-02-01",
+        )
 
 
 def test_daily_inference_applies_preprocessing_frozen_in_training_manifest(

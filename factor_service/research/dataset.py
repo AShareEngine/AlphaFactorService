@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -2251,7 +2252,12 @@ def walk_forward_segments(
     oos_date_start: str = "",
     oos_date_end: str = "",
 ) -> list[dict[str, tuple[str, str]]]:
-    """Build every non-overlapping OOS window in the requested trading-date span."""
+    """Generate Qlib rolling tasks and return their normalized date segments.
+
+    AlphaBlocks supplies the frozen trading calendar and explicit dual embargo.
+    Qlib's ``RollingGen`` remains responsible for shifting the task template,
+    including the sliding-versus-expanding training-window semantics.
+    """
     unique = pd.Index(sorted(pd.to_datetime(dates).normalize().unique()))
     if strategy not in {"rolling", "expanding"}:
         raise ValueError("Walk-Forward策略只允许rolling或expanding")
@@ -2285,31 +2291,153 @@ def walk_forward_segments(
             f"样本外开始日前至少需要{minimum_history}个交易日用于训练、验证和隔离"
         )
 
-    windows: list[dict[str, tuple[str, str]]] = []
     last_oos_index = int(unique.get_loc(oos_end))
-    test_start_index = first_oos_index
-    while test_start_index <= last_oos_index:
-        test_end_index = min(test_start_index + test_sessions - 1, last_oos_index)
-        valid_end_index = test_start_index - embargo - 1
-        valid_start_index = valid_end_index - valid_sessions + 1
-        train_end_index = valid_start_index - embargo - 1
-        train_start_index = (
-            0 if strategy == "expanding"
-            else train_end_index - train_sessions + 1
-        )
-        if train_start_index < 0:
-            raise ValueError("Walk-Forward训练历史不足，无法覆盖完整样本外区间")
-        windows.append({
-            "train": _date_range(unique, train_start_index, train_end_index),
-            "valid": _date_range(unique, valid_start_index, valid_end_index),
-            "test": _date_range(unique, test_start_index, test_end_index),
-        })
-        test_start_index += step_sessions
+    valid_end_index = first_oos_index - embargo - 1
+    valid_start_index = valid_end_index - valid_sessions + 1
+    train_end_index = valid_start_index - embargo - 1
+    train_start_index = (
+        0 if strategy == "expanding"
+        else train_end_index - train_sessions + 1
+    )
+    if train_start_index < 0:
+        raise ValueError("Walk-Forward训练历史不足，无法覆盖完整样本外区间")
+
+    initial_segments = {
+        "train": _date_range(unique, train_start_index, train_end_index),
+        "valid": _date_range(unique, valid_start_index, valid_end_index),
+        # RollingGen reads this end as the requested rolling horizon, then
+        # replaces the first test segment with exactly one rolling step.
+        "test": (
+            unique[first_oos_index].date().isoformat(),
+            unique[last_oos_index].date().isoformat(),
+        ),
+    }
+    tasks = _qlib_rolling_tasks(
+        unique,
+        initial_segments,
+        strategy=strategy,
+        step_sessions=step_sessions,
+    )
+    windows: list[dict[str, tuple[str, str]]] = []
+    for task in tasks:
+        source = task["dataset"]["kwargs"]["segments"]
+        normalized = {
+            name: (
+                pd.Timestamp(segment[0]).date().isoformat(),
+                pd.Timestamp(segment[1]).date().isoformat(),
+            )
+            for name, segment in source.items()
+        }
+        test_start = pd.Timestamp(normalized["test"][0])
+        if test_start > oos_end:
+            break
+        if pd.Timestamp(normalized["test"][1]) > oos_end:
+            normalized["test"] = (
+                normalized["test"][0],
+                oos_end.date().isoformat(),
+            )
+        windows.append(normalized)
     if not windows or windows[0]["test"][0] != oos_start.date().isoformat():
         raise ValueError("Walk-Forward未能覆盖样本外开始日期")
     if windows[-1]["test"][1] != oos_end.date().isoformat():
         raise ValueError("Walk-Forward步长在样本外区间留下了未覆盖日期")
     return windows
+
+
+def _qlib_rolling_tasks(
+    dates: pd.Index,
+    initial_segments: dict[str, tuple[str, str]],
+    *,
+    strategy: str,
+    step_sessions: int,
+) -> list[dict[str, Any]]:
+    """Run Qlib RollingGen against an immutable in-memory trading calendar."""
+    try:
+        from qlib.workflow.task.gen import RollingGen
+        from qlib.workflow.task.utils import TimeAdjuster
+    except ImportError as exc:
+        raise RuntimeError("Qlib滚动任务生成器不可用，请安装pyqlib") from exc
+
+    class FrozenCalendarTimeAdjuster(TimeAdjuster):
+        def __init__(self, calendar: pd.Index) -> None:
+            self._future = True
+            self.cals = np.asarray(
+                [pd.Timestamp(value).normalize() for value in calendar],
+                dtype=object,
+            )
+
+    class FrozenCalendarRollingGen(RollingGen):
+        def __init__(self) -> None:
+            self.step = int(step_sessions)
+            self.rtype = (
+                RollingGen.ROLL_EX
+                if strategy == "expanding"
+                else RollingGen.ROLL_SD
+            )
+            self.ds_extra_mod_func = None
+            self.ta = FrozenCalendarTimeAdjuster(dates)
+            self.test_key = "test"
+            self.train_key = "train"
+            # AlphaBlocks already placed a full embargo on both boundaries.
+            # Applying RollingGen.trunc_days here would shorten it a second time.
+            self.trunc_days = None
+            self.task_copy_func = deepcopy
+
+        def generate(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+            # Qlib 0.9.7 calls the global D.calendar() only to normalize the
+            # requested test end. AlphaBlocks has no Qlib market provider here;
+            # use the already frozen calendar for that one lookup, while
+            # retaining RollingGen's sliding/expanding TimeAdjuster semantics.
+            first = self.task_copy_func(task)
+            segments = deepcopy(
+                self.ta.align_seg(first["dataset"]["kwargs"]["segments"])
+            )
+            test_end = self.ta.align_time(
+                segments[self.test_key][1], tp_type="end",
+            )
+            test_start_index = self.ta.align_idx(
+                segments[self.test_key][0], tp_type="start",
+            )
+            segments[self.test_key] = (
+                self.ta.get(test_start_index),
+                self.ta.get(
+                    min(test_start_index + self.step - 1, len(self.ta.cals) - 1)
+                ),
+            )
+            self._update_task_segs(first, segments)
+            result = [first]
+            previous = segments
+            while previous[self.test_key][1] < test_end:
+                following: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+                for name, segment in previous.items():
+                    rtype = (
+                        self.ta.SHIFT_EX
+                        if name == self.train_key and self.rtype == self.ROLL_EX
+                        else self.ta.SHIFT_SD
+                    )
+                    shifted = self.ta.shift(segment, step=self.step, rtype=rtype)
+                    if name == self.test_key and shifted[1] is None:
+                        shifted = (shifted[0], test_end)
+                    following[name] = shifted
+                test_start = following[self.test_key][0]
+                if test_start is None or test_start > test_end:
+                    break
+                if following[self.test_key][1] > test_end:
+                    following[self.test_key] = (test_start, test_end)
+                generated = self.task_copy_func(first)
+                self._update_task_segs(generated, following)
+                result.append(generated)
+                previous = following
+            return result
+
+    template = {
+        "dataset": {
+            "class": "DatasetH",
+            "module_path": "qlib.data.dataset",
+            "kwargs": {"segments": initial_segments},
+        },
+    }
+    return FrozenCalendarRollingGen().generate(template)
 
 
 def _date_range(dates: pd.Index, start: int, end: int) -> tuple[str, str]:

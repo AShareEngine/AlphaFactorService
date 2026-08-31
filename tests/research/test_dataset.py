@@ -524,6 +524,21 @@ def test_walk_forward_expanding_windows_keep_original_train_start() -> None:
     assert windows[-1]["test"][1] == dates[1059].date().isoformat()
 
 
+def test_walk_forward_clips_partial_last_window_on_frozen_calendar_end() -> None:
+    dates = pd.date_range("2018-01-02", periods=1000, freq="B")
+    windows = walk_forward_segments(
+        pd.Index(dates), train_sessions=252, valid_sessions=63,
+        test_sessions=20, step_sessions=20, embargo_sessions=5,
+        oos_date_start=dates[-45].date().isoformat(),
+        oos_date_end=dates[-1].date().isoformat(),
+    )
+
+    assert len(windows) == 3
+    assert windows[-1]["test"] == (
+        dates[-5].date().isoformat(), dates[-1].date().isoformat(),
+    )
+
+
 def test_walk_forward_rejects_overlapping_test_windows() -> None:
     dates = pd.date_range("2018-01-02", periods=1000, freq="B")
     with pytest.raises(ValueError, match="步长必须等于测试窗口"):

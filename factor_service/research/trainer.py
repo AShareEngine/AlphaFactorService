@@ -47,6 +47,16 @@ class TrainingResult:
     predictions_path: Path
 
 
+@dataclass(frozen=True)
+class WalkForwardTrainingResult:
+    prediction: pd.Series
+    report: dict[str, Any]
+    latest_model: Any
+    latest_dataset: Any
+    latest_evals_result: dict[str, Any]
+    latest_segments: dict[str, tuple[str, str]]
+
+
 @dataclass
 class QlibStackingModel:
     """Serializable Stacking bundle: fitted Qlib bases plus Ridge meta learner."""
@@ -174,6 +184,35 @@ class QlibTrainer:
         evals_result: dict[str, Any] = {}
         walk_forward_report: dict[str, Any] | None = None
         walk_forward_prediction: pd.Series | None = None
+        walk_forward_result: WalkForwardTrainingResult | None = None
+        if walk_forward_config.get("enabled") is True:
+            rolling_experiment_name = (
+                f"{experiment_name}_rolling_v"
+                f"{int(config.get('planned_model_version') or 1)}"
+            )
+            _prepare_recorder_experiment(
+                recorder_uri, rolling_experiment_name, recorder_root,
+            )
+            walk_forward_result = _run_walk_forward(
+                prepared,
+                walk_forward_config,
+                work_dir=work_dir,
+                model_id=str(job["model_id"]),
+                model_version=int(config.get("planned_model_version") or 1),
+                model_kind=model_kind,
+                raw_params=raw_params,
+                DataHandlerLP=DataHandlerLP,
+                DatasetH=DatasetH,
+                recorder_uri=recorder_uri,
+                experiment_name=rolling_experiment_name,
+                cancellation=cancellation,
+                progress=progress,
+            )
+            walk_forward_prediction = walk_forward_result.prediction
+            walk_forward_report = walk_forward_result.report
+            model = walk_forward_result.latest_model
+            dataset = walk_forward_result.latest_dataset
+            evals_result = walk_forward_result.latest_evals_result
         with R.start(
             experiment_name=experiment_name,
             recorder_name=str(job["job_id"]),
@@ -201,28 +240,28 @@ class QlibTrainer:
                 train_prediction = stacking["train_prediction"]
                 valid_prediction = stacking["valid_prediction"]
                 test_prediction = stacking["test_prediction"]
+            elif walk_forward_result is not None:
+                # RollingGen + TrainerR already fitted every immutable window.
+                # The root model is only a latest-window compatibility alias;
+                # date-aware inference must always load a window artifact.
+                _progress(progress, "rolling_series_ready", 80, {
+                    "window_count": walk_forward_report["window_count"],
+                    "latest_segments": walk_forward_result.latest_segments,
+                })
+                train_prediction = _predict_training_dataset(
+                    model, model_kind, dataset, "train",
+                    classification=classification,
+                )
+                valid_prediction = _predict_dataset(
+                    model, model_kind, dataset, "valid",
+                    classification=classification,
+                )
+                test_prediction = _predict_dataset(
+                    model, model_kind, dataset, "test",
+                    classification=classification,
+                )
             else:
-                if walk_forward_config.get("enabled") is True:
-                    walk_forward_prediction, walk_forward_report = _run_walk_forward(
-                        prepared,
-                        walk_forward_config,
-                        work_dir=work_dir,
-                        model_id=str(job["model_id"]),
-                        model_version=int(
-                            (job.get("config_json") or {}).get(
-                                "planned_model_version"
-                            ) or 1
-                        ),
-                        model_kind=model_kind,
-                        raw_params=raw_params,
-                        DataHandlerLP=DataHandlerLP,
-                        DatasetH=DatasetH,
-                        cancellation=cancellation,
-                        progress=progress,
-                    )
-                    training_start = 73
-                else:
-                    training_start = 58
+                training_start = 58
                 _progress(progress, "training_final_model", training_start, {"iteration": 0})
                 _fit_model(
                     model_kind, model, dataset, evals_result,
@@ -251,26 +290,37 @@ class QlibTrainer:
             R.save_objects(trained_model=model)
             recorder_id = R.get_recorder().id
         # 研究回测只允许使用完全样本外的test段；train/valid预测不得进入模型信号库。
-        # 开启Walk-Forward时发布各窗口拼接后的OOS预测，正式模型仍单独保存用于后续每日推理。
+        # 开启Walk-Forward时发布各窗口拼接后的OOS预测；根模型只是最新窗口别名，
+        # 不得被按日期推理直接使用。
         published_prediction = walk_forward_prediction if walk_forward_prediction is not None else test_prediction
         prediction_frame = _prediction_frame(published_prediction, training_prepared, job)
         predictions_path = work_dir / "predictions.parquet"
         prediction_frame.to_parquet(predictions_path, index=False)
         prediction_rows = len(prediction_frame)
+        metric_frame = (
+            prepared.raw_frame
+            if walk_forward_result is not None and prepared.raw_frame is not None
+            else training_prepared.frame
+        )
+        metric_segments = (
+            walk_forward_result.latest_segments
+            if walk_forward_result is not None
+            else training_prepared.segments
+        )
         standard_metrics = _metrics(
-            test_prediction, training_prepared.frame,
-            training_prepared.segments["test"],
+            test_prediction, metric_frame,
+            metric_segments["test"],
             classification=classification,
         )
         train_metrics = _metrics(
-            train_prediction, training_prepared.frame,
-            training_prepared.segments["train"],
+            train_prediction, metric_frame,
+            metric_segments["train"],
             classification=classification,
         )
         del train_prediction
         raw_validation_metrics = _metrics(
-            valid_prediction, training_prepared.frame,
-            training_prepared.segments["valid"],
+            valid_prediction, metric_frame,
+            metric_segments["valid"],
             classification=classification,
         )
         validation_metrics = {
@@ -354,6 +404,11 @@ class QlibTrainer:
             "model_version": int((job.get("config_json") or {}).get("planned_model_version") or 1),
             "qlib_recorder_id": recorder_id,
             "qlib_recorder_uri": recorder_uri,
+            "root_model_role": (
+                "latest_window_compatibility_alias"
+                if walk_forward_report is not None
+                else "primary_model"
+            ),
             "model_params": model_params,
             "ensemble": (
                 {
@@ -604,9 +659,14 @@ def _run_walk_forward(
     raw_params: dict[str, Any],
     DataHandlerLP: Any,
     DatasetH: Any,
+    recorder_uri: str,
+    experiment_name: str,
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
-) -> tuple[pd.Series, dict[str, Any]]:
+) -> WalkForwardTrainingResult:
+    from qlib.model.trainer import TrainerR
+    from qlib.workflow import R
+
     classification = str(raw_params.get("loss") or "mse") == "binary"
     raw_frame = prepared.raw_frame
     if raw_frame is None:
@@ -626,53 +686,143 @@ def _run_walk_forward(
     if not windows:
         raise ValueError("没有可执行的Walk-Forward窗口")
 
-    predictions: list[pd.Series] = []
-    reports: list[dict[str, Any]] = []
     series_root = work_dir / "walk_forward"
     series_root.mkdir(parents=True, exist_ok=False)
     total = len(windows)
-    for index, segments in enumerate(windows, start=1):
+    tasks = [
+        {
+            "model": {
+                "kind": model_kind,
+                "params": dict(raw_params),
+            },
+            "dataset": {
+                "class": "DatasetH",
+                "module_path": "qlib.data.dataset",
+                "kwargs": {"segments": segments},
+            },
+            "alphablocks": {
+                "schema_version": "alphablocks.qlib-rolling-task.v1",
+                "series_id": model_id,
+                "series_revision": int(model_version),
+                "window": index,
+            },
+        }
+        for index, segments in enumerate(windows, start=1)
+    ]
+    trained: dict[int, dict[str, Any]] = {}
+
+    def train_task(
+        task: dict[str, Any],
+        task_experiment_name: str,
+        recorder_name: str | None = None,
+    ) -> Any:
+        window_meta = dict(task["alphablocks"])
+        index = int(window_meta["window"])
+        segments = {
+            name: (str(segment[0]), str(segment[1]))
+            for name, segment in dict(
+                task["dataset"]["kwargs"]["segments"]
+            ).items()
+        }
         _checkpoint(cancellation)
         start_percent = 58 + int(14 * (index - 1) / total)
         end_percent = 58 + int(14 * index / total)
         details = {"window_index": index, "window_count": total, "segments": segments}
         _progress(progress, "walk_forward_training", start_percent, details)
         window_frame, medians = _walk_forward_frame(prepared, segments)
-        dataset = _dataset_for_model(
+        window_dataset = _dataset_for_model(
             DataHandlerLP.from_df(window_frame), segments, model_kind, raw_params, DatasetH,
         )
-        model, _ = _create_model(model_kind, raw_params, len(prepared.feature_names))
-        evals_result: dict[str, Any] = {}
-        _fit_model(
-            model_kind,
-            model,
-            dataset,
-            evals_result,
-            cancellation=cancellation,
-            progress=progress,
-            stage="walk_forward_training",
-            progress_start=start_percent,
-            progress_end=end_percent,
-            progress_details=details,
-            metric_prefix=f"walk_forward.window_{index}.",
+        window_model, _ = _create_model(
+            model_kind, raw_params, len(prepared.feature_names),
         )
-        prediction = _predict_dataset(
-            model, model_kind, dataset, "test", classification=classification,
+        window_evals: dict[str, Any] = {}
+        effective_recorder_name = (
+            recorder_name
+            or f"{model_id}_v{model_version}_window_{index:04d}"
         )
-        window_metrics = _metrics(
-            prediction, raw_frame, segments["test"],
-            classification=classification,
-        )
-        if hasattr(model, "to_cpu"):
-            model.to_cpu()
-        _prepare_model_for_serialization(model_kind, model)
+        with R.start(
+            experiment_name=task_experiment_name,
+            recorder_name=effective_recorder_name,
+        ):
+            R.log_params(
+                series_id=model_id,
+                series_revision=int(model_version),
+                window=index,
+                segments=json.dumps(segments, sort_keys=True),
+                task_generator="qlib.workflow.task.gen.RollingGen",
+                trainer="qlib.model.trainer.TrainerR",
+            )
+            _fit_model(
+                model_kind,
+                window_model,
+                window_dataset,
+                window_evals,
+                cancellation=cancellation,
+                progress=progress,
+                stage="walk_forward_training",
+                progress_start=start_percent,
+                progress_end=end_percent,
+                progress_details=details,
+                metric_prefix=f"walk_forward.window_{index}.",
+            )
+            prediction = _predict_dataset(
+                window_model, model_kind, window_dataset, "test",
+                classification=classification,
+            )
+            window_metrics = _metrics(
+                prediction, raw_frame, segments["test"],
+                classification=classification,
+            )
+            if hasattr(window_model, "to_cpu"):
+                window_model.to_cpu()
+            _prepare_model_for_serialization(model_kind, window_model)
+            R.save_objects(**{
+                "task": task,
+                "params.pkl": window_model,
+                "pred.pkl": prediction,
+                "metrics.pkl": window_metrics,
+            })
+            recorder = R.get_recorder()
+        trained[index] = {
+            "segments": segments,
+            "model": window_model,
+            "dataset": window_dataset,
+            "evals_result": window_evals,
+            "prediction": prediction,
+            "metrics": window_metrics,
+            "medians": medians,
+            "recorder_id": recorder.id,
+            "task": task,
+        }
+        return recorder
+
+    qlib_trainer = TrainerR(
+        experiment_name=experiment_name,
+        train_func=train_task,
+    )
+    with R.uri_context(recorder_uri):
+        recorders = qlib_trainer.train(tasks)
+        qlib_trainer.end_train(recorders)
+    if len(recorders) != total or len(trained) != total:
+        raise ValueError("Qlib滚动任务训练结果数量与窗口计划不一致")
+
+    predictions: list[pd.Series] = []
+    reports: list[dict[str, Any]] = []
+    for index in range(1, total + 1):
+        payload = trained[index]
+        segments = payload["segments"]
+        window_model = payload["model"]
+        prediction = payload["prediction"]
+        window_metrics = payload["metrics"]
+        medians = payload["medians"]
         window_root = series_root / f"window_{index:04d}"
         window_root.mkdir()
         window_model_path = window_root / "model.pkl"
         with window_model_path.open("wb") as target:
-            pickle.dump(model, target)
+            pickle.dump(window_model, target)
         window_manifest = {
-            "schema_version": "alphablocks.walk-forward-window.v1",
+            "schema_version": "alphablocks.qlib-rolling-window.v2",
             "series_id": model_id,
             "series_revision": int(model_version),
             "window": index,
@@ -683,6 +833,8 @@ def _run_walk_forward(
             "feature_names": list(prepared.feature_names),
             "train_medians": medians,
             "metrics": window_metrics,
+            "qlib_recorder_id": payload["recorder_id"],
+            "qlib_task": payload["task"],
             "model_sha256": _file_sha256(window_model_path),
         }
         window_manifest_path = window_root / "manifest.json"
@@ -696,6 +848,7 @@ def _run_walk_forward(
             "segments": segments,
             "metrics": window_metrics,
             "train_medians": medians,
+            "qlib_recorder_id": payload["recorder_id"],
             "effective_date_start": segments["test"][0],
             "effective_date_end": segments["test"][1],
             "artifact": {
@@ -721,7 +874,7 @@ def _run_walk_forward(
         "positive_ic_window_ratio": float(np.mean(window_ics > 0)),
     })
     report = {
-        "schema_version": "alphablocks.walk-forward-model-series.v1",
+        "schema_version": "alphablocks.qlib-rolling-model-series.v2",
         "enabled": True,
         "series_id": model_id,
         "series_revision": int(model_version),
@@ -739,11 +892,27 @@ def _run_walk_forward(
         "aggregate": aggregate,
         "prediction_date_start": windows[0]["test"][0],
         "prediction_date_end": windows[-1]["test"][1],
+        "orchestration": {
+            "task_generator": "qlib.workflow.task.gen.RollingGen",
+            "trainer": "qlib.model.trainer.TrainerR",
+            "recorder_per_window": True,
+            "prediction_collector": "alphablocks.strict_oos_stitch",
+            "inference_router": "exact_effective_date_interval",
+            "root_model_role": "latest_window_compatibility_alias",
+        },
         "stability": assess_walk_forward_stability(
             aggregate, window_count=total,
         ),
     }
-    return stitched, report
+    latest = trained[total]
+    return WalkForwardTrainingResult(
+        prediction=stitched,
+        report=report,
+        latest_model=latest["model"],
+        latest_dataset=latest["dataset"],
+        latest_evals_result=latest["evals_result"],
+        latest_segments=latest["segments"],
+    )
 
 
 def _walk_forward_frame(

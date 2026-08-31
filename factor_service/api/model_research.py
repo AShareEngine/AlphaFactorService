@@ -1097,7 +1097,10 @@ def list_artifacts(job_id: str) -> dict[str, Any]:
 def download_artifact(request: Request, artifact_id: str) -> FileResponse:
     try:
         artifact = repository.get_artifact(artifact_id)
-        path = _worker(request).artifact_store.resolve(str(artifact["relative_path"]))
+        path = _worker(request).control.resolve_artifact(
+            artifact_id,
+            str(artifact.get("sha256") or ""),
+        )
         return FileResponse(path, media_type="application/octet-stream", filename=path.name)
     except Exception as exc:
         _raise(exc)

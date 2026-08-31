@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 from hashlib import sha256
 from pathlib import Path
 import os
 import re
 import shutil
 import tempfile
-from typing import BinaryIO
+import time
+from typing import BinaryIO, Iterator
 
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_DATASET_HASH = re.compile(r"^[0-9a-f]{64}$")
 _DATASET_SCOPED_KINDS = {"dataset", "dataset_raw", "dataset_manifest"}
+_DATASET_LAST_USED_FILE = ".last_used"
 
 
 class ArtifactError(ValueError):
@@ -112,9 +117,29 @@ class ModelArtifactStore:
             )
 
     def resolve(self, relative_path: str) -> Path:
-        target = (self.root / str(relative_path)).resolve()
-        if self.root not in target.parents or not target.is_file():
-            raise ArtifactError("模型产物不存在")
+        relative = Path(str(relative_path))
+        parts = relative.parts
+        if (
+            len(parts) >= 3
+            and parts[0] == "datasets"
+            and _DATASET_HASH.fullmatch(parts[1])
+        ):
+            dataset_hash = parts[1]
+            with self.dataset_lock(dataset_hash):
+                target = self._resolve_file(relative)
+                self.touch_dataset(dataset_hash)
+                return target
+        return self._resolve_file(relative)
+
+    def object_cache_path(self, digest: str, file_name: str) -> Path:
+        """Return a content-addressed cache target for a remote model artifact."""
+        clean_digest = str(digest or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", clean_digest):
+            raise ArtifactError("模型对象缓存缺少有效SHA256")
+        safe_file = self._name(file_name, "file_name")
+        target = (self.root / ".object-cache" / clean_digest / safe_file).resolve()
+        if self.root not in target.parents:
+            raise ArtifactError("模型对象缓存路径越界")
         return target
 
     def delete_job_artifacts(self, job_id: str) -> dict[str, bool]:
@@ -140,14 +165,114 @@ class ModelArtifactStore:
         return removed
 
     def delete_dataset_artifacts(self, dataset_hash: str) -> bool:
-        """Delete an immutable dataset snapshot after its final DB reference is gone."""
+        """Delete one local dataset snapshot without racing an active reader."""
 
-        clean_hash = str(dataset_hash or "").strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{64}", clean_hash):
-            raise ArtifactError("dataset_hash无效")
-        return self._remove_directory(
-            (self.root / "datasets" / clean_hash).resolve(),
+        clean_hash = self._dataset_hash(dataset_hash)
+        with self.dataset_lock(clean_hash):
+            return self._remove_directory(
+                (self.root / "datasets" / clean_hash).resolve(),
+            )
+
+    @contextmanager
+    def dataset_lock(
+        self, dataset_hash: str, *, blocking: bool = True,
+    ) -> Iterator[None]:
+        """Serialize dataset publication, reuse, and expiry across processes."""
+
+        clean_hash = self._dataset_hash(dataset_hash)
+        lock_root = (self.root / ".dataset-locks").resolve()
+        lock_root.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_root / f"{clean_hash}.lock"
+        with lock_path.open("a+b") as descriptor:
+            operation = fcntl.LOCK_EX
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(descriptor.fileno(), operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
+
+    def touch_dataset(self, dataset_hash: str, *, used_at: float | None = None) -> Path:
+        """Record successful materialization or reuse of a local dataset cache."""
+
+        clean_hash = self._dataset_hash(dataset_hash)
+        dataset_dir = (self.root / "datasets" / clean_hash).resolve()
+        if not dataset_dir.is_dir():
+            raise ArtifactError("训练数据集缓存不存在")
+        marker = dataset_dir / _DATASET_LAST_USED_FILE
+        marker.touch(exist_ok=True)
+        timestamp = time.time() if used_at is None else float(used_at)
+        os.utime(marker, (timestamp, timestamp))
+        return marker
+
+    def prune_dataset_cache(
+        self,
+        *,
+        retention_seconds: float = 24 * 60 * 60,
+        protected_hashes: set[str] | frozenset[str] = frozenset(),
+        now: float | None = None,
+    ) -> dict[str, object]:
+        """Remove local dataset snapshots not used within the retention window."""
+
+        retention = float(retention_seconds)
+        if retention <= 0:
+            raise ArtifactError("训练数据集缓存保留时间必须大于0")
+        protected = {
+            self._dataset_hash(value) for value in protected_hashes
+        }
+        cutoff = (time.time() if now is None else float(now)) - retention
+        datasets_root = (self.root / "datasets").resolve()
+        result: dict[str, object] = {
+            "scanned": 0,
+            "deleted": [],
+            "reclaimed_bytes": 0,
+            "protected": 0,
+            "locked": 0,
+        }
+        if not datasets_root.is_dir():
+            return result
+
+        for directory in sorted(datasets_root.iterdir()):
+            if not directory.is_dir() or not _DATASET_HASH.fullmatch(directory.name):
+                continue
+            result["scanned"] = int(result["scanned"]) + 1
+            dataset_hash = directory.name
+            if dataset_hash in protected:
+                result["protected"] = int(result["protected"]) + 1
+                continue
+            try:
+                with self.dataset_lock(dataset_hash, blocking=False):
+                    if not directory.is_dir():
+                        continue
+                    if self._dataset_last_used_at(directory) > cutoff:
+                        continue
+                    size_bytes = sum(
+                        path.stat().st_size
+                        for path in directory.rglob("*")
+                        if path.is_file()
+                    )
+                    self._remove_directory(directory.resolve())
+                    deleted = result["deleted"]
+                    assert isinstance(deleted, list)
+                    deleted.append(dataset_hash)
+                    result["reclaimed_bytes"] = (
+                        int(result["reclaimed_bytes"]) + size_bytes
+                    )
+            except BlockingIOError:
+                result["locked"] = int(result["locked"]) + 1
+        return result
+
+    @staticmethod
+    def _dataset_last_used_at(directory: Path) -> float:
+        marker = directory / _DATASET_LAST_USED_FILE
+        if marker.is_file():
+            return marker.stat().st_mtime
+        timestamps = [directory.stat().st_mtime]
+        timestamps.extend(
+            path.stat().st_mtime for path in directory.rglob("*") if path.is_file()
         )
+        return max(timestamps)
 
     def save_chunk(
         self, *, job_id: str, artifact_kind: str, file_name: str,
@@ -240,11 +365,24 @@ class ModelArtifactStore:
         shutil.rmtree(directory)
         return True
 
+    def _resolve_file(self, relative_path: str | Path) -> Path:
+        target = (self.root / relative_path).resolve()
+        if self.root not in target.parents or not target.is_file():
+            raise ArtifactError("模型产物不存在")
+        return target
+
     @staticmethod
     def _name(value: str, field: str) -> str:
         clean = str(value or "").strip()
         if not _SAFE_NAME.fullmatch(clean) or clean in {".", ".."}:
             raise ArtifactError(f"{field}包含非法字符")
+        return clean
+
+    @staticmethod
+    def _dataset_hash(value: str) -> str:
+        clean = str(value or "").strip().lower()
+        if not _DATASET_HASH.fullmatch(clean):
+            raise ArtifactError("dataset_hash无效")
         return clean
 
 

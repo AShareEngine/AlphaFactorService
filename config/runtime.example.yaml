@@ -64,5 +64,21 @@ research:
     # This root contains job datasets, trained models, predictions, MLflow files,
     # logs, manifests, and crash-recovery state.
     work_root: "./data/research"
-    # Immutable, formally published model artifacts managed by FactorService.
+    # Formally published models and content-addressed local dataset caches.
     model_artifacts_root: "./data/model_artifacts"
+    # Generated factor-training Parquet is a local cache. Successful creation or
+    # reuse refreshes its access marker; snapshots unused for 24 hours are removed.
+    dataset_cache_retention_hours: 24
+    dataset_cache_cleanup_interval_seconds: 3600
+    # Optional durable mirror for final model bundles. The credentials file is
+    # ignored by Git and should be readable only by the service account.
+    object_store:
+      enabled: false
+      credentials_file: "./.secrets/alphablocks-s3.env"
+      endpoint_url: "http://10.126.126.5:9000"
+      bucket: "alphablocks-models"
+      region: "us-east-1"
+      prefix: "models"
+      artifact_kinds:
+        - bundle
+        - walk_forward_series

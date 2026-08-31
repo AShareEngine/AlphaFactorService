@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import factor_service.model_research_repository as repository_module
 from factor_service.model_research_repository import (
     ModelResearchRepository,
     ModelResearchConflict,
@@ -50,6 +51,92 @@ def _source() -> dict:
             "params": {"window": 20},
         }],
     }
+
+
+def test_create_inference_job_rejects_date_outside_rolling_revision() -> None:
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    repository.get_model = lambda _model_id, _version: {
+        "manifest_json": {
+            "walk_forward": {
+                "enabled": True,
+                "prediction_date_start": "2024-01-02",
+                "prediction_date_end": "2024-01-31",
+                "windows": [{
+                    "effective_date_start": "2024-01-02",
+                    "effective_date_end": "2024-01-31",
+                }],
+            },
+        },
+    }
+
+    with pytest.raises(ModelResearchConflict, match="必须先训练并发布"):
+        repository.create_inference_job(
+            "model-1", 1,
+            {
+                "trade_date": "2024-02-01",
+                "data_cutoff": "2024-02-01T16:00:00+08:00",
+            },
+        )
+
+
+def test_attach_artifact_object_storage_updates_completed_attempt(monkeypatch) -> None:
+    artifact = {
+        "artifact_id": "artifact-1",
+        "job_id": "job-1",
+        "artifact_kind": "bundle",
+        "file_name": "model.tar.gz",
+        "relative_path": "job-1/bundle/model.tar.gz",
+        "sha256": "a" * 64,
+        "size_bytes": 10,
+        "dataset_hash": "b" * 64,
+        "object_store_uri": "",
+        "object_store_version_id": "",
+        "object_store_sha256": "",
+    }
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return self
+
+        def execute(self, statement, params):
+            sql = " ".join(str(statement).split())
+            if sql.startswith("SELECT * FROM model_artifacts"):
+                return SimpleNamespace(fetchone=lambda: dict(artifact))
+            if sql.startswith("UPDATE model_artifacts"):
+                return SimpleNamespace(fetchone=lambda: {
+                    **artifact,
+                    "object_store_uri": params[0],
+                    "object_store_version_id": params[1],
+                    "object_store_sha256": params[2],
+                })
+            if sql.startswith("SELECT attempt_count FROM model_jobs"):
+                return SimpleNamespace(fetchone=lambda: {"attempt_count": 1})
+            raise AssertionError(sql)
+
+    database = SimpleNamespace(connection=lambda: _Connection())
+    audited = []
+    monkeypatch.setattr(
+        repository_module,
+        "_update_attempt_audit_row",
+        lambda *_args, **kwargs: audited.append(kwargs) or True,
+    )
+
+    result = ModelResearchRepository(database).attach_artifact_object_storage(
+        "artifact-1",
+        object_store_uri="s3://alphablocks-models/models/model.tar.gz",
+        object_store_version_id="version-1",
+        object_store_sha256="a" * 64,
+    )
+
+    assert result["object_store_version_id"] == "version-1"
+    assert audited[0]["ordinal"] == 1
+    assert audited[0]["artifact"]["object_store_sha256"] == "a" * 64
 
 
 def test_dataset_spec_preserves_versioned_capability_identities() -> None:
@@ -228,6 +315,28 @@ class _RecordingDatabase:
 
     def connection(self):
         return self.recording_connection
+
+
+def test_active_dataset_hashes_include_queued_and_executing_jobs() -> None:
+    class _ActiveDatasetConnection(_RecordingConnection):
+        def execute(self, query, _params=()):
+            normalized = " ".join(str(query).split())
+            self.queries.append(normalized)
+            self.executions.append((normalized, tuple(_params)))
+            if normalized.startswith("SELECT DISTINCT specs.spec_hash"):
+                return _Cursor(rows=[
+                    {"dataset_hash": "a" * 64},
+                    {"dataset_hash": "b" * 64},
+                ])
+            return super().execute(query, _params)
+
+    connection = _ActiveDatasetConnection({})
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+
+    hashes = repository.active_dataset_hashes()
+
+    assert hashes == {"a" * 64, "b" * 64}
+    assert "'queued', 'leased', 'running', 'uploading'" in connection.queries[0]
 
 
 def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
@@ -602,14 +711,22 @@ def test_completed_job_row_exposes_pending_and_registered_states() -> None:
             "registration": {"status": "declined"},
         },
     })
+    automatic = _job_row({
+        **pending,
+        "result_json": {
+            "metrics": {"ic": 0.03},
+            "registration": {"status": "automatic_pending"},
+        },
+    })
 
     assert pending["planned_model_version"] == 3
-    assert pending["registration_status"] == "pending_confirmation"
+    assert pending["registration_status"] == "legacy_pending_confirmation"
+    assert automatic["registration_status"] == "automatic_pending"
     assert registered["registration_status"] == "registered"
     assert declined["registration_status"] == "declined"
 
 
-def test_training_completion_does_not_insert_model_version_before_confirmation() -> None:
+def test_training_completion_persists_automatic_registration_intent() -> None:
     row = {
         "job_id": "job-pending",
         "kind": "train",
@@ -637,6 +754,14 @@ def test_training_completion_does_not_insert_model_version_before_confirmation()
     assert "INSERT INTO model_versions" not in sql
     assert "model_version = NULL" in sql
     assert "INSERT INTO model_job_events" in sql
+    result_payload = next(
+        value.obj
+        for query, params in connection.executions
+        if query.startswith("UPDATE model_jobs")
+        for value in params
+        if hasattr(value, "obj") and "metrics" in value.obj
+    )
+    assert result_payload["registration"]["status"] == "automatic_pending"
 
 
 def _claimable_job(*, attempt_count: int = 0, status: str = "queued") -> dict:
@@ -1081,7 +1206,7 @@ def test_declined_training_result_cannot_be_registered() -> None:
         "result_json": {"registration": {"status": "declined"}},
     }
 
-    with pytest.raises(ModelResearchConflict, match="已选择不入库"):
+    with pytest.raises(ModelResearchConflict, match="已被排除入库"):
         repository.register_training_result("job-declined")
 
 
@@ -1100,8 +1225,107 @@ def test_parameter_experiment_only_registers_validation_selected_job() -> None:
         },
     }
 
-    with pytest.raises(ModelResearchConflict, match="只允许验证集入选版本"):
+    with pytest.raises(ModelResearchConflict, match="验证集入选版本"):
         repository.register_training_result("job-runner-up")
+
+
+def test_completed_standalone_training_is_automatically_registered() -> None:
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    current = {
+        "job_id": "job-standalone",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "config_json": {},
+        "result_json": {"registration": {"status": "automatic_pending"}},
+    }
+    repository.get_job = lambda _job_id: dict(current)
+    registered: list[str] = []
+    repository.register_training_result = lambda job_id: (
+        registered.append(job_id) or {**current, "model_version": 4}
+    )
+
+    result = repository.finalize_training_result("job-standalone")
+
+    assert result["model_version"] == 4
+    assert registered == ["job-standalone"]
+
+
+def test_completed_experiment_registers_only_selected_trial() -> None:
+    repository = ModelResearchRepository.__new__(ModelResearchRepository)
+    current = {
+        "job_id": "job-final-trial",
+        "kind": "train",
+        "status": "succeeded",
+        "model_version": None,
+        "config_json": {"experiment": {"experiment_id": "experiment-1"}},
+        "result_json": {"registration": {"status": "automatic_pending"}},
+    }
+    repository.get_job = lambda _job_id: dict(current)
+    summary = {
+        "selection": {
+            "complete": True,
+            "status": "selected",
+            "selected_job_id": "job-winner",
+        },
+        "jobs": [current],
+    }
+    repository.get_training_experiment = lambda _experiment_id: summary
+    registered: list[str] = []
+    closed: list[tuple[dict, str]] = []
+    repository.register_training_result = lambda job_id: registered.append(job_id) or {}
+    repository._close_experiment_registration = lambda source, *, selected_job_id: (
+        closed.append((source, selected_job_id))
+    )
+
+    repository.finalize_training_result("job-final-trial")
+
+    assert registered == ["job-winner"]
+    assert closed == [(summary, "job-winner")]
+
+
+def test_registration_recovery_queries_only_durable_automatic_pending_jobs() -> None:
+    queries: list[str] = []
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, params):
+            queries.append(" ".join(str(statement).split()))
+            assert params == (25,)
+            return SimpleNamespace(fetchall=lambda: [
+                {"job_id": "job-pending-1"},
+                {"job_id": "job-pending-2"},
+            ])
+
+    repository = ModelResearchRepository(
+        SimpleNamespace(connection=lambda: _Connection()),
+    )
+    finalized: list[str] = []
+    repository.finalize_training_result = lambda job_id: (
+        finalized.append(job_id)
+        or {
+            "model_version": 1 if job_id.endswith("1") else None,
+            "result_json": {
+                "registration": {
+                    "status": (
+                        "registered" if job_id.endswith("1")
+                        else "experiment_not_selected"
+                    ),
+                },
+            },
+        }
+    )
+
+    result = repository.reconcile_pending_training_results(limit=25)
+
+    assert finalized == ["job-pending-1", "job-pending-2"]
+    assert result == {"pending": 2, "finalized": 2}
+    assert "result_json -> 'registration' ->> 'status' = 'automatic_pending'" in queries[0]
 
 
 def test_dataset_contract_freezes_stock_entity_asset_fields_without_factor_definition() -> None:
