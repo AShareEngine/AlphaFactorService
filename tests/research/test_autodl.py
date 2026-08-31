@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -26,6 +27,7 @@ from factor_service.research.remote import (
     load_remote_nodes,
     node_with_autodl_endpoint,
 )
+from tests.research.utils import valid_job
 
 
 class _Response:
@@ -62,6 +64,17 @@ def _node_runtime(tmp_path: Path) -> dict:
             "auto_stop": True,
         }]}}
     }
+
+
+def _settings(tmp_path: Path) -> Settings:
+    return Settings(
+        clickhouse_host="localhost", clickhouse_port=9000,
+        clickhouse_user="default", clickhouse_password="",
+        factor_database="ab_factor", model_database="ab_model",
+        source_database="starlight", work_root=tmp_path / "work",
+        model_artifacts_root=tmp_path / "artifacts", scheduler_enabled=False,
+        scheduler_refresh_seconds=60,
+    )
 
 
 def test_autodl_client_uses_fixed_host_and_token_environment(
@@ -234,15 +247,7 @@ def test_remote_executor_powers_on_waits_for_ssh_and_refreshes_endpoint(
     monkeypatch.setattr(
         "factor_service.research.remote.RemoteTransport", FakeTransport,
     )
-    settings = Settings(
-        clickhouse_host="localhost", clickhouse_port=9000,
-        clickhouse_user="default", clickhouse_password="",
-        factor_database="ab_factor", model_database="ab_model",
-        source_database="starlight", work_root=tmp_path / "work",
-        model_artifacts_root=tmp_path / "artifacts", scheduler_enabled=False,
-        scheduler_refresh_seconds=60,
-    )
-    executor = RemoteResearchExecutor(settings, node)
+    executor = RemoteResearchExecutor(_settings(tmp_path), node)
     executor.lifecycle = FakeLifecycle()
     events = []
 
@@ -255,6 +260,107 @@ def test_remote_executor_powers_on_waits_for_ssh_and_refreshes_endpoint(
     assert calls[-1] == ("ssh", "connect.example.test", 39453, "true")
     assert "remote_powering_on" in events
     assert executor.node.host == "connect.example.test"
+
+
+def test_remote_executor_stages_dataset_before_starting_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_AUTODL_TOKEN", "secret-token")
+    executor = RemoteResearchExecutor(
+        _settings(tmp_path), load_remote_nodes(_node_runtime(tmp_path))[0],
+    )
+    monkeypatch.setattr(
+        "factor_service.research.remote.DatasetBuilder", lambda _settings: object(),
+    )
+    calls = []
+
+    class SnapshotStore:
+        def get_or_create(self, *_args, **_kwargs):
+            calls.append("dataset")
+            return SimpleNamespace(reused=False)
+
+    executor.snapshot_store = SnapshotStore()
+
+    def stop_after_lifecycle(**_kwargs):
+        calls.append("lifecycle")
+        raise RuntimeError("stop after lifecycle ordering check")
+
+    executor._prepare_lifecycle = stop_after_lifecycle
+    executor._power_off_after_job = lambda *_args: calls.append("power_off")
+
+    with pytest.raises(RuntimeError, match="ordering check"):
+        executor.train(
+            valid_job(), tmp_path / "attempt",
+            cancellation=CancellationToken(), progress=lambda *_args: None,
+        )
+
+    assert calls == ["dataset", "lifecycle", "power_off"]
+
+
+def test_dataset_failure_never_calls_autodl_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_AUTODL_TOKEN", "secret-token")
+    executor = RemoteResearchExecutor(
+        _settings(tmp_path), load_remote_nodes(_node_runtime(tmp_path))[0],
+    )
+    monkeypatch.setattr(
+        "factor_service.research.remote.DatasetBuilder", lambda _settings: object(),
+    )
+    calls = []
+
+    class FailingSnapshotStore:
+        def get_or_create(self, *_args, **_kwargs):
+            calls.append("dataset")
+            raise ValueError("dataset generation failed")
+
+    executor.snapshot_store = FailingSnapshotStore()
+    executor._prepare_lifecycle = lambda **_kwargs: calls.append("lifecycle")
+    executor._power_off_after_job = lambda *_args: calls.append("power_off")
+
+    with pytest.raises(ValueError, match="dataset generation failed"):
+        executor.train(
+            valid_job(), tmp_path / "attempt",
+            cancellation=CancellationToken(), progress=lambda *_args: None,
+        )
+
+    assert calls == ["dataset"]
+
+
+def test_experiment_keeps_autodl_alive_only_for_ready_pending_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_AUTODL_TOKEN", "secret-token")
+    executor = RemoteResearchExecutor(
+        _settings(tmp_path), load_remote_nodes(_node_runtime(tmp_path))[0],
+    )
+    pending_hash = "b" * 64
+    pending = {
+        "job_id": "model_job_pending",
+        "status": "queued",
+        "dataset_hash": pending_hash,
+        "config_json": {"execution": {"node_id": executor.node.node_id}},
+    }
+
+    class Repository:
+        def list_jobs(self, **_kwargs):
+            return [pending]
+
+    monkeypatch.setattr(
+        "factor_service.model_research_repository.ModelResearchRepository",
+        Repository,
+    )
+    job = valid_job()
+    job["config_json"]["experiment"] = {"experiment_id": "experiment_test"}
+
+    assert executor._experiment_has_pending_remote_jobs(job) is False
+
+    snapshot = executor.snapshot_store.artifacts.root / "datasets" / pending_hash
+    snapshot.mkdir(parents=True)
+    for name in ("dataset.parquet", "dataset_raw.parquet", "dataset_manifest.json"):
+        (snapshot / name).write_bytes(b"ready")
+
+    assert executor._experiment_has_pending_remote_jobs(job) is True
 
 
 def test_remote_executor_still_powers_off_when_progress_is_canceled() -> None:

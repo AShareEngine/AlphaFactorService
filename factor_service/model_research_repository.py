@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 from itertools import product
 import json
@@ -866,7 +866,7 @@ class ModelResearchRepository:
                 "model": trial["model"],
                 "walk_forward": {
                     **walk_forward,
-                    "embargo_days": horizon,
+                    "embargo_sessions": horizon,
                 },
                 "execution": payload.get("execution") or {
                     "node_id": payload.get("execution_node_id") or "local",
@@ -2689,6 +2689,52 @@ class ModelResearchRepository:
         if not row:
             raise ModelResearchNotFound("模型版本不存在")
         return dict(row)
+
+    def resolve_model_reference(
+        self,
+        reference: str,
+        *,
+        version: int | None = None,
+    ) -> dict[str, Any]:
+        """Resolve one display name or model id to one immutable version."""
+
+        clean_reference = str(reference or "").strip()
+        if not clean_reference:
+            raise ModelResearchError("模型名称或model_id不能为空")
+        with self.database.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT model_id, version, name, state, created_at
+                FROM model_versions
+                WHERE (model_id = %s OR name = %s)
+                  AND state != 'archived'
+                  AND (%s::integer IS NULL OR version = %s::integer)
+                ORDER BY version DESC, created_at DESC
+                """,
+                (clean_reference, clean_reference, version, version),
+            ).fetchall()
+        if not rows:
+            raise ModelResearchNotFound("模型或指定版本不存在")
+        model_ids = sorted({str(row["model_id"]) for row in rows})
+        if clean_reference not in model_ids and len(model_ids) != 1:
+            raise ModelResearchConflict(
+                "模型名称不唯一，请改用model_id：" + "、".join(model_ids)
+            )
+        selected_model_id = (
+            clean_reference if clean_reference in model_ids else model_ids[0]
+        )
+        selected = next(
+            row for row in rows if str(row["model_id"]) == selected_model_id
+        )
+        return {
+            "model_id": selected_model_id,
+            "model_version": int(selected["version"]),
+            "name": str(selected["name"]),
+            "state": str(selected["state"]),
+            "resolved_from": (
+                "model_id" if clean_reference == selected_model_id else "name"
+            ),
+        }
 
     def update_model_registry(
         self,
@@ -6097,24 +6143,35 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             )
         return value
 
-    train_years = integer("train_years", 3, 1, 8)
-    valid_months = integer("valid_months", 6, 1, 36)
-    test_months = integer("test_months", 12, 1, 36)
-    step_months = integer("step_months", 12, 1, 36)
-    max_windows = integer("max_windows", 4, 1, 12)
-    embargo_days = integer("embargo_days", 5, 1, 30)
-    if step_months < test_months:
-        raise ModelResearchError("Walk-Forward步长不得小于测试窗口，避免样本外预测重叠")
+    train_sessions = integer("train_sessions", 756, 252, 2520)
+    valid_sessions = integer("valid_sessions", 60, 21, 504)
+    test_sessions = integer("test_sessions", 20, 1, 252)
+    step_sessions = integer("step_sessions", 20, 1, 252)
+    embargo_sessions = integer("embargo_sessions", 5, 1, 252)
+    if step_sessions != test_sessions:
+        raise ModelResearchError(
+            "Walk-Forward步长必须等于测试窗口，确保样本外日期完整且不重叠"
+        )
+    oos_date_start = str(source.get("oos_date_start") or "").strip()
+    oos_date_end = str(source.get("oos_date_end") or "").strip()
+    if enabled:
+        try:
+            oos_start = date.fromisoformat(oos_date_start)
+            oos_end = date.fromisoformat(oos_date_end)
+        except ValueError as exc:
+            raise ModelResearchError("Walk-Forward样本外起止日期必须是ISO日期") from exc
+        if oos_start > oos_end:
+            raise ModelResearchError("Walk-Forward样本外开始日期不得晚于结束日期")
     return {
         "enabled": enabled,
         "strategy": strategy,
-        "train_years": train_years,
-        "valid_months": valid_months,
-        "test_months": test_months,
-        "step_months": step_months,
-        "max_windows": max_windows,
-        "embargo_days": embargo_days,
-        "session_convention": {"year": 252, "month": 21},
+        "train_sessions": train_sessions,
+        "valid_sessions": valid_sessions,
+        "test_sessions": test_sessions,
+        "step_sessions": step_sessions,
+        "embargo_sessions": embargo_sessions,
+        "oos_date_start": oos_date_start,
+        "oos_date_end": oos_date_end,
     }
 
 

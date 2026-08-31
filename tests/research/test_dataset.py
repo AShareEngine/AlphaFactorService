@@ -488,12 +488,14 @@ def test_explicit_date_split_rejects_hidden_gaps() -> None:
 def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> None:
     dates = pd.date_range("2018-01-02", periods=1600, freq="B")
     windows = walk_forward_segments(
-        pd.Index(dates), train_years=1, valid_months=3,
-        test_months=12, step_months=12, max_windows=3, embargo_days=5,
+        pd.Index(dates), train_sessions=252, valid_sessions=63,
+        test_sessions=20, step_sessions=20, embargo_sessions=5,
+        oos_date_start=dates[1000].date().isoformat(),
+        oos_date_end=dates[1059].date().isoformat(),
     )
 
     assert len(windows) == 3
-    assert windows[-1]["test"][1] == dates[-1].date().isoformat()
+    assert windows[-1]["test"][1] == dates[1059].date().isoformat()
     for window in windows:
         train_start = dates.get_loc(pd.Timestamp(window["train"][0]))
         train_end = dates.get_loc(pd.Timestamp(window["train"][1]))
@@ -510,22 +512,26 @@ def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> 
 def test_walk_forward_expanding_windows_keep_original_train_start() -> None:
     dates = pd.date_range("2018-01-02", periods=1600, freq="B")
     windows = walk_forward_segments(
-        pd.Index(dates), strategy="expanding", train_years=1,
-        valid_months=3, test_months=6, step_months=6, max_windows=3,
+        pd.Index(dates), strategy="expanding", train_sessions=252,
+        valid_sessions=63, test_sessions=20, step_sessions=20,
+        oos_date_start=dates[1000].date().isoformat(),
+        oos_date_end=dates[1059].date().isoformat(),
     )
 
     assert len(windows) == 3
     assert {window["train"][0] for window in windows} == {dates[0].date().isoformat()}
     assert windows[0]["train"][1] < windows[-1]["train"][1]
-    assert windows[-1]["test"][1] == dates[-1].date().isoformat()
+    assert windows[-1]["test"][1] == dates[1059].date().isoformat()
 
 
 def test_walk_forward_rejects_overlapping_test_windows() -> None:
     dates = pd.date_range("2018-01-02", periods=1000, freq="B")
-    with pytest.raises(ValueError, match="步长不得小于测试窗口"):
+    with pytest.raises(ValueError, match="步长必须等于测试窗口"):
         walk_forward_segments(
-            pd.Index(dates), train_years=1, valid_months=3,
-            test_months=12, step_months=6,
+            pd.Index(dates), train_sessions=252, valid_sessions=63,
+            test_sessions=20, step_sessions=10,
+            oos_date_start=dates[500].date().isoformat(),
+            oos_date_end=dates[559].date().isoformat(),
         )
 
 

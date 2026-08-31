@@ -458,17 +458,18 @@ def test_job_validation_accepts_walk_forward_contract() -> None:
     source["config_json"]["walk_forward"] = {
         "enabled": True,
         "strategy": "rolling",
-        "train_years": 1,
-        "valid_months": 3,
-        "test_months": 12,
-        "step_months": 12,
-        "max_windows": 4,
-        "embargo_days": 5,
+        "train_sessions": 756,
+        "valid_sessions": 60,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
     }
 
     job = validate_job(source)
 
-    assert job["config_json"]["walk_forward"]["train_years"] == 1
+    assert job["config_json"]["walk_forward"]["train_sessions"] == 756
 
 
 def test_job_validation_accepts_strict_lightgbm_incremental_contract() -> None:
@@ -539,11 +540,13 @@ def test_job_validation_rejects_overlapping_walk_forward_tests() -> None:
     source = valid_job()
     source["config_json"]["walk_forward"] = {
         "enabled": True,
-        "test_months": 12,
-        "step_months": 6,
+        "test_sessions": 20,
+        "step_sessions": 10,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
     }
 
-    with pytest.raises(PermanentJobError, match="步长不得小于测试窗口"):
+    with pytest.raises(PermanentJobError, match="步长必须等于测试窗口"):
         validate_job(source)
 
 

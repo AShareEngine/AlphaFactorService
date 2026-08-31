@@ -9,6 +9,7 @@ from factor_service.model_backtest import (
     _compose_architecture_signals,
     _expand_architecture_prediction_scopes,
 )
+from factor_service.model_repository import _resolve_model_backtest_benchmark
 
 
 def _market(calendar: pd.DatetimeIndex, codes: list[str]) -> pd.DataFrame:
@@ -63,6 +64,14 @@ def test_top_n_rebalances_every_five_signal_sessions() -> None:
     )
 
     assert list(targets) == [calendar[1], calendar[6]]
+
+
+def test_model_backtest_benchmark_can_be_separate_from_universe() -> None:
+    assert _resolve_model_backtest_benchmark("all_a", None) == "000985.SH"
+    assert _resolve_model_backtest_benchmark("all_a", "000300.sh") == "000300.SH"
+
+    with pytest.raises(ValueError, match="系统已配置"):
+        _resolve_model_backtest_benchmark("all_a", "NOT_CONFIGURED")
 
 
 def _architecture_predictions() -> pd.DataFrame:

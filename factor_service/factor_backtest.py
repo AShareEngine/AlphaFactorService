@@ -444,6 +444,7 @@ def _load_market(
         ANY LEFT JOIN starlight.ad_history_stock_status s
           ON k.code = s.market_code AND toDate(k.trade_time) = s.trade_date
         WHERE k.code IN {codes:Array(String)}
+          AND k.open > 0
           AND toDate(k.trade_time) >= {date_start:Date} - INTERVAL 160 DAY
           AND toDate(k.trade_time) <= {date_end:Date} + INTERVAL 10 DAY
         ORDER BY trade_date, code
@@ -459,6 +460,9 @@ def _load_market(
     frame["date"] = pd.to_datetime(frame["date"])
     for column in ("open", "adjusted_open", "high_limit", "low_limit"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["adjusted_open"] = frame["adjusted_open"].where(
+        frame["adjusted_open"] > 0
+    )
     frame["has_open"] = frame["open"].notna() & (frame["open"] > 0)
     frame["buy_allowed"] = (
         frame["has_open"] & (frame["is_suspended"] == 0)

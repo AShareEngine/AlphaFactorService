@@ -415,6 +415,7 @@ class ModelBacktestJobCreate(BaseModel):
     model_id: str = Field(min_length=1)
     model_version: int = Field(ge=1)
     universe_id: str = "csi500"
+    benchmark_code: Optional[str] = Field(default=None, min_length=1)
     date_preset: Literal["3m", "1y", "3y", "10y", "custom"] = "3y"
     date_start: Optional[date] = None
     date_end: Optional[date] = None

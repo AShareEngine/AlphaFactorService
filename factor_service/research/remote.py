@@ -462,18 +462,25 @@ class RemoteResearchExecutor:
         remote_root = f"{self.node.work_dir}/runs/{job_id}/attempt-{attempt:03d}"
         cache_root = f"{self.node.work_dir}/cache"
         container = f"ab-research-{job_id[-32:]}-{attempt:03d}"
+        progress("remote_materializing_dataset", 4, {"node_id": self.node.node_id})
+        builder = DatasetBuilder(self.settings)
+        snapshot = self.snapshot_store.get_or_create(
+            job, work_dir, builder,
+            cancellation=cancellation, progress=progress,
+        )
+        progress("remote_dataset_staged", 56, {
+            "node_id": self.node.node_id,
+            "dataset_hash": job["dataset_hash"],
+            "snapshot_reused": snapshot.reused,
+        })
+        cancellation.checkpoint()
         remote_ready = False
+        lifecycle_attempted = False
         try:
+            lifecycle_attempted = self.lifecycle is not None
             self._prepare_lifecycle(cancellation=cancellation, progress=progress)
             remote_ready = True
-            progress("remote_materializing_dataset", 4, {"node_id": self.node.node_id})
-            builder = DatasetBuilder(self.settings)
-            snapshot = self.snapshot_store.get_or_create(
-                job, work_dir, builder,
-                cancellation=cancellation, progress=progress,
-            )
-            cancellation.checkpoint()
-            progress("remote_preparing", 57, {"node_id": self.node.node_id})
+            progress("remote_preparing", 60, {"node_id": self.node.node_id})
             source_root = Path(__file__).resolve().parents[1]
             source_fingerprint = _source_fingerprint(source_root)
             source_cache = f"{cache_root}/source/{source_fingerprint}"
@@ -546,7 +553,7 @@ class RemoteResearchExecutor:
             self.transport.push(
                 descriptor, f"{remote_root}/job.json", cancellation=cancellation,
             )
-            progress("remote_snapshot_uploaded", 60, {
+            progress("remote_snapshot_uploaded", 61, {
                 "node_id": self.node.node_id,
                 "dataset_hash": job["dataset_hash"],
                 "dataset_cache_hit": dataset_cache_hit,
@@ -557,7 +564,7 @@ class RemoteResearchExecutor:
             thread_count = _effective_remote_thread_count(
                 cpu_cores, _requested_job_threads(job),
             )
-            progress("remote_resources_ready", 61, {
+            progress("remote_resources_ready", 62, {
                 "node_id": self.node.node_id,
                 "cpu_cores": cpu_cores,
                 "training_threads": thread_count,
@@ -606,7 +613,7 @@ class RemoteResearchExecutor:
                 raise RetryableJobError(
                     f"远程{self.node.runner}启动失败: {launched.stderr.strip()[-1000:]}"
                 )
-            progress("remote_training", 62, {
+            progress("remote_training", 63, {
                 "node_id": self.node.node_id,
                 "runner": self.node.runner,
                 **({"container": container} if self.node.runner == "docker" else {}),
@@ -641,7 +648,8 @@ class RemoteResearchExecutor:
         finally:
             if remote_ready:
                 self._stop_remote_runner(container, remote_root)
-            self._power_off_after_job(job, progress)
+            if lifecycle_attempted:
+                self._power_off_after_job(job, progress)
 
     def _remote_cache_ready(
         self, remote_path: str, cancellation: CancellationToken,
@@ -682,7 +690,7 @@ class RemoteResearchExecutor:
     ) -> None:
         if self.lifecycle is None:
             return
-        progress("remote_checking_power", 1, {
+        progress("remote_checking_power", 57, {
             "node_id": self.node.node_id,
             "provider": self.node.lifecycle_provider,
         })
@@ -693,21 +701,21 @@ class RemoteResearchExecutor:
                 raise RetryableJobError(
                     f"AutoDL实例未开机（当前状态: {state}），请先开机或启用自动开机",
                 )
-            progress("remote_powering_on", 2, {
+            progress("remote_powering_on", 58, {
                 "node_id": self.node.node_id, "power_state": state,
             })
             self.lifecycle.power_on()
             state = self.lifecycle.wait_for_running(
                 timeout_seconds=self.node.boot_timeout_minutes * 60,
                 checkpoint=cancellation.checkpoint,
-                on_status=lambda current: progress("remote_powering_on", 2, {
+                on_status=lambda current: progress("remote_powering_on", 58, {
                     "node_id": self.node.node_id, "power_state": current,
                 }),
             )
         snapshot = self.lifecycle.snapshot()
         self.node = node_with_autodl_endpoint(self.node, snapshot)
         self.transport = RemoteTransport(self.node)
-        progress("remote_waiting_for_ssh", 3, {
+        progress("remote_waiting_for_ssh", 59, {
             "node_id": self.node.node_id,
             "power_state": state,
             "host": self.node.host,
@@ -795,9 +803,21 @@ class RemoteResearchExecutor:
             execution = dict(
                 dict(candidate.get("config_json") or {}).get("execution") or {}
             )
-            if str(execution.get("node_id") or "local") == self.node.node_id:
+            dataset_hash = str(candidate.get("dataset_hash") or "").strip().lower()
+            if (
+                str(execution.get("node_id") or "local") == self.node.node_id
+                and self._local_dataset_snapshot_ready(dataset_hash)
+            ):
                 return True
         return False
+
+    def _local_dataset_snapshot_ready(self, dataset_hash: str) -> bool:
+        if not dataset_hash:
+            return False
+        root = self.snapshot_store.artifacts.root / "datasets" / dataset_hash
+        return all((root / name).is_file() for name in (
+            "dataset.parquet", "dataset_raw.parquet", "dataset_manifest.json",
+        ))
 
     def _direct_python_command(self, remote_root: str, thread_count: int) -> str:
         gpu_enabled = bool(self.node.gpus and self.node.gpus != "0")
@@ -994,7 +1014,7 @@ class RemoteResearchExecutor:
                 continue
             progress(
                 f"remote.{item.get('stage') or 'training'}",
-                min(88, max(62, int(item.get("percent") or 0))),
+                min(88, max(63, int(item.get("percent") or 0))),
                 {"node_id": self.node.node_id, **dict(item.get("details") or {})},
             )
         return len(lines)

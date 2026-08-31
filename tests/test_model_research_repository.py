@@ -1452,12 +1452,13 @@ def _origin_source_job() -> dict:
     })
     walk_forward = _walk_forward_spec({
         "enabled": True,
-        "train_years": 1,
-        "valid_months": 3,
-        "test_months": 12,
-        "step_months": 12,
-        "max_windows": 3,
-        "embargo_days": 5,
+        "train_sessions": 756,
+        "valid_sessions": 60,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
     })
     return {
         "job_id": "source-job",
@@ -2046,18 +2047,29 @@ def test_transformer_lstm_contract_rejects_incompatible_heads() -> None:
 
 
 def test_walk_forward_contract_has_strict_independent_test_defaults() -> None:
-    spec = _walk_forward_spec({"enabled": True})
+    spec = _walk_forward_spec({
+        "enabled": True,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
+    })
 
     assert spec["strategy"] == "rolling"
-    assert spec["valid_months"] == 6
-    assert spec["test_months"] == 12
-    assert spec["step_months"] == 12
-    assert spec["embargo_days"] == 5
+    assert spec["train_sessions"] == 756
+    assert spec["valid_sessions"] == 60
+    assert spec["test_sessions"] == 20
+    assert spec["step_sessions"] == 20
+    assert spec["embargo_sessions"] == 5
 
 
 def test_walk_forward_contract_rejects_overlapping_test_windows() -> None:
-    with pytest.raises(ModelResearchError, match="样本外预测重叠"):
-        _walk_forward_spec({"enabled": True, "test_months": 12, "step_months": 6})
+    with pytest.raises(ModelResearchError, match="步长必须等于测试窗口"):
+        _walk_forward_spec({
+            "enabled": True,
+            "test_sessions": 20,
+            "step_sessions": 10,
+            "oos_date_start": "2023-01-03",
+            "oos_date_end": "2024-12-31",
+        })
 
 
 def test_job_transport_serializes_database_timestamps() -> None:
@@ -2233,7 +2245,7 @@ def test_horizon_experiment_creates_separate_frozen_datasets() -> None:
         item["dataset"]["label"]["horizon_trading_days"] for item in captured
     ] == [1, 5, 10]
     assert [item["dataset"]["split"]["embargo_days"] for item in captured] == [1, 5, 10]
-    assert [item["walk_forward"]["embargo_days"] for item in captured] == [1, 5, 10]
+    assert [item["walk_forward"]["embargo_sessions"] for item in captured] == [1, 5, 10]
     assert [
         item["experiment"]["search_params"]["label_horizon_trading_days"]
         for item in captured

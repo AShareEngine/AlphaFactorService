@@ -222,6 +222,8 @@ def test_progress_log_persists_upload_milestones_without_heartbeat_noise(
     job = valid_job()
     cancellation = CancellationToken()
 
+    worker._report_progress(job, cancellation, "remote_dataset_staged", 56, {})
+    worker._report_progress(job, cancellation, "remote_checking_power", 57, {})
     worker._report_progress(job, cancellation, "remote_preparing", 57, {})
     worker._report_progress(job, cancellation, "remote_preparing", 58, {})
     worker._report_progress(job, cancellation, "training_final_model", 70, {})
@@ -231,7 +233,7 @@ def test_progress_log_persists_upload_milestones_without_heartbeat_noise(
     )
 
     assert [item["record_event"] for item in api.renewals] == [
-        True, False, False, True,
+        True, True, True, False, False, True,
     ]
 
 

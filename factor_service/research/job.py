@@ -713,18 +713,37 @@ def _validate_walk_forward(source: Any) -> None:
     strategy = str(source.get("strategy") or "rolling")
     if strategy not in {"rolling", "expanding"}:
         raise PermanentJobError("Walk-Forward策略只允许rolling或expanding")
-    _integer(source.get("train_years", 3), "walk_forward.train_years", 1, 8)
-    _integer(source.get("valid_months", 6), "walk_forward.valid_months", 1, 36)
-    test_months = _integer(
-        source.get("test_months", 12), "walk_forward.test_months", 1, 36,
+    _integer(
+        source.get("train_sessions", 756),
+        "walk_forward.train_sessions", 252, 2520,
     )
-    step_months = _integer(
-        source.get("step_months", 12), "walk_forward.step_months", 1, 36,
+    _integer(
+        source.get("valid_sessions", 60),
+        "walk_forward.valid_sessions", 21, 504,
     )
-    _integer(source.get("max_windows", 4), "walk_forward.max_windows", 1, 12)
-    _integer(source.get("embargo_days", 5), "walk_forward.embargo_days", 1, 30)
-    if step_months < test_months:
-        raise PermanentJobError("Walk-Forward步长不得小于测试窗口")
+    test_sessions = _integer(
+        source.get("test_sessions", 20),
+        "walk_forward.test_sessions", 1, 252,
+    )
+    step_sessions = _integer(
+        source.get("step_sessions", 20),
+        "walk_forward.step_sessions", 1, 252,
+    )
+    _integer(
+        source.get("embargo_sessions", 5),
+        "walk_forward.embargo_sessions", 1, 252,
+    )
+    try:
+        oos_start = date.fromisoformat(str(source.get("oos_date_start") or ""))
+        oos_end = date.fromisoformat(str(source.get("oos_date_end") or ""))
+    except ValueError as exc:
+        raise PermanentJobError("Walk-Forward样本外起止日期必须是ISO日期") from exc
+    if oos_start > oos_end:
+        raise PermanentJobError("Walk-Forward样本外开始日期不得晚于结束日期")
+    if step_sessions != test_sessions:
+        raise PermanentJobError(
+            "Walk-Forward步长必须等于测试窗口，确保样本外日期完整且不重叠"
+        )
 
 
 def _validate_incremental_training(

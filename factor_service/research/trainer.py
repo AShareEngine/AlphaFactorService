@@ -206,6 +206,13 @@ class QlibTrainer:
                     walk_forward_prediction, walk_forward_report = _run_walk_forward(
                         prepared,
                         walk_forward_config,
+                        work_dir=work_dir,
+                        model_id=str(job["model_id"]),
+                        model_version=int(
+                            (job.get("config_json") or {}).get(
+                                "planned_model_version"
+                            ) or 1
+                        ),
                         model_kind=model_kind,
                         raw_params=raw_params,
                         DataHandlerLP=DataHandlerLP,
@@ -422,6 +429,13 @@ class QlibTrainer:
                 archive.add(recorder_db, arcname=recorder_db.name)
             if recorder_root.exists():
                 archive.add(recorder_root, arcname="mlruns")
+            walk_forward_root = work_dir / "walk_forward"
+            if walk_forward_root.exists():
+                archive.add(walk_forward_root, arcname="walk_forward")
+        walk_forward_bundle_path = work_dir / "walk_forward_series.tar.gz"
+        if walk_forward_report is not None:
+            with tarfile.open(walk_forward_bundle_path, "w:gz") as archive:
+                archive.add(work_dir / "walk_forward", arcname="walk_forward")
         result = {
             "metrics": metrics,
             "feature_importance": feature_importance,
@@ -443,6 +457,8 @@ class QlibTrainer:
             ("manifest", manifest_path),
             ("training_diagnostics", training_diagnostics_path),
         ]
+        if walk_forward_report is not None:
+            artifacts.append(("walk_forward_series", walk_forward_bundle_path))
         _checkpoint(cancellation)
         _progress(progress, "packaged", 88, {
             "artifact_count": len(artifacts), "prediction_rows": prediction_rows,
@@ -569,10 +585,21 @@ def _prepare_recorder_experiment(
         )
 
 
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _run_walk_forward(
     prepared: PreparedDataset,
     config: dict[str, Any],
     *,
+    work_dir: Path,
+    model_id: str,
+    model_version: int,
     model_kind: str,
     raw_params: dict[str, Any],
     DataHandlerLP: Any,
@@ -588,18 +615,21 @@ def _run_walk_forward(
     windows = walk_forward_segments(
         dates,
         strategy=str(config.get("strategy") or "rolling"),
-        train_years=int(config.get("train_years") or 3),
-        valid_months=int(config.get("valid_months") or 6),
-        test_months=int(config.get("test_months") or 12),
-        step_months=int(config.get("step_months") or 12),
-        max_windows=int(config.get("max_windows") or 4),
-        embargo_days=int(config.get("embargo_days") or 5),
+        train_sessions=int(config.get("train_sessions") or 756),
+        valid_sessions=int(config.get("valid_sessions") or 60),
+        test_sessions=int(config.get("test_sessions") or 20),
+        step_sessions=int(config.get("step_sessions") or 20),
+        embargo_sessions=int(config.get("embargo_sessions") or 5),
+        oos_date_start=str(config.get("oos_date_start") or ""),
+        oos_date_end=str(config.get("oos_date_end") or ""),
     )
     if not windows:
         raise ValueError("没有可执行的Walk-Forward窗口")
 
     predictions: list[pd.Series] = []
     reports: list[dict[str, Any]] = []
+    series_root = work_dir / "walk_forward"
+    series_root.mkdir(parents=True, exist_ok=False)
     total = len(windows)
     for index, segments in enumerate(windows, start=1):
         _checkpoint(cancellation)
@@ -633,12 +663,46 @@ def _run_walk_forward(
             prediction, raw_frame, segments["test"],
             classification=classification,
         )
+        if hasattr(model, "to_cpu"):
+            model.to_cpu()
+        _prepare_model_for_serialization(model_kind, model)
+        window_root = series_root / f"window_{index:04d}"
+        window_root.mkdir()
+        window_model_path = window_root / "model.pkl"
+        with window_model_path.open("wb") as target:
+            pickle.dump(model, target)
+        window_manifest = {
+            "schema_version": "alphablocks.walk-forward-window.v1",
+            "series_id": model_id,
+            "series_revision": int(model_version),
+            "window": index,
+            "model_kind": model_kind,
+            "segments": segments,
+            "effective_date_start": segments["test"][0],
+            "effective_date_end": segments["test"][1],
+            "feature_names": list(prepared.feature_names),
+            "train_medians": medians,
+            "metrics": window_metrics,
+            "model_sha256": _file_sha256(window_model_path),
+        }
+        window_manifest_path = window_root / "manifest.json"
+        window_manifest_path.write_text(
+            json.dumps(window_manifest, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         predictions.append(prediction)
         reports.append({
             "window": index,
             "segments": segments,
             "metrics": window_metrics,
             "train_medians": medians,
+            "effective_date_start": segments["test"][0],
+            "effective_date_end": segments["test"][1],
+            "artifact": {
+                "path": f"walk_forward/window_{index:04d}",
+                "model_sha256": window_manifest["model_sha256"],
+                "manifest_sha256": _file_sha256(window_manifest_path),
+            },
         })
 
     stitched = pd.concat(predictions).sort_index()
@@ -657,14 +721,19 @@ def _run_walk_forward(
         "positive_ic_window_ratio": float(np.mean(window_ics > 0)),
     })
     report = {
-        "schema_version": "alphablocks.walk-forward.v1",
+        "schema_version": "alphablocks.walk-forward-model-series.v1",
         "enabled": True,
+        "series_id": model_id,
+        "series_revision": int(model_version),
+        "publish_state": "ready",
         "strategy": str(config.get("strategy") or "rolling"),
-        "train_years": int(config.get("train_years") or 3),
-        "valid_months": int(config.get("valid_months") or 6),
-        "test_months": int(config.get("test_months") or 12),
-        "step_months": int(config.get("step_months") or 12),
-        "embargo_days": int(config.get("embargo_days") or 5),
+        "train_sessions": int(config.get("train_sessions") or 756),
+        "valid_sessions": int(config.get("valid_sessions") or 60),
+        "test_sessions": int(config.get("test_sessions") or 20),
+        "step_sessions": int(config.get("step_sessions") or 20),
+        "embargo_sessions": int(config.get("embargo_sessions") or 5),
+        "oos_date_start": str(config.get("oos_date_start") or ""),
+        "oos_date_end": str(config.get("oos_date_end") or ""),
         "window_count": total,
         "windows": reports,
         "aggregate": aggregate,

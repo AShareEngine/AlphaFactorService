@@ -42,6 +42,8 @@ PERSISTED_PROGRESS_STAGES = frozenset({
     "building_labels",
     "splitting_dataset",
     "dataset_ready",
+    "remote_dataset_staged",
+    "remote_checking_power",
     "remote_powering_on",
     "remote_waiting_for_ssh",
     "remote_materializing_dataset",

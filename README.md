@@ -26,6 +26,7 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 - `POST /factor-values/sync-states` 批量查询因子规格的真实持久化覆盖范围，供自动全量/增量同步规划使用。
 - `POST /model-inference/availability` 按冻结因子、数据截止时间和历史交易日检查每日推理可用性。
 - `GET /model-signals` 返回指定不可变模型版本、交易日的PIT安全TopN信号，供AlphaBlocks正式策略回测读取。
+- `POST /model-backtests/jobs` 支持用可选 `benchmark_code` 将选股范围与报告基准分离；基准只能取系统已配置指数，未传时仍使用股票池默认基准。
 - `POST /model-research/jobs` 创建训练任务，`POST /model-research/jobs/{job_id}/dispatch` 在本服务中调度执行；`execution.max_runtime_minutes`冻结60至1440分钟的任务上限，超时后终止隔离进程并记录`training_timeout`。
 - `DELETE /model-research/models/{model_id}/versions/{version}` 永久删除未被主模型、运行任务、部署、架构或其他冻结模型引用的版本，并清理其预测、回测与独占产物。
 - `GET /research/ready` 和 `GET /research/status` 查询内置研究调度器状态。
@@ -165,28 +166,31 @@ AlphaFactorService不通过AlphaBlocks API回写模型状态或元数据。只�
 
 ### Walk-Forward滚动评估
 
-训练任务可选开启严格Walk-Forward评估。每个窗口按交易日依次执行
-`训练 → 5日隔离 → 验证 → 5日隔离 → 独立测试`，逐窗缺失值中位数仅使用该窗训练段拟合。
-各窗口测试预测按时间拼接后写入模型信号库并用于Top20研究回测；正式模型产物仍单独训练和保存，
-用于后续每日推理。滚动窗口默认按1年252个交易日、1个月21个交易日换算。
+训练任务可选开启严格Walk-Forward评估。窗口长度全部使用实际交易日，默认依次执行
+`756日训练 → 隔离 → 60日验证 → 隔离 → 20日独立测试`，隔离长度不得小于标签周期。
+用户显式选择样本外起止日，服务生成覆盖整个区间的全部窗口，不再使用最大窗口数截断。
+逐窗缺失值中位数仅使用该窗训练段拟合；每窗模型、预处理参数、指标和生效区间都随模型版本
+持久化，拼接后的样本外分数写入模型信号库。
 
 ```json
 {
   "walk_forward": {
     "enabled": true,
     "strategy": "rolling",
-    "train_years": 1,
-    "valid_months": 3,
-    "test_months": 12,
-    "step_months": 12,
-    "max_windows": 4,
-    "embargo_days": 5
+    "train_sessions": 756,
+    "valid_sessions": 60,
+    "test_sessions": 20,
+    "step_sessions": 20,
+    "embargo_sessions": 5,
+    "oos_date_start": "2022-01-04",
+    "oos_date_end": "2025-12-31"
   }
 }
 ```
 
-为保证拼接后的样本外信号唯一，`step_months`不得小于`test_months`。`expanding`策略固定首个
-训练日并逐窗扩展训练段；`rolling`策略保持训练长度不变并向前滚动。
+为保证样本外日期完整且预测唯一，`step_sessions`必须等于`test_sessions`；末窗不足一个标准
+测试周期时按剩余交易日生成。`expanding`策略固定首个训练日并逐窗扩展训练段；`rolling`策略
+保持训练长度不变并向前滚动。
 
 安装后可用统一命令执行环境诊断：
 

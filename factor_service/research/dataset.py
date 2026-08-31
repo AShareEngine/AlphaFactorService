@@ -2243,47 +2243,53 @@ def walk_forward_segments(
     dates: pd.Index,
     *,
     strategy: str = "rolling",
-    train_years: int = 3,
-    valid_months: int = 6,
-    test_months: int = 12,
-    step_months: int = 12,
-    max_windows: int = 4,
-    embargo_days: int = 5,
+    train_sessions: int = 756,
+    valid_sessions: int = 60,
+    test_sessions: int = 20,
+    step_sessions: int = 20,
+    embargo_sessions: int = 5,
+    oos_date_start: str = "",
+    oos_date_end: str = "",
 ) -> list[dict[str, tuple[str, str]]]:
-    """Build recent, non-overlapping walk-forward windows from trading sessions.
-
-    One year is defined as 252 observed trading sessions and one month as 21.
-    All embargoes are counted using the supplied trading calendar. Windows are
-    planned backwards from the latest observed session so the final independent
-    test window always reaches the frozen dataset boundary. This avoids silently
-    leaving a recent partial step outside the stability assessment.
-    """
-    unique = pd.Index(sorted(pd.to_datetime(dates).unique()))
+    """Build every non-overlapping OOS window in the requested trading-date span."""
+    unique = pd.Index(sorted(pd.to_datetime(dates).normalize().unique()))
     if strategy not in {"rolling", "expanding"}:
         raise ValueError("Walk-Forward策略只允许rolling或expanding")
-    train_sessions = int(train_years) * 252
-    valid_sessions = int(valid_months) * 21
-    test_sessions = int(test_months) * 21
-    step_sessions = int(step_months) * 21
-    embargo = int(embargo_days)
-    limit = int(max_windows)
-    if train_sessions < 252 or valid_sessions < 21 or test_sessions < 21:
+    train_sessions = int(train_sessions)
+    valid_sessions = int(valid_sessions)
+    test_sessions = int(test_sessions)
+    step_sessions = int(step_sessions)
+    embargo = int(embargo_sessions)
+    if train_sessions < 252 or valid_sessions < 21 or test_sessions < 1:
         raise ValueError("Walk-Forward训练、验证或测试窗口长度无效")
-    if step_sessions < test_sessions:
-        raise ValueError("Walk-Forward步长不得小于测试窗口，避免样本外预测日期重叠")
-    if embargo < 1 or limit < 1:
-        raise ValueError("Walk-Forward隔离天数和窗口数必须大于0")
+    if step_sessions != test_sessions:
+        raise ValueError("Walk-Forward步长必须等于测试窗口，确保样本外日期完整且不重叠")
+    if embargo < 1:
+        raise ValueError("Walk-Forward隔离交易日必须大于0")
 
-    required = train_sessions + valid_sessions + test_sessions + embargo * 2
-    if len(unique) < required:
+    try:
+        oos_start = pd.Timestamp(oos_date_start).normalize()
+        oos_end = pd.Timestamp(oos_date_end).normalize()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Walk-Forward样本外起止日期无效") from exc
+    calendar = set(unique)
+    if oos_start not in calendar or oos_end not in calendar:
+        raise ValueError("Walk-Forward样本外起止日期必须是有效交易日")
+    if oos_start > oos_end:
+        raise ValueError("Walk-Forward样本外开始日期不得晚于结束日期")
+
+    minimum_history = train_sessions + valid_sessions + embargo * 2
+    first_oos_index = int(unique.get_loc(oos_start))
+    if first_oos_index < minimum_history:
         raise ValueError(
-            f"有效交易日不足{required}天，无法生成Walk-Forward训练/验证/测试窗口"
+            f"样本外开始日前至少需要{minimum_history}个交易日用于训练、验证和隔离"
         )
 
     windows: list[dict[str, tuple[str, str]]] = []
-    for reverse_index in range(limit):
-        test_end_index = len(unique) - 1 - reverse_index * step_sessions
-        test_start_index = test_end_index - test_sessions + 1
+    last_oos_index = int(unique.get_loc(oos_end))
+    test_start_index = first_oos_index
+    while test_start_index <= last_oos_index:
+        test_end_index = min(test_start_index + test_sessions - 1, last_oos_index)
         valid_end_index = test_start_index - embargo - 1
         valid_start_index = valid_end_index - valid_sessions + 1
         train_end_index = valid_start_index - embargo - 1
@@ -2292,13 +2298,18 @@ def walk_forward_segments(
             else train_end_index - train_sessions + 1
         )
         if train_start_index < 0:
-            break
+            raise ValueError("Walk-Forward训练历史不足，无法覆盖完整样本外区间")
         windows.append({
             "train": _date_range(unique, train_start_index, train_end_index),
             "valid": _date_range(unique, valid_start_index, valid_end_index),
             "test": _date_range(unique, test_start_index, test_end_index),
         })
-    return list(reversed(windows))
+        test_start_index += step_sessions
+    if not windows or windows[0]["test"][0] != oos_start.date().isoformat():
+        raise ValueError("Walk-Forward未能覆盖样本外开始日期")
+    if windows[-1]["test"][1] != oos_end.date().isoformat():
+        raise ValueError("Walk-Forward步长在样本外区间留下了未覆盖日期")
+    return windows
 
 
 def _date_range(dates: pd.Index, start: int, end: int) -> tuple[str, str]:

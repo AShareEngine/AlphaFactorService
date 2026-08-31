@@ -48,6 +48,15 @@ class _Repository:
             ]
         return jobs[:limit]
 
+    def resolve_model_reference(self, reference, *, version=None):
+        return {
+            "model_id": "model-a",
+            "model_version": int(version or 3),
+            "name": str(reference),
+            "state": "candidate",
+            "resolved_from": "name",
+        }
+
     def create_training_job(self, payload):
         self.created_payload = payload
         job = {"job_id": "job-created", "status": "queued", "title": payload["title"]}
@@ -376,6 +385,39 @@ def test_training_job_is_created_and_dispatched_locally(monkeypatch) -> None:
     assert dispatched.status_code == 202
     assert dispatched.json()["service"]["accepted"] is True
     assert scheduler.submitted[0]["lease_owner"] == "alpha-factor-service"
+
+
+def test_model_score_query_freezes_resolved_version_and_exact_date(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    captured = {}
+
+    def snapshot(**kwargs):
+        captured.update(kwargs)
+        return {
+            "model_id": kwargs["model_id"],
+            "model_version": kwargs["model_version"],
+            "trade_date": kwargs["trade_date"].isoformat(),
+            "rows": [{"entity_code": "000001.SZ", "score": 0.9}],
+        }
+
+    monkeypatch.setattr(
+        model_research.model_repository, "model_score_snapshot", snapshot,
+    )
+
+    response = client.post(
+        "/model-research/model-scores/query",
+        json={"model": "大小盘选股", "date": "2026-08-28", "topk": 20},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolved_model"]["model_version"] == 3
+    assert captured == {
+        "model_id": "model-a",
+        "model_version": 3,
+        "trade_date": date(2026, 8, 28),
+        "topk": 20,
+    }
 
 
 def test_training_job_freezes_configured_database_binding(monkeypatch) -> None:

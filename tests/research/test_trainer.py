@@ -844,10 +844,13 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
             prediction, report = _run_walk_forward(
                 prepared,
                 {
-                    "enabled": True, "strategy": "rolling", "train_years": 1,
-                    "valid_months": 1, "test_months": 1, "step_months": 1,
-                    "max_windows": 1, "embargo_days": 5,
+                    "enabled": True, "strategy": "rolling", "train_sessions": 252,
+                    "valid_sessions": 21, "test_sessions": 21, "step_sessions": 21,
+                    "embargo_sessions": 5,
+                    "oos_date_start": dates[300].date().isoformat(),
+                    "oos_date_end": dates[320].date().isoformat(),
                 },
+                work_dir=root, model_id="walk_forward_test", model_version=1,
                 model_kind="lightgbm",
                 raw_params={"n_estimators": 2, "early_stopping_rounds": 1, "num_threads": 1},
                 DataHandlerLP=DataHandlerLP, DatasetH=DatasetH,

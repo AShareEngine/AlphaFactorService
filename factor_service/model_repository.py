@@ -240,6 +240,82 @@ def list_model_predictions(
     ]
 
 
+def model_score_snapshot(
+    *,
+    model_id: str,
+    model_version: int,
+    trade_date: date,
+    topk: int | None = None,
+) -> dict[str, Any]:
+    """Return one exact, complete score cross-section without date fallback."""
+
+    trading_rows = client().query(
+        """
+        SELECT count()
+        FROM starlight.ad_market_kline_daily
+        WHERE toDate(trade_time) = {trade_date:Date}
+        """,
+        parameters={"trade_date": trade_date},
+    ).result_rows
+    if not trading_rows or int(trading_rows[0][0]) <= 0:
+        raise ValueError(f"{trade_date.isoformat()}不是有效交易日")
+    database = settings().model_database
+    rows = client().query(
+        f"""
+        SELECT entity_code, score, raw_prediction, rank_value, percentile,
+               feature_cutoff_at, computed_at, source_vintage, dataset_hash,
+               inference_run_id
+        FROM {database}.model_predictions_daily FINAL
+        WHERE model_id = {{model_id:String}}
+          AND model_version = {{model_version:UInt32}}
+          AND trade_date = {{trade_date:Date}}
+        ORDER BY score DESC, entity_code ASC
+        LIMIT 10000
+        """,
+        parameters={
+            "model_id": str(model_id),
+            "model_version": int(model_version),
+            "trade_date": trade_date,
+        },
+    ).result_rows
+    if not rows:
+        raise ValueError(
+            f"模型{model_id} v{model_version}在{trade_date.isoformat()}没有分数截面"
+        )
+    if len({str(row[0]) for row in rows}) != len(rows):
+        raise ValueError("模型分数截面包含重复股票")
+    if any(row[1] is None or not np.isfinite(float(row[1])) for row in rows):
+        raise ValueError("模型分数截面包含缺失或非有限分数")
+    limit = len(rows) if topk is None else max(1, min(int(topk), len(rows)))
+    selected = rows[:limit]
+    return {
+        "schema_version": "alphablocks.model-score-snapshot.v1",
+        "model_id": str(model_id),
+        "model_version": int(model_version),
+        "trade_date": trade_date.isoformat(),
+        "row_count": len(rows),
+        "returned_count": len(selected),
+        "order": "score_desc_entity_code_asc",
+        "rows": [
+            {
+                "entity_code": str(row[0]),
+                "score": float(row[1]),
+                "raw_prediction": (
+                    float(row[2]) if row[2] is not None else None
+                ),
+                "rank_value": int(row[3]) if row[3] is not None else None,
+                "percentile": float(row[4]) if row[4] is not None else None,
+                "feature_cutoff_at": row[5].isoformat(),
+                "computed_at": row[6].isoformat(),
+                "source_vintage": str(row[7]),
+                "dataset_hash": str(row[8]),
+                "inference_run_id": str(row[9]),
+            }
+            for row in selected
+        ],
+    }
+
+
 def model_prediction_overview(
     *, model_id: str, model_version: int, trade_date: Optional[date] = None,
     top_n: int = 20, history_days: int = 120,
@@ -3601,6 +3677,9 @@ def delete_model_data(*, model_id: str, model_version: int) -> dict[str, object]
 def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJobOut:
     if payload.universe_id not in UNIVERSES:
         raise ValueError("不支持的股票池")
+    benchmark_code = _resolve_model_backtest_benchmark(
+        payload.universe_id, payload.benchmark_code,
+    )
     if payload.date_preset == "custom":
         if not payload.date_start or not payload.date_end or payload.date_start >= payload.date_end:
             raise ValueError("自定义回测必须提供有效日期范围")
@@ -3629,10 +3708,13 @@ def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJ
         "exclude_delisting": False,
         "exclude_bse": False,
         "research_only": bool(payload.research_only),
+        "benchmark_source": (
+            "explicit_override" if payload.benchmark_code else "universe_default"
+        ),
     }
     row = [
         backtest_job_id, payload.model_id, payload.model_version,
-        payload.universe_id, UNIVERSES[payload.universe_id]["benchmark"],
+        payload.universe_id, benchmark_code,
         payload.date_preset, payload.date_start, payload.date_end, None, None,
         payload.top_n, payload.rebalance_every, 0.0003, 0.0013,
         json.dumps(configuration, ensure_ascii=False, sort_keys=True),
@@ -3644,6 +3726,20 @@ def create_model_backtest_job(payload: ModelBacktestJobCreate) -> ModelBacktestJ
         column_names=_MODEL_JOB_COLUMNS,
     )
     return get_model_backtest_job(backtest_job_id)  # type: ignore[return-value]
+
+
+def _resolve_model_backtest_benchmark(
+    universe_id: str, benchmark_code: Optional[str],
+) -> str:
+    default = str(UNIVERSES[universe_id]["benchmark"])
+    requested = str(benchmark_code or default).strip().upper()
+    configured = {
+        str(item["benchmark"]).strip().upper()
+        for item in UNIVERSES.values()
+    }
+    if requested not in configured:
+        raise ValueError("回测基准必须来自系统已配置的指数")
+    return requested
 
 
 def create_architecture_backtest_job(

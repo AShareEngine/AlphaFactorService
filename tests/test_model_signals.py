@@ -10,6 +10,37 @@ import pytest
 from factor_service import model_repository
 
 
+def test_model_score_snapshot_requires_exact_date_and_stable_order(monkeypatch) -> None:
+    target_date = date(2026, 8, 28)
+    cutoff = datetime(2026, 8, 28, 15, 0)
+    responses = [
+        [(4000,)],
+        [
+            ("000002.SZ", 0.9, 0.8, 1, 1.0, cutoff, cutoff, "v1", "hash", "run"),
+            ("000001.SZ", 0.7, 0.6, 2, 0.5, cutoff, cutoff, "v1", "hash", "run"),
+        ],
+    ]
+
+    class _Client:
+        def query(self, _query, parameters):
+            assert parameters["trade_date"] == target_date
+            return SimpleNamespace(result_rows=responses.pop(0))
+
+    monkeypatch.setattr(model_repository, "client", lambda: _Client())
+    monkeypatch.setattr(
+        model_repository, "settings",
+        lambda: SimpleNamespace(model_database="ab_model"),
+    )
+
+    result = model_repository.model_score_snapshot(
+        model_id="model-a", model_version=4, trade_date=target_date, topk=1,
+    )
+
+    assert result["row_count"] == 2
+    assert result["returned_count"] == 1
+    assert result["rows"][0]["entity_code"] == "000002.SZ"
+
+
 def test_stock_market_history_uses_real_ohlc_and_latest_display_name(monkeypatch) -> None:
     calls = []
 

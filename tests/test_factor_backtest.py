@@ -3,9 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from factor_service import factor_backtest
 from factor_service.factor_backtest import (
     _annualized_return,
     _build_targets,
+    _load_market,
     _max_drawdown,
     _normalize_signal_dates,
     _sample_filters,
@@ -211,3 +213,38 @@ def test_summary_math_uses_trading_day_annualization_and_negative_drawdown():
     daily = [0.001] * 252
     assert _annualized_return(daily) == pytest.approx((1.001 ** 252) - 1)
     assert _max_drawdown(pd.Series([1.0, 1.1, 0.88, 1.2])) == pytest.approx(-0.2)
+
+
+def test_market_loader_rejects_zero_open_rows_and_never_creates_minus_one_return(
+    monkeypatch,
+):
+    calendar = pd.DatetimeIndex(["2024-01-08", "2024-01-09", "2024-01-10"])
+    rows = [
+        ("2024-01-08", "000001.SZ", 10.0, 10.0, 0, 0, 0, None, None),
+        ("2024-01-09", "000001.SZ", 11.0, 11.0, 0, 0, 0, None, None),
+        ("2024-01-09", "000001.SZ", 0.0, 0.0, 0, 0, 0, None, None),
+        ("2024-01-10", "000001.SZ", 12.0, 12.0, 0, 0, 0, None, None),
+    ]
+
+    class FakeClient:
+        query_text = ""
+
+        def query(self, query_text, *, parameters):
+            self.query_text = query_text
+            return type("Result", (), {"result_rows": rows})()
+
+    fake = FakeClient()
+    monkeypatch.setattr(factor_backtest, "client", lambda: fake)
+    job = type("Job", (), {
+        "date_start": pd.Timestamp("2024-01-08").date(),
+        "date_end": pd.Timestamp("2024-01-10").date(),
+    })()
+
+    market = _load_market(job, ["000001.SZ"], calendar)
+
+    assert "AND k.open > 0" in fake.query_text
+    assert market["forward_return"].map(pd.notna).all()
+    assert market["forward_return"].min() > -1.0
+    assert market.loc[
+        market["date"] == pd.Timestamp("2024-01-08"), "forward_return"
+    ].item() == pytest.approx(0.0)

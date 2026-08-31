@@ -1130,6 +1130,31 @@ def list_models(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]
         _raise(exc)
 
 
+@router.post("/model-scores/query")
+def query_model_scores(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Resolve a model once and return its exact-date immutable score snapshot."""
+
+    try:
+        version_value = payload.get("model_version")
+        resolved = repository.resolve_model_reference(
+            str(payload.get("model") or payload.get("model_id") or ""),
+            version=(int(version_value) if version_value not in (None, "") else None),
+        )
+        trade_date = datetime.fromisoformat(
+            str(payload.get("date") or payload.get("trade_date") or "")[:10]
+        ).date()
+        topk_value = payload.get("topk")
+        snapshot = model_repository.model_score_snapshot(
+            model_id=str(resolved["model_id"]),
+            model_version=int(resolved["model_version"]),
+            trade_date=trade_date,
+            topk=(int(topk_value) if topk_value not in (None, "") else None),
+        )
+        return {"ok": True, "resolved_model": resolved, "snapshot": snapshot}
+    except Exception as exc:
+        _raise(exc)
+
+
 @router.get("/architectures")
 def list_model_architectures(
     limit: int = Query(default=100, ge=1, le=200),
