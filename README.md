@@ -29,6 +29,8 @@ AlphaBlocks统一的数据研究服务，负责因子、Qlib模型训练与推�
 - `POST /model-backtests/jobs` 支持用可选 `benchmark_code` 将选股范围与报告基准分离；基准只能取系统已配置指数，未传时仍使用股票池默认基准。
 - `POST /model-research/jobs` 创建训练任务，`POST /model-research/jobs/{job_id}/dispatch` 在本服务中调度执行；`execution.max_runtime_minutes`冻结60至1440分钟的任务上限，超时后终止隔离进程并记录`training_timeout`。
 - `DELETE /model-research/models/{model_id}/versions/{version}` 永久删除未被主模型、运行任务、部署、架构或其他冻结模型引用的版本，并清理其预测、回测与独占产物。
+- 删除模型时会自动核对 `paper` 部署快照对应的模拟盘是否仍存在；仅当策略已删除时，才清理孤儿部署引用并继续删除模型。仍存在的策略、非 `paper` 部署或无法核对的引用都会保留并返回冲突。
+- `DELETE /model-research/architectures/{architecture_id}` 永久删除未激活且没有运行中回测的模型架构，并清理其引擎引用和ClickHouse回测证据。
 - `GET /research/ready` 和 `GET /research/status` 查询内置研究调度器状态。
 
 聚宽因子迁移实施参考见 [`docs/joinquant-factor-catalog.md`](docs/joinquant-factor-catalog.md)，可通过
@@ -97,6 +99,17 @@ python3.11 -m venv .venv
 .venv/bin/pip install -e .
 pm2 start ecosystem.config.js
 ```
+
+远程GPU节点不使用`runtime.local.yaml`。节点普通字段保存在PostgreSQL
+`model_execution_nodes`，SSH密码、SSH私钥正文和AutoDL Token经AES-GCM加密后保存在
+`model_execution_node_secrets`。首次启用前生成并导出固定主密钥，再用`--update-env`启动PM2：
+
+```bash
+export ALPHA_REMOTE_NODE_SECRET_KEY="$(openssl rand -base64 32)"
+pm2 startOrReload ecosystem.config.js --update-env
+```
+
+所有AlphaFactorService副本必须使用同一主密钥；接口不会返回任何秘密明文。
 
 PM2只启动一个常驻进程`alpha-factor-service`，统一提供因子、模型信号、回测、
 Qlib多模型训练和每日推理。模型训练在任务期间启动隔离子进程，完成后自动退出。
@@ -176,6 +189,18 @@ S3_ENDPOINT=http://10.126.126.5:9000
 S3_BUCKET=alphablocks-models
 S3_REGION=us-east-1
 ```
+
+远程训练已经生成完整`remote_result.json`，但下载或发布阶段被取消时，可在完成文件哈希核验后执行
+只发布、不重训的恢复命令：
+
+```bash
+python -m factor_service.research.artifact_recovery <job_id> --source-attempt <ordinal>
+```
+
+恢复操作只接受`failed`或`canceled`训练任务及已终止的来源Attempt。系统会新建一个本地
+`uploading` Attempt，继续本地正式制品、MinIO、预测结果和候选模型登记，并保留原失败或取消
+Attempt的审计记录；不会把原Attempt改写为成功，也不会再次训练模型。
+
 `research.storage.model_artifacts_root`保存经过SHA256校验并原子发布的正式模型产物，以及
 `datasets/{dataset_hash}`下按内容寻址的训练Parquet缓存。Qlib训练只读取已校验快照，不读取暂存文件。
 数据集成功生成或复用时会刷新最后使用时间；默认连续24小时未被使用后由后台任务删除，排队中和

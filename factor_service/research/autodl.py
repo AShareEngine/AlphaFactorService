@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 import re
 import time
 from typing import Any, Callable
@@ -12,23 +10,13 @@ from urllib.request import Request, urlopen
 
 
 AUTODL_API_BASE = "https://api.autodl.com"
-DEFAULT_AUTODL_TOKEN_ENV = "ALPHA_AUTODL_API_TOKEN"
-AUTODL_TOKEN_FILE_ENV = "ALPHA_AUTODL_API_TOKEN_FILE"
 _INSTANCE_UUID = re.compile(r"^pro-[A-Za-z0-9]{6,64}$")
-_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _IMAGE_NAME = re.compile(r"^[^\x00-\x1f\x7f]{1,80}$")
 _RUNNING_STATES = {"running"}
 
 
 class AutoDLAPIError(RuntimeError):
     """A safe, token-free AutoDL API error."""
-
-
-def autodl_token_file() -> Path:
-    configured = str(os.environ.get(AUTODL_TOKEN_FILE_ENV) or "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return Path(__file__).resolve().parents[2] / ".secrets" / "autodl_api_token"
 
 
 def validate_api_token(value: str) -> str:
@@ -40,73 +28,23 @@ def validate_api_token(value: str) -> str:
     return token
 
 
-def save_api_token(value: str) -> None:
-    token = validate_api_token(value)
-    target = autodl_token_file()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    target.parent.chmod(0o700)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(f"{token}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(0o600)
-        os.replace(temporary, target)
-        target.chmod(0o600)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def load_api_token(token_env: str = DEFAULT_AUTODL_TOKEN_ENV) -> str:
-    environment = validate_token_environment(token_env)
-    if environment == DEFAULT_AUTODL_TOKEN_ENV:
-        target = autodl_token_file()
-        if target.is_file():
-            token = target.read_text(encoding="utf-8").strip()
-            if token:
-                return validate_api_token(token)
-    token = str(os.environ.get(environment) or "").strip()
-    return validate_api_token(token) if token else ""
-
-
-def api_token_status(
-    token_env: str = DEFAULT_AUTODL_TOKEN_ENV,
-) -> dict[str, Any]:
-    environment = validate_token_environment(token_env)
-    target = autodl_token_file()
-    file_configured = (
-        environment == DEFAULT_AUTODL_TOKEN_ENV
-        and target.is_file()
-        and bool(target.read_text(encoding="utf-8").strip())
-    )
-    environment_configured = bool(os.environ.get(environment, "").strip())
-    return {
-        "configured": file_configured or environment_configured,
-        "source": (
-            "secure_file" if file_configured
-            else "environment" if environment_configured
-            else "none"
-        ),
-    }
-
-
 class AutoDLProClient:
     def __init__(
         self,
         instance_uuid: str,
-        token_env: str,
+        api_token: str,
         *,
         request_timeout_seconds: int = 30,
     ) -> None:
         self.instance_uuid = validate_instance_uuid(instance_uuid)
-        self.token_env = validate_token_environment(token_env)
+        clean_token = str(api_token or "").strip()
+        self._api_token = validate_api_token(clean_token) if clean_token else ""
         self.request_timeout_seconds = max(
             5, min(int(request_timeout_seconds), 60),
         )
 
     def configured(self) -> bool:
-        return bool(load_api_token(self.token_env))
+        return bool(self._api_token)
 
     def status(self) -> str:
         return str(self._request(
@@ -188,7 +126,7 @@ class AutoDLProClient:
     def _request(
         self, method: str, path: str, payload: dict[str, Any],
     ) -> Any:
-        token = load_api_token(self.token_env)
+        token = self._api_token
         if not token:
             raise ValueError("AutoDL API Token未配置，请在系统设置中填写")
         method_name = str(method or "GET").upper()
@@ -241,13 +179,6 @@ def validate_instance_uuid(value: str) -> str:
     return clean
 
 
-def validate_token_environment(value: str) -> str:
-    clean = str(value or "").strip()
-    if not _ENV_NAME.fullmatch(clean):
-        raise ValueError(f"AutoDL API Token环境变量名无效: {clean}")
-    return clean
-
-
 def validate_image_name(value: str) -> str:
     clean = str(value or "").strip()
     if not _IMAGE_NAME.fullmatch(clean):
@@ -295,9 +226,6 @@ def _safe_http_error(exc: HTTPError) -> str:
 
 
 __all__ = [
-    "AUTODL_API_BASE", "AUTODL_TOKEN_FILE_ENV", "DEFAULT_AUTODL_TOKEN_ENV",
-    "AutoDLAPIError", "AutoDLProClient", "api_token_status",
-    "autodl_token_file", "load_api_token", "sanitize_snapshot",
-    "save_api_token", "validate_api_token", "validate_image_name",
-    "validate_instance_uuid", "validate_token_environment",
+    "AUTODL_API_BASE", "AutoDLAPIError", "AutoDLProClient", "sanitize_snapshot",
+    "validate_api_token", "validate_image_name", "validate_instance_uuid",
 ]

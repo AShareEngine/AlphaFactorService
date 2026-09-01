@@ -10,6 +10,7 @@ dependencies = [
   "pydantic>=2.7",
   "PyYAML>=6.0",
   "clickhouse-connect>=0.7.8",
+  "cryptography>=44,<50",
   "lightgbm>=4.5,<5",
   "minio>=7.2,<8",
   "numpy>=1.26,<3",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
 import os
@@ -9,15 +9,16 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable
+import weakref
 
 from factor_service.research.config import Settings
 from factor_service.research.autodl import (
     AutoDLProClient,
-    api_token_status,
+    validate_api_token,
     validate_instance_uuid,
-    validate_token_environment,
 )
 from factor_service.research.dataset import DatasetBuilder
 from factor_service.research.errors import RetryableJobError
@@ -25,9 +26,10 @@ from factor_service.research.job import CancellationToken
 from factor_service.research.remote_node_repository import (
     get_remote_node_repository,
 )
+from factor_service.research.remote_node_secrets import REMOTE_NODE_SECRET_KEY_ENV
 from factor_service.research.snapshot import DatasetSnapshotStore
 from factor_service.research.trainer import TrainingResult
-from factor_service.runtime_config import load_runtime_config, section
+from factor_service.runtime_config import section
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -35,9 +37,9 @@ _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
 _USER = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,63}$")
 _IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$")
 _GPU_SPEC = re.compile(r"^[A-Za-z0-9=,._-]{0,128}$")
-_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _REMOTE_RUNNERS = {"docker", "direct_python"}
 _LIFECYCLE_PROVIDERS = {"", "autodl_pro"}
+_AUTHENTICATION_TYPES = {"ssh_private_key", "password"}
 _REMOTE_MAX_THREADS = 32
 _REMOTE_VALIDATION_SAMPLE_ROWS = 200_000
 _REMOTE_TRAIN_METRIC_SAMPLE_ROWS = 200_000
@@ -57,26 +59,22 @@ class RemoteNode:
     python_executable: str
     docker_image: str
     gpus: str
-    ssh_key: Path | None
-    password_env: str
+    authentication_type: str
+    ssh_private_key: str = field(repr=False)
+    ssh_password: str = field(repr=False)
     known_hosts: Path | None
     enabled: bool
     cleanup_success: bool
     max_runtime_minutes: int
     lifecycle_provider: str
     instance_uuid: str
-    api_token_env: str
+    api_token: str = field(repr=False)
     auto_start: bool
     auto_stop: bool
     boot_timeout_minutes: int
-    ssh_key_config: str = ""
     known_hosts_config: str = ""
 
     def public(self) -> dict[str, Any]:
-        credential = (
-            "ssh_key" if self.ssh_key is not None
-            else "password_env" if self.password_env else "missing"
-        )
         return {
             "id": self.node_id,
             "type": "remote",
@@ -95,35 +93,28 @@ class RemoteNode:
                 and self.credentials_available()
                 and (not self.lifecycle_provider or self.lifecycle_available())
             ),
-            "credential_type": credential,
+            "credential_type": self.authentication_type,
+            "credential_configured": self.credentials_available(),
             "known_hosts_configured": self.known_hosts is not None,
             "max_runtime_minutes": self.max_runtime_minutes,
             "lifecycle_provider": self.lifecycle_provider or "manual",
             "instance_uuid": self.instance_uuid,
-            "api_token_configured": bool(
-                self.api_token_env
-                and api_token_status(self.api_token_env)["configured"]
-            ),
-            "api_token_environment_configured": bool(
-                self.api_token_env
-                and api_token_status(self.api_token_env)["configured"]
-            ),
+            "api_token_configured": bool(self.api_token),
             "auto_start": self.auto_start,
             "auto_stop": self.auto_stop,
             "boot_timeout_minutes": self.boot_timeout_minutes,
         }
 
     def credentials_available(self) -> bool:
-        if self.ssh_key is not None:
-            return self.ssh_key.is_file()
-        return bool(self.password_env and os.environ.get(self.password_env))
+        if self.authentication_type == "ssh_private_key":
+            return bool(self.ssh_private_key)
+        return bool(self.authentication_type == "password" and self.ssh_password)
 
     def lifecycle_available(self) -> bool:
         return bool(
             self.lifecycle_provider == "autodl_pro"
             and self.instance_uuid
-            and self.api_token_env
-            and api_token_status(self.api_token_env)["configured"]
+            and self.api_token
         )
 
 
@@ -131,17 +122,7 @@ def load_remote_nodes(runtime: dict[str, Any] | None = None) -> list[RemoteNode]
     if runtime is not None:
         raw_nodes = _runtime_remote_node_payloads(runtime)
     else:
-        repository = get_remote_node_repository()
-        if repository.legacy_import_required():
-            runtime_payload = load_runtime_config()
-            legacy_nodes = [
-                _normalize_node(raw)
-                for raw in _runtime_remote_node_payloads(runtime_payload)
-            ]
-            repository.import_legacy_once([
-                remote_node_storage_payload(node) for node in legacy_nodes
-            ])
-        raw_nodes = repository.list_nodes()
+        raw_nodes = get_remote_node_repository().list_nodes()
     if not isinstance(raw_nodes, list):
         raise ValueError("PostgreSQL远程训练节点配置必须是数组")
     nodes: list[RemoteNode] = []
@@ -175,8 +156,7 @@ def remote_node_storage_payload(node: RemoteNode) -> dict[str, Any]:
         "host": node.host,
         "port": node.port,
         "user": node.user,
-        "ssh_key": node.ssh_key_config or str(node.ssh_key or ""),
-        "password_env": node.password_env,
+        "authentication_type": node.authentication_type,
         "known_hosts": node.known_hosts_config or str(node.known_hosts or ""),
         "work_dir": node.work_dir,
         "runner": node.runner,
@@ -187,7 +167,6 @@ def remote_node_storage_payload(node: RemoteNode) -> dict[str, Any]:
         "cleanup_success": node.cleanup_success,
         "lifecycle_provider": node.lifecycle_provider,
         "instance_uuid": node.instance_uuid,
-        "api_token_env": node.api_token_env,
         "auto_start": node.auto_start,
         "auto_stop": node.auto_stop,
         "boot_timeout_minutes": node.boot_timeout_minutes,
@@ -219,6 +198,10 @@ def get_remote_node(node_id: str) -> RemoteNode:
 class RemoteTransport:
     def __init__(self, node: RemoteNode) -> None:
         self.node = node
+        self._ssh_key_path: Path | None = None
+        self._ssh_key_cleanup: weakref.finalize | None = None
+        if node.authentication_type == "ssh_private_key" and node.ssh_private_key:
+            self._materialize_private_key(node.ssh_private_key)
         self._ensure_client_tools()
 
     def test_connection(self) -> dict[str, Any]:
@@ -379,11 +362,9 @@ class RemoteTransport:
         cancellation: CancellationToken | None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        if self.node.password_env:
-            password = os.environ.get(self.node.password_env, "")
-            if not password:
-                raise ValueError(f"远程节点密码环境变量未设置: {self.node.password_env}")
-            environment["SSHPASS"] = password
+        environment.pop(REMOTE_NODE_SECRET_KEY_ENV, None)
+        if self.node.ssh_password:
+            environment["SSHPASS"] = self.node.ssh_password
         process = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=environment,
@@ -418,7 +399,7 @@ class RemoteTransport:
             raise
 
     def _auth_prefix(self) -> list[str]:
-        return ["sshpass", "-e"] if self.node.password_env else []
+        return ["sshpass", "-e"] if self.node.ssh_password else []
 
     def _ssh_base(self, *, include_target: bool = True) -> list[str]:
         args = [
@@ -432,8 +413,8 @@ class RemoteTransport:
             ])
         else:
             args.extend(["-o", "StrictHostKeyChecking=accept-new"])
-        if self.node.ssh_key is not None:
-            args.extend(["-o", "BatchMode=yes", "-i", str(self.node.ssh_key)])
+        if self._ssh_key_path is not None:
+            args.extend(["-o", "BatchMode=yes", "-i", str(self._ssh_key_path)])
         else:
             args.extend(["-o", "BatchMode=no"])
         if include_target:
@@ -444,12 +425,22 @@ class RemoteTransport:
         return f"{self.node.user}@{self.node.host}"
 
     def _ensure_client_tools(self) -> None:
-        required = ["ssh", "rsync", *( ["sshpass"] if self.node.password_env else [])]
+        required = ["ssh", "rsync", *( ["sshpass"] if self.node.ssh_password else [])]
         missing = [name for name in required if shutil.which(name) is None]
         if missing:
             raise RuntimeError("本机缺少远程训练命令: " + ", ".join(missing))
         if not self.node.credentials_available():
             raise ValueError(f"远程节点{self.node.node_id}认证信息不可用")
+
+    def _materialize_private_key(self, value: str) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="alphablocks-ssh-", delete=False,
+        ) as handle:
+            handle.write(value.rstrip("\n") + "\n")
+            path = Path(handle.name)
+        path.chmod(0o600)
+        self._ssh_key_path = path
+        self._ssh_key_cleanup = weakref.finalize(self, path.unlink, missing_ok=True)
 
 
 class RemoteResearchExecutor:
@@ -1159,14 +1150,20 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
     python_executable = str(source.get("python_executable") or "python").strip()
     image = str(source.get("docker_image") or "alphafactor-research:latest").strip()
     gpus = str(source.get("gpus") or "all").strip()
-    password_env = str(source.get("password_env") or "").strip()
+    authentication_type = str(
+        source.get("authentication_type") or ""
+    ).strip().lower()
+    ssh_private_key = str(source.get("ssh_private_key") or "")
+    ssh_password = str(source.get("ssh_password") or "")
+    if not authentication_type:
+        authentication_type = "password" if ssh_password else "ssh_private_key"
     lifecycle_provider = str(
         source.get("lifecycle_provider") or ""
     ).strip().lower()
     if lifecycle_provider in {"manual", "none"}:
         lifecycle_provider = ""
     instance_uuid = str(source.get("instance_uuid") or "").strip()
-    api_token_env = str(source.get("api_token_env") or "").strip()
+    api_token = str(source.get("api_token") or "").strip()
     if not _IDENTIFIER.fullmatch(node_id) or node_id == "local":
         raise ValueError(f"远程训练节点ID无效: {node_id}")
     if not _HOST.fullmatch(host):
@@ -1189,25 +1186,30 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         raise ValueError(f"远程训练docker_image无效: {image}")
     if not _GPU_SPEC.fullmatch(gpus):
         raise ValueError(f"远程训练gpus配置无效: {gpus}")
-    if password_env and not _ENV_NAME.fullmatch(password_env):
-        raise ValueError(f"远程训练password_env无效: {password_env}")
+    if authentication_type not in _AUTHENTICATION_TYPES:
+        raise ValueError("远程训练认证只允许ssh_private_key或password")
+    if "\x00" in ssh_password:
+        raise ValueError("远程训练SSH密码包含无效NUL字符")
+    if ssh_private_key and (
+        "-----BEGIN " not in ssh_private_key
+        or "PRIVATE KEY-----" not in ssh_private_key
+        or "\x00" in ssh_private_key
+    ):
+        raise ValueError("远程训练SSH私钥格式无效")
     if lifecycle_provider not in _LIFECYCLE_PROVIDERS:
         raise ValueError("远程节点生命周期只支持manual或autodl_pro")
     if lifecycle_provider == "autodl_pro":
         instance_uuid = validate_instance_uuid(instance_uuid)
-        api_token_env = validate_token_environment(api_token_env)
+        if api_token:
+            api_token = validate_api_token(api_token)
     else:
         instance_uuid = ""
-        api_token_env = ""
+        api_token = ""
     port = int(source.get("port") or 22)
     if not 1 <= port <= 65535:
         raise ValueError("远程训练SSH端口必须在1到65535之间")
-    ssh_key_text = str(source.get("ssh_key") or "").strip()
     known_hosts_text = str(source.get("known_hosts") or "").strip()
-    ssh_key = Path(ssh_key_text).expanduser().resolve() if ssh_key_text else None
     known_hosts = Path(known_hosts_text).expanduser().resolve() if known_hosts_text else None
-    if not ssh_key and not password_env:
-        raise ValueError(f"远程训练节点{node_id}必须配置ssh_key或password_env")
     return RemoteNode(
         node_id=node_id,
         name=str(source.get("name") or node_id).strip()[:80],
@@ -1219,15 +1221,18 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         python_executable=python_executable,
         docker_image=image,
         gpus=gpus,
-        ssh_key=ssh_key,
-        password_env=password_env,
+        authentication_type=authentication_type,
+        ssh_private_key=(
+            ssh_private_key if authentication_type == "ssh_private_key" else ""
+        ),
+        ssh_password=(ssh_password if authentication_type == "password" else ""),
         known_hosts=known_hosts,
         enabled=bool(source.get("enabled", True)),
         cleanup_success=bool(source.get("cleanup_success", True)),
         max_runtime_minutes=max(10, min(int(source.get("max_runtime_minutes") or 240), 1440)),
         lifecycle_provider=lifecycle_provider,
         instance_uuid=instance_uuid,
-        api_token_env=api_token_env,
+        api_token=api_token,
         auto_start=(
             bool(source.get("auto_start", False))
             if lifecycle_provider else False
@@ -1239,7 +1244,6 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         boot_timeout_minutes=max(
             2, min(int(source.get("boot_timeout_minutes") or 15), 60),
         ),
-        ssh_key_config=ssh_key_text,
         known_hosts_config=known_hosts_text,
     )
 
@@ -1247,7 +1251,7 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
 def autodl_client(node: RemoteNode) -> AutoDLProClient:
     if node.lifecycle_provider != "autodl_pro":
         raise ValueError(f"远程节点{node.node_id}未启用AutoDL Pro API")
-    return AutoDLProClient(node.instance_uuid, node.api_token_env)
+    return AutoDLProClient(node.instance_uuid, node.api_token)
 
 
 def node_with_autodl_endpoint(

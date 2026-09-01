@@ -114,6 +114,16 @@ class _Repository:
         self.architectures[architecture_id]["state"] = "archived"
         return dict(self.architectures[architecture_id])
 
+    def delete_model_architecture(self, architecture_id):
+        architecture = self.architectures.pop(architecture_id)
+        return {
+            "architecture_id": architecture_id,
+            "name": architecture["name"],
+            "state": architecture["state"],
+            "revision": architecture["revision"],
+            "engines": architecture.get("engines") or [],
+        }
+
     def create_training_experiment(self, payload):
         experiment_id = "model_experiment_created"
         jobs = [
@@ -264,6 +274,26 @@ class _Repository:
             "dataset_id": "dataset-1",
             "dataset_hash": "d" * 64,
             "dataset_deleted": False,
+        }
+
+    def delete_strategy_deployment(self, model_id, version, *, mode):
+        self.deleted_deployment_payload = {
+            "model_id": model_id, "version": version, "mode": mode,
+        }
+        return {
+            "deployment_id": "deployment-1",
+            "model_id": model_id,
+            "model_version": version,
+            "mode": mode,
+        }
+
+    def get_strategy_deployment(self, model_id, version, *, mode):
+        return {
+            "deployment_id": "deployment-1",
+            "model_id": model_id,
+            "model_version": version,
+            "mode": mode,
+            "strategy_snapshot_json": {"live_id": "live-gone"},
         }
 
     def mark_validated(self, model_id, version, backtest_job_id, *, validation):
@@ -525,7 +555,7 @@ def test_execution_nodes_and_local_status_are_exposed_without_secrets(monkeypatc
         {"id": "local", "type": "local", "available": True},
         {
             "id": "autodl-gpu-01", "type": "remote", "available": True,
-            "credential_type": "password_env",
+            "credential_type": "password",
         },
     ])
     client = _client(monkeypatch, _Repository(), _Scheduler())
@@ -603,7 +633,8 @@ def test_execution_node_settings_crud_api_never_returns_password_values(monkeypa
         "type": "remote",
         "name": "AutoDL GPU",
         "host": "gpu.example.test",
-        "password_env": "TEST_AUTODL_PASSWORD",
+        "credential_type": "password",
+        "ssh_password_configured": True,
     }
     monkeypatch.setattr(remote_settings, "list_remote_node_settings", lambda: [node])
     monkeypatch.setattr(
@@ -634,6 +665,8 @@ def test_execution_node_settings_crud_api_never_returns_password_values(monkeypa
     assert listed.status_code == 200
     assert listed.json()["storage"] == "postgresql"
     assert listed.json()["security"]["password_values_returned"] is False
+    assert listed.json()["security"]["secret_storage"] == "postgresql_aes_gcm"
+    assert listed.json()["security"]["master_key_storage"] == "process_environment"
     assert created.status_code == 201
     assert updated.json()["node"]["name"] == "AutoDL A100"
     assert deleted.json()["deleted"] is True
@@ -732,6 +765,27 @@ def test_model_version_delete_rejects_active_backtest(monkeypatch) -> None:
     assert response.status_code == 409
     assert "model-backtest-running" in response.json()["detail"]
     assert repository.deleted_payload is None
+
+
+def test_strategy_deployment_delete_is_idempotent_and_model_scoped(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+
+    response = client.request(
+        "DELETE",
+        "/model-research/models/model-1/versions/1/strategy-deployments/paper",
+        json={
+            "live_id": "live-gone",
+            "reason": "orphaned_paper_strategy",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["deleted"]["deployment_id"] == "deployment-1"
+    assert repository.deleted_deployment_payload == {
+        "model_id": "model-1", "version": 1, "mode": "paper",
+    }
 
 
 def test_model_research_report_routes(monkeypatch) -> None:
@@ -929,6 +983,19 @@ def test_incremental_training_precheck_route_is_server_authoritative(monkeypatch
 
 def test_model_architecture_crud_and_activation_routes(monkeypatch) -> None:
     repository = _Repository()
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "active_model_backtest_jobs",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        model_research.model_repository,
+        "delete_model_data",
+        lambda **_kwargs: {
+            "backtest_job_count": 0,
+            "predictions_deleted": True,
+        },
+    )
     client = _client(monkeypatch, repository, _Scheduler())
     payload = {
         "name": "三引擎选股架构",
@@ -969,6 +1036,14 @@ def test_model_architecture_crud_and_activation_routes(monkeypatch) -> None:
     )
     assert archived.status_code == 200
     assert archived.json()["architecture"]["state"] == "archived"
+
+    deleted = client.delete(
+        f"/model-research/architectures/{architecture_id}",
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"]["architecture_id"] == architecture_id
+    assert deleted.json()["cleanup"]["clickhouse"]["predictions_deleted"] is True
+    assert architecture_id not in repository.architectures
 
 
 def test_model_architecture_can_start_a_shared_engine_backtest(monkeypatch) -> None:

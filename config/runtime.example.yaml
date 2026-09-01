@@ -56,9 +56,10 @@ research:
   scheduler:
     enabled: true
     refresh_seconds: 60
-  # Remote GPU node metadata is managed in System Settings and stored in
-  # PostgreSQL model_execution_nodes. AutoDL tokens and SSH passwords remain in
-  # protected files/environment variables and are never stored in PostgreSQL.
+  # Remote GPU node configuration is managed in System Settings. Normal fields
+  # are stored in PostgreSQL model_execution_nodes; SSH passwords, SSH private
+  # keys and AutoDL tokens are encrypted in model_execution_node_secrets. Set
+  # ALPHA_REMOTE_NODE_SECRET_KEY in the service process environment.
   storage:
     # Relative paths are resolved from the AlphaFactorService project root.
     # This root contains job datasets, trained models, predictions, MLflow files,

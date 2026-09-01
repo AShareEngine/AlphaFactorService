@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
 
-from factor_service.research.autodl import api_token_status, save_api_token
 from factor_service.research.remote import (
     RemoteNode,
     load_remote_nodes,
@@ -29,10 +27,11 @@ def create_remote_node_setting(payload: dict[str, Any]) -> dict[str, Any]:
     with _CONFIG_LOCK:
         load_remote_nodes()
         node = _validated_submitted_node(node_id, payload)
+        _require_secrets(node)
         stored = get_remote_node_repository().create_node(
             remote_node_storage_payload(node),
+            _node_secrets(node),
         )
-        _save_submitted_api_token(payload)
     return _settings_view(_validated_stored_node(stored))
 
 
@@ -44,21 +43,19 @@ def update_remote_node_setting(
         submitted_id = str(payload.get("id") or clean_id).strip()
         if submitted_id != clean_id:
             raise ValueError("远程训练节点ID创建后不可修改")
-        load_remote_nodes()
-        node = _validated_submitted_node(clean_id, payload)
+        existing = next(
+            (node for node in load_remote_nodes() if node.node_id == clean_id),
+            None,
+        )
+        if existing is None:
+            raise ValueError(f"远程训练节点未配置: {clean_id}")
+        node = _validated_submitted_node(clean_id, payload, existing=existing)
+        _require_secrets(node)
         stored = get_remote_node_repository().update_node(
             clean_id, remote_node_storage_payload(node),
+            _node_secrets(node),
         )
-        _save_submitted_api_token(payload)
     return _settings_view(_validated_stored_node(stored))
-
-
-def _save_submitted_api_token(payload: dict[str, Any]) -> None:
-    if str(payload.get("lifecycle_provider") or "").strip() != "autodl_pro":
-        return
-    token = str(payload.get("api_token") or "").strip()
-    if token:
-        save_api_token(token)
 
 
 def delete_remote_node_setting(node_id: str) -> dict[str, Any]:
@@ -71,9 +68,12 @@ def delete_remote_node_setting(node_id: str) -> dict[str, Any]:
 
 
 def _validated_submitted_node(
-    node_id: str, payload: dict[str, Any],
+    node_id: str,
+    payload: dict[str, Any],
+    *,
+    existing: RemoteNode | None = None,
 ) -> RemoteNode:
-    return _validated_stored_node(_submitted_node(node_id, payload))
+    return _validated_stored_node(_submitted_node(node_id, payload, existing))
 
 
 def _validated_stored_node(payload: dict[str, Any]) -> RemoteNode:
@@ -81,7 +81,33 @@ def _validated_stored_node(payload: dict[str, Any]) -> RemoteNode:
     return load_remote_nodes(runtime)[0]
 
 
-def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _submitted_node(
+    node_id: str,
+    payload: dict[str, Any],
+    existing: RemoteNode | None,
+) -> dict[str, Any]:
+    authentication_type = str(
+        payload.get("authentication_type")
+        or (existing.authentication_type if existing else "ssh_private_key")
+    ).strip().lower()
+    ssh_private_key = str(payload.get("ssh_private_key") or "")
+    ssh_password = str(payload.get("ssh_password") or "")
+    if existing and authentication_type == existing.authentication_type:
+        if authentication_type == "ssh_private_key" and not ssh_private_key:
+            ssh_private_key = existing.ssh_private_key
+        if authentication_type == "password" and not ssh_password:
+            ssh_password = existing.ssh_password
+    lifecycle_provider = str(
+        payload.get("lifecycle_provider") or ""
+    ).strip().lower()
+    api_token = str(payload.get("api_token") or "").strip()
+    if (
+        existing
+        and lifecycle_provider == "autodl_pro"
+        and existing.lifecycle_provider == "autodl_pro"
+        and not api_token
+    ):
+        api_token = existing.api_token
     return {
         "id": node_id,
         "name": str(payload.get("name") or node_id).strip(),
@@ -89,8 +115,9 @@ def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "host": str(payload.get("host") or "").strip(),
         "port": int(payload.get("port") or 22),
         "user": str(payload.get("user") or "root").strip(),
-        "ssh_key": str(payload.get("ssh_key") or "").strip(),
-        "password_env": str(payload.get("password_env") or "").strip(),
+        "authentication_type": authentication_type,
+        "ssh_private_key": ssh_private_key,
+        "ssh_password": ssh_password,
         "known_hosts": str(payload.get("known_hosts") or "").strip(),
         "work_dir": str(
             payload.get("work_dir") or "/root/alphablocks-research"
@@ -105,11 +132,9 @@ def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "gpus": str(payload.get("gpus") or "all").strip(),
         "max_runtime_minutes": int(payload.get("max_runtime_minutes") or 240),
         "cleanup_success": _boolean(payload.get("cleanup_success"), True),
-        "lifecycle_provider": str(
-            payload.get("lifecycle_provider") or ""
-        ).strip().lower(),
+        "lifecycle_provider": lifecycle_provider,
         "instance_uuid": str(payload.get("instance_uuid") or "").strip(),
-        "api_token_env": str(payload.get("api_token_env") or "").strip(),
+        "api_token": api_token,
         "auto_start": _boolean(payload.get("auto_start"), False),
         "auto_stop": _boolean(payload.get("auto_stop"), False),
         "boot_timeout_minutes": int(
@@ -119,24 +144,15 @@ def _submitted_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _settings_view(node: RemoteNode) -> dict[str, Any]:
-    token_status = (
-        api_token_status(node.api_token_env)
-        if node.api_token_env else {"configured": False, "source": "none"}
-    )
     return {
         **node.public(),
-        "ssh_key": node.ssh_key_config or str(node.ssh_key or ""),
-        "password_env": node.password_env,
-        "password_environment_configured": bool(
-            node.password_env and os.environ.get(node.password_env)
-        ),
+        "ssh_private_key_configured": bool(node.ssh_private_key),
+        "ssh_password_configured": bool(node.ssh_password),
         "known_hosts": node.known_hosts_config or str(node.known_hosts or ""),
         "cleanup_success": node.cleanup_success,
         "max_runtime_minutes": node.max_runtime_minutes,
-        "api_token_env": node.api_token_env,
-        "api_token_configured": bool(token_status["configured"]),
-        "api_token_environment_configured": bool(token_status["configured"]),
-        "api_token_source": token_status["source"],
+        "api_token_configured": bool(node.api_token),
+        "api_token_source": "postgresql_encrypted" if node.api_token else "none",
         "lifecycle_provider": node.lifecycle_provider or "manual",
         "instance_uuid": node.instance_uuid,
         "auto_start": node.auto_start,
@@ -144,9 +160,26 @@ def _settings_view(node: RemoteNode) -> dict[str, Any]:
         "boot_timeout_minutes": node.boot_timeout_minutes,
         "configuration_valid": True,
         "authentication_hint": (
-            "SSH私钥" if node.ssh_key is not None
-            else f"环境变量 {node.password_env}"
+            "PostgreSQL加密SSH私钥"
+            if node.authentication_type == "ssh_private_key"
+            else "PostgreSQL加密SSH密码"
         ),
+    }
+
+
+def _require_secrets(node: RemoteNode) -> None:
+    if not node.credentials_available():
+        label = "SSH私钥" if node.authentication_type == "ssh_private_key" else "SSH密码"
+        raise ValueError(f"远程训练节点{node.node_id}必须配置{label}")
+    if node.lifecycle_provider == "autodl_pro" and not node.api_token:
+        raise ValueError("AutoDL Pro节点必须配置开发者Token")
+
+
+def _node_secrets(node: RemoteNode) -> dict[str, str]:
+    return {
+        "ssh_private_key": node.ssh_private_key,
+        "ssh_password": node.ssh_password,
+        "api_token": node.api_token,
     }
 
 

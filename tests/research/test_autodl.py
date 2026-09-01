@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -11,11 +10,7 @@ import pytest
 
 from factor_service.research import autodl
 from factor_service.research.autodl import (
-    AUTODL_TOKEN_FILE_ENV,
-    DEFAULT_AUTODL_TOKEN_ENV,
     AutoDLProClient,
-    api_token_status,
-    save_api_token,
     sanitize_snapshot,
     validate_image_name,
     validate_instance_uuid,
@@ -45,21 +40,24 @@ class _Response:
 
 
 def _node_runtime(tmp_path: Path) -> dict:
-    key = tmp_path / "id_ed25519"
-    key.write_text("test", encoding="utf-8")
     return {
         "research": {"execution": {"remote_nodes": [{
             "id": "autodl-pro-01",
             "host": "old.example.test",
             "port": 22022,
             "user": "root",
-            "ssh_key": str(key),
+            "authentication_type": "ssh_private_key",
+            "ssh_private_key": (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                "dGVzdA==\n"
+                "-----END OPENSSH PRIVATE KEY-----"
+            ),
             "work_dir": "/root/alphablocks-research",
             "runner": "direct_python",
             "python_executable": "/root/miniconda3/bin/python",
             "lifecycle_provider": "autodl_pro",
             "instance_uuid": "pro-76576c61fdf1",
-            "api_token_env": "TEST_AUTODL_TOKEN",
+            "api_token": "secret-token",
             "auto_start": True,
             "auto_stop": True,
         }]}}
@@ -77,10 +75,9 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def test_autodl_client_uses_fixed_host_and_token_environment(
+def test_autodl_client_uses_fixed_host_and_supplied_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TEST_AUTODL_TOKEN", "secret-token")
     captured = {}
 
     def fake_urlopen(request, timeout):
@@ -97,7 +94,7 @@ def test_autodl_client_uses_fixed_host_and_token_environment(
     monkeypatch.setattr(autodl, "urlopen", fake_urlopen)
 
     status = AutoDLProClient(
-        "pro-76576c61fdf1", "TEST_AUTODL_TOKEN",
+        "pro-76576c61fdf1", "secret-token",
     ).status()
 
     assert status == "running"
@@ -114,26 +111,19 @@ def test_autodl_client_uses_fixed_host_and_token_environment(
     }
 
 
-def test_autodl_client_never_accepts_or_returns_inline_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("TEST_AUTODL_TOKEN", raising=False)
-    client = AutoDLProClient("pro-76576c61fdf1", "TEST_AUTODL_TOKEN")
+def test_autodl_client_rejects_requests_without_token() -> None:
+    client = AutoDLProClient("pro-76576c61fdf1", "")
 
     with pytest.raises(ValueError, match="Token未配置") as exc:
         client.status()
 
     assert "secret-token" not in str(exc.value)
-    assert "token" not in client.__dict__.keys()
+    assert client.configured() is False
 
 
-def test_autodl_client_reads_secure_token_file_without_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_autodl_client_uses_decrypted_database_token(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    token_file = tmp_path / "secrets" / "autodl_api_token"
-    monkeypatch.setenv(AUTODL_TOKEN_FILE_ENV, str(token_file))
-    monkeypatch.delenv(DEFAULT_AUTODL_TOKEN_ENV, raising=False)
-    save_api_token("saved-secret-token")
     captured = {}
 
     def fake_urlopen(request, timeout):
@@ -142,13 +132,11 @@ def test_autodl_client_reads_secure_token_file_without_restart(
 
     monkeypatch.setattr(autodl, "urlopen", fake_urlopen)
 
-    client = AutoDLProClient("pro-76576c61fdf1", DEFAULT_AUTODL_TOKEN_ENV)
+    client = AutoDLProClient("pro-76576c61fdf1", "saved-secret-token")
 
     assert client.configured() is True
     assert client.status() == "running"
     assert captured["authorization"] == "saved-secret-token"
-    assert api_token_status()["source"] == "secure_file"
-    assert os.stat(token_file).st_mode & 0o777 == 0o600
 
 
 def test_autodl_snapshot_sanitizer_drops_credentials() -> None:
@@ -179,19 +167,18 @@ def test_autodl_rejects_invalid_image_name(value: str) -> None:
 
 
 def test_remote_node_exposes_lifecycle_without_token_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("TEST_AUTODL_TOKEN", "secret-token")
     node = load_remote_nodes(_node_runtime(tmp_path))[0]
 
     public = node.public()
 
     assert public["lifecycle_provider"] == "autodl_pro"
     assert public["instance_uuid"] == "pro-76576c61fdf1"
-    assert public["api_token_environment_configured"] is True
+    assert public["api_token_configured"] is True
     assert public["available"] is True
     assert "secret-token" not in json.dumps(public)
-    assert "api_token_env" not in public
+    assert "api_token" not in public
 
 
 def test_autodl_snapshot_refreshes_dynamic_ssh_endpoint(

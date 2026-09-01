@@ -586,11 +586,14 @@ def get_execution_node_settings() -> dict[str, Any]:
             "storage": "postgresql",
             "nodes": list_remote_node_settings(),
             "security": {
-                "password_storage": "environment_variable",
+                "secret_storage": "postgresql_aes_gcm",
+                "password_storage": "postgresql_encrypted",
                 "password_values_returned": False,
-                "ssh_key_recommended": True,
-                "api_token_storage": "secure_file_or_environment",
+                "ssh_private_key_storage": "postgresql_encrypted",
+                "ssh_private_key_values_returned": False,
+                "api_token_storage": "postgresql_encrypted",
                 "api_token_values_returned": False,
+                "master_key_storage": "process_environment",
             },
         }
     except Exception as exc:
@@ -1236,6 +1239,44 @@ def archive_model_architecture(architecture_id: str) -> dict[str, Any]:
             "architecture": _architecture_views([
                 repository.archive_model_architecture(architecture_id),
             ])[0],
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.delete("/architectures/{architecture_id}")
+def delete_model_architecture(architecture_id: str) -> dict[str, Any]:
+    """Permanently delete an inactive architecture and its ClickHouse evidence."""
+
+    try:
+        architecture = repository.get_model_architecture(architecture_id)
+        revision = int(architecture.get("revision") or 1)
+        active_backtests = model_repository.active_model_backtest_jobs(
+            model_id=architecture_id,
+            model_version=revision,
+        )
+        if active_backtests:
+            raise ModelResearchConflict(
+                "模型架构仍有运行中的回测任务："
+                + "、".join(
+                    str(item["backtest_job_id"]) for item in active_backtests
+                )
+            )
+        deleted = repository.delete_model_architecture(architecture_id)
+        warnings: list[str] = []
+        cleanup: dict[str, Any] = {}
+        try:
+            cleanup["clickhouse"] = model_repository.delete_model_data(
+                model_id=architecture_id,
+                model_version=revision,
+            )
+        except Exception as exc:
+            warnings.append(f"ClickHouse架构回测清理失败：{exc}")
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "cleanup": cleanup,
+            "warnings": warnings,
         }
     except Exception as exc:
         _raise(exc)
@@ -2455,6 +2496,45 @@ def record_strategy_deployment(
                 mode=mode,
                 state=str(payload.get("state") or "active"),
                 snapshot=dict(payload.get("snapshot") or {}),
+            ),
+        }
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.delete("/models/{model_id}/versions/{version}/strategy-deployments/{mode}")
+def delete_strategy_deployment(
+    model_id: str,
+    version: int,
+    mode: str,
+    payload: dict[str, Any] = Body(default={}),
+) -> dict[str, Any]:
+    """Delete a verified orphan deployment reference."""
+
+    try:
+        repository.get_model(model_id, version)
+        if mode != "paper" or payload.get("reason") != "orphaned_paper_strategy":
+            raise ModelResearchConflict(
+                "仅允许通过 orphaned_paper_strategy 清理 paper 残留部署"
+            )
+        deployment = repository.get_strategy_deployment(
+            model_id, version, mode=mode,
+        )
+        snapshot = (
+            deployment.get("strategy_snapshot_json")
+            if isinstance(deployment, dict)
+            else {}
+        )
+        if not deployment:
+            return {"ok": True, "deleted": None}
+        if str(payload.get("live_id") or "").strip() != str(
+            (snapshot or {}).get("live_id") or ""
+        ).strip():
+            raise ModelResearchConflict("部署策略标识与模型部署快照不匹配")
+        return {
+            "ok": True,
+            "deleted": repository.delete_strategy_deployment(
+                model_id, version, mode=mode,
             ),
         }
     except Exception as exc:

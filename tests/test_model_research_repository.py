@@ -870,6 +870,79 @@ def test_manual_retry_preserves_prior_attempt_and_next_claim_appends_ordinal() -
     )
 
 
+def test_artifact_recovery_claim_creates_local_uploading_attempt() -> None:
+    canceled = _claimable_job(attempt_count=2, status="canceled")
+    canceled.update({
+        "lease_owner": "",
+        "lease_token": "",
+        "cancel_requested": True,
+        "result_json": {"failure": {"retryable": False}},
+    })
+
+    class _RecoveryConnection(_RecordingConnection):
+        def execute(self, query, _params=()):
+            normalized = " ".join(str(query).split())
+            if normalized.startswith("SELECT status FROM model_job_attempts"):
+                self.queries.append(normalized)
+                self.executions.append((normalized, tuple(_params)))
+                return _Cursor({"status": "canceled"})
+            return super().execute(query, _params)
+
+    connection = _RecoveryConnection(canceled)
+    repository = ModelResearchRepository(_RecordingDatabase(connection))
+    repository.get_job = lambda _job_id: {
+        "job_id": _job_id,
+        "status": "uploading",
+        "attempt_count": 3,
+    }
+
+    claimed = repository.claim_artifact_recovery(
+        "job-attempt-audit",
+        source_attempt=2,
+    )
+
+    insert_params = next(
+        params for query, params in connection.executions
+        if query.startswith("INSERT INTO model_job_attempts")
+    )
+    assert insert_params[:4] == (
+        _attempt_identity("job-attempt-audit", 3),
+        "job-attempt-audit",
+        3,
+        "local",
+    )
+    job_update = next(
+        query for query, _params in connection.executions
+        if query.startswith("UPDATE model_jobs SET status = 'uploading'")
+    )
+    assert "cancel_requested = FALSE" in job_update
+    assert "attempt_count = attempt_count + 1" in job_update
+    assert claimed["artifact_recovery_source_attempt"] == 2
+    assert claimed["lease_token"]
+
+
+def test_artifact_recovery_rejects_nonterminal_source_attempt() -> None:
+    failed = _claimable_job(attempt_count=2, status="failed")
+    failed.update({"lease_owner": "", "lease_token": ""})
+
+    class _RecoveryConnection(_RecordingConnection):
+        def execute(self, query, _params=()):
+            normalized = " ".join(str(query).split())
+            if normalized.startswith("SELECT status FROM model_job_attempts"):
+                return _Cursor({"status": "running"})
+            return super().execute(query, _params)
+
+    repository = ModelResearchRepository(
+        _RecordingDatabase(_RecoveryConnection(failed)),
+    )
+
+    with pytest.raises(ModelResearchConflict, match="尚未终止"):
+        repository.claim_artifact_recovery(
+            "job-attempt-audit",
+            source_attempt=2,
+        )
+
+
 def test_attempt_row_exposes_error_log_cursor_and_artifact_identities() -> None:
     started = datetime(2026, 8, 28, 1, 2, tzinfo=timezone.utc)
     finished = datetime(2026, 8, 28, 1, 4, tzinfo=timezone.utc)

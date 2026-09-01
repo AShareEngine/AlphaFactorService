@@ -1750,6 +1750,149 @@ class ModelResearchRepository:
             return self.get_job(job_id)
         return self.get_job(job_id)
 
+    def claim_artifact_recovery(
+        self,
+        job_id: str,
+        *,
+        source_attempt: int,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any]:
+        """Lease a publish-only Attempt for a verified terminal training result.
+
+        The caller must validate the recovered files before invoking this method.
+        This transition deliberately creates a new local Attempt so artifacts and
+        completion are audited without rewriting the terminal source Attempt or
+        pretending that the interrupted remote execution itself succeeded.
+        """
+        source_ordinal = int(source_attempt)
+        if source_ordinal <= 0:
+            raise ModelResearchError("恢复来源Attempt必须是正整数")
+        lease_owner = "alpha-factor-service"
+        lease_seconds = max(30, min(int(lease_seconds), 300))
+        now = _utcnow()
+        expires = now + timedelta(seconds=lease_seconds)
+        token = secrets.token_urlsafe(32)
+        with self.database.connection() as conn:
+            with conn.transaction():
+                self._recover_expired(conn, now)
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (lease_owner,),
+                )
+                active = conn.execute(
+                    """
+                    SELECT job_id FROM model_jobs
+                    WHERE lease_owner = %s
+                      AND status IN ('leased', 'running', 'uploading')
+                      AND lease_expires_at >= %s
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (lease_owner, now),
+                ).fetchone()
+                if active:
+                    raise ModelResearchConflict("模型研究调度服务正在执行其他任务")
+                row = conn.execute(
+                    "SELECT * FROM model_jobs WHERE job_id = %s FOR UPDATE",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型任务不存在")
+                if str(row.get("kind") or "train") != "train":
+                    raise ModelResearchConflict("只有训练任务可以恢复产物入库")
+                if str(row.get("status") or "") not in {"failed", "canceled"}:
+                    raise ModelResearchConflict("只有失败或已取消的训练任务可以恢复产物入库")
+                if source_ordinal > int(row.get("attempt_count") or 0):
+                    raise ModelResearchConflict("恢复来源Attempt不存在")
+                source = conn.execute(
+                    """
+                    SELECT status FROM model_job_attempts
+                    WHERE job_id = %s AND ordinal = %s
+                    FOR UPDATE
+                    """,
+                    (job_id, source_ordinal),
+                ).fetchone()
+                if not source:
+                    raise ModelResearchConflict("恢复来源Attempt审计记录不存在")
+                if str(source.get("status") or "") not in {"failed", "canceled"}:
+                    raise ModelResearchConflict("恢复来源Attempt尚未终止")
+
+                ordinal = int(row.get("attempt_count") or 0) + 1
+                recovery_row = dict(row)
+                recovery_config = dict(recovery_row.get("config_json") or {})
+                recovery_config["execution"] = {
+                    **dict(recovery_config.get("execution") or {}),
+                    "node_id": "local",
+                }
+                recovery_row["config_json"] = recovery_config
+                _insert_attempt_audit_row(
+                    conn,
+                    row=recovery_row,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    started_at=now,
+                )
+                if not _update_attempt_audit_row(
+                    conn,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    status="uploading",
+                    require_active=True,
+                ):
+                    raise ModelResearchConflict("无法创建产物恢复Attempt审计记录")
+
+                result = dict(row.get("result_json") or {})
+                result["artifact_recovery"] = {
+                    "schema_version": "alphablocks.model-artifact-recovery.v1",
+                    "status": "uploading",
+                    "source_attempt": source_ordinal,
+                    "recovery_attempt": ordinal,
+                    "started_at": now.isoformat(),
+                }
+                progress = {
+                    "stage": "artifact_recovery",
+                    "percent": 90,
+                    "source_attempt": source_ordinal,
+                    "recovery_attempt": ordinal,
+                }
+                conn.execute(
+                    """
+                    UPDATE model_jobs
+                    SET status = 'uploading', cancel_requested = FALSE,
+                        lease_owner = %s, lease_token = %s,
+                        lease_expires_at = %s,
+                        attempt_count = attempt_count + 1,
+                        max_attempts = GREATEST(max_attempts, attempt_count + 1),
+                        result_json = %s, progress_json = %s,
+                        error_message = '', finished_at = NULL, updated_at = %s
+                    WHERE job_id = %s
+                    """,
+                    (
+                        lease_owner,
+                        token,
+                        expires,
+                        Jsonb(result),
+                        Jsonb(progress),
+                        now,
+                        job_id,
+                    ),
+                )
+                self._event(
+                    conn,
+                    job_id,
+                    "job.artifact_recovery_started",
+                    stage="artifact_recovery",
+                    message="已从终止的远程Attempt恢复完整产物，开始发布入库",
+                    payload={
+                        "source_attempt": source_ordinal,
+                        "recovery_attempt": ordinal,
+                    },
+                )
+        claimed = self.get_job(job_id)
+        claimed["lease_token"] = token
+        claimed["artifact_recovery_source_attempt"] = source_ordinal
+        return claimed
+
     def claim_specific_job(
         self, job_id: str, *, lease_seconds: int = 90,
     ) -> dict[str, Any]:
@@ -3376,6 +3519,43 @@ class ModelResearchRepository:
             raise ModelResearchNotFound("模型架构不存在或已归档")
         return self.get_model_architecture(architecture_id)
 
+    def delete_model_architecture(self, architecture_id: str) -> dict[str, Any]:
+        """Permanently delete one inactive architecture and its engine links."""
+
+        clean_architecture_id = _required_identifier(
+            architecture_id, "architecture_id",
+        )
+        with self.database.connection() as conn:
+            with conn.transaction():
+                row = conn.execute(
+                    "SELECT * FROM model_architectures WHERE architecture_id = %s FOR UPDATE",
+                    (clean_architecture_id,),
+                ).fetchone()
+                if not row:
+                    raise ModelResearchNotFound("模型架构不存在")
+                if str(row.get("state") or "draft") == "active":
+                    raise ModelResearchConflict("已激活模型架构必须先归档，才能永久删除")
+                engines = conn.execute(
+                    """
+                    SELECT engine_key, model_id, model_version
+                    FROM model_architecture_engines
+                    WHERE architecture_id = %s
+                    ORDER BY priority, engine_key
+                    """,
+                    (clean_architecture_id,),
+                ).fetchall()
+                conn.execute(
+                    "DELETE FROM model_architectures WHERE architecture_id = %s",
+                    (clean_architecture_id,),
+                )
+        return _json_ready_mapping({
+            "architecture_id": clean_architecture_id,
+            "name": str(row.get("name") or clean_architecture_id),
+            "state": str(row.get("state") or "draft"),
+            "revision": int(row.get("revision") or 1),
+            "engines": [dict(item) for item in engines],
+        })
+
     @staticmethod
     def _replace_architecture_engines(
         conn: Any, architecture_id: str, engines: list[Mapping[str, Any]],
@@ -3590,6 +3770,33 @@ class ModelResearchRepository:
                 WHERE model_id = %s AND model_version = %s AND mode = %s
                 """,
                 (model_id, int(version), mode),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_strategy_deployment(
+        self, model_id: str, version: int, *, mode: str,
+    ) -> dict[str, Any] | None:
+        """Remove one model deployment reference, idempotently.
+
+        The model itself remains protected by ``delete_model`` until every
+        deployment is gone.  Keeping this operation separate lets the
+        workflow layer remove a verified orphan without touching active
+        strategies or live-trading state.
+        """
+
+        clean_model_id = _required_identifier(model_id, "model_id")
+        clean_version = int(version)
+        if clean_version <= 0:
+            raise ModelResearchError("model_version必须是正整数")
+        clean_mode = _required_identifier(mode, "mode")
+        with self.database.connection() as conn:
+            row = conn.execute(
+                """
+                DELETE FROM model_strategy_deployments
+                WHERE model_id = %s AND model_version = %s AND mode = %s
+                RETURNING *
+                """,
+                (clean_model_id, clean_version, clean_mode),
             ).fetchone()
         return dict(row) if row else None
 

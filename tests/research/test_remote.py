@@ -36,7 +36,8 @@ def _runtime(tmp_path: Path) -> dict:
                     "host": "gpu.example.test",
                     "port": 22022,
                     "user": "root",
-                    "password_env": "TEST_AUTODL_PASSWORD",
+                    "authentication_type": "password",
+                    "ssh_password": "private-value",
                     "work_dir": "/root/alphablocks-research",
                     "docker_image": "alphafactor-research:latest",
                     "gpus": "all",
@@ -48,24 +49,22 @@ def _runtime(tmp_path: Path) -> dict:
 
 
 def test_remote_node_public_contract_does_not_expose_secret(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("TEST_AUTODL_PASSWORD", "private-value")
     node = load_remote_nodes(_runtime(tmp_path))[0]
 
     public = node.public()
 
     assert public["id"] == "autodl-gpu-01"
     assert public["available"] is True
-    assert public["credential_type"] == "password_env"
-    assert "password_env" not in public
+    assert public["credential_type"] == "password"
+    assert "ssh_password" not in public
     assert "private-value" not in json.dumps(public)
 
 
 def test_remote_node_supports_autodl_direct_python_runner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("TEST_AUTODL_PASSWORD", "private-value")
     runtime = _runtime(tmp_path)
     runtime["research"]["execution"]["remote_nodes"][0].update({
         "runner": "direct_python",
@@ -80,23 +79,18 @@ def test_remote_node_supports_autodl_direct_python_runner(
     assert node.public()["runner"] == "direct_python"
 
 
-def test_remote_node_storage_preserves_relative_secret_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_remote_node_storage_excludes_secret_values(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    key_path = tmp_path / ".secrets" / "remote_nodes" / "autodl_ed25519"
-    key_path.parent.mkdir(parents=True)
-    key_path.write_text("test-key", encoding="utf-8")
     runtime = _runtime(tmp_path)
     config = runtime["research"]["execution"]["remote_nodes"][0]
-    config.pop("password_env")
-    config["ssh_key"] = ".secrets/remote_nodes/autodl_ed25519"
 
     node = load_remote_nodes(runtime)[0]
     stored = remote_node_storage_payload(node)
 
-    assert node.ssh_key == key_path
-    assert stored["ssh_key"] == ".secrets/remote_nodes/autodl_ed25519"
+    assert stored["authentication_type"] == "password"
+    assert "ssh_password" not in stored
+    assert "private-value" not in repr(stored)
 
 
 @pytest.mark.parametrize(
@@ -105,7 +99,7 @@ def test_remote_node_storage_preserves_relative_secret_paths(
         ("host", "gpu;touch /tmp/pwned"),
         ("work_dir", "/root/../tmp"),
         ("docker_image", "image;shutdown"),
-        ("password_env", "bad-name"),
+        ("authentication_type", "password;shutdown"),
         ("runner", "direct;shutdown"),
     ],
 )
@@ -132,12 +126,15 @@ def test_direct_python_runner_rejects_relative_python_path(tmp_path: Path) -> No
 def test_remote_transport_ssh_includes_target_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    key_path = tmp_path / "id_ed25519"
-    key_path.write_text("test-key", encoding="utf-8")
     runtime = _runtime(tmp_path)
     node_config = runtime["research"]["execution"]["remote_nodes"][0]
-    node_config.pop("password_env")
-    node_config["ssh_key"] = str(key_path)
+    node_config["authentication_type"] = "ssh_private_key"
+    node_config["ssh_password"] = ""
+    node_config["ssh_private_key"] = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "dGVzdA==\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
     transport = RemoteTransport(load_remote_nodes(runtime)[0])
     captured: list[str] = []
 
@@ -151,11 +148,16 @@ def test_remote_transport_ssh_includes_target_once(
 
     assert captured.count("root@gpu.example.test") == 1
     assert captured[-1] == "printf ok"
+    assert transport._ssh_key_path is not None
+    assert transport._ssh_key_path.read_text(encoding="utf-8").startswith(
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+    )
+    assert oct(transport._ssh_key_path.stat().st_mode & 0o777) == "0o600"
 
 
 def test_remote_transport_drains_large_stdout_and_stderr() -> None:
     transport = object.__new__(RemoteTransport)
-    transport.node = SimpleNamespace(password_env="")
+    transport.node = SimpleNamespace(ssh_password="")
     size = 1_000_000
 
     completed = transport._run(
@@ -180,14 +182,17 @@ def test_remote_transport_drains_large_stdout_and_stderr() -> None:
 def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    key_path = tmp_path / "id_ed25519"
-    key_path.write_text("test-key", encoding="utf-8")
     source = tmp_path / "dataset.parquet"
     source.write_text("test-data", encoding="utf-8")
     runtime = _runtime(tmp_path)
     node_config = runtime["research"]["execution"]["remote_nodes"][0]
-    node_config.pop("password_env")
-    node_config["ssh_key"] = str(key_path)
+    node_config["authentication_type"] = "ssh_private_key"
+    node_config["ssh_password"] = ""
+    node_config["ssh_private_key"] = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "dGVzdA==\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
     transport = RemoteTransport(load_remote_nodes(runtime)[0])
     captured: list[str] = []
 
