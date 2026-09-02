@@ -37,7 +37,6 @@ from factor_service.model_reproducibility import build_model_reproducibility_aud
 from factor_service.model_selection import (
     daily_selection as run_daily_selection,
     negative_selection as run_negative_selection,
-    run_inference_backtest,
 )
 from factor_service.research.config import load_settings as load_research_settings
 from factor_service.research.dataset import DatasetBuilder
@@ -1157,6 +1156,31 @@ def query_model_scores(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             topk=(int(topk_value) if topk_value not in (None, "") else None),
         )
         return {"ok": True, "resolved_model": resolved, "snapshot": snapshot}
+    except Exception as exc:
+        _raise(exc)
+
+
+@router.post("/model-scores/query-range")
+def query_model_scores_range(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Resolve one model revision and return bounded exact-date score snapshots."""
+
+    try:
+        version_value = payload.get("model_version")
+        resolved = repository.resolve_model_reference(
+            str(payload.get("model") or payload.get("model_id") or ""),
+            version=(int(version_value) if version_value not in (None, "") else None),
+        )
+        date_start = datetime.fromisoformat(str(payload.get("date_start") or "")[:10]).date()
+        date_end = datetime.fromisoformat(str(payload.get("date_end") or "")[:10]).date()
+        topk_value = payload.get("topk")
+        snapshots = model_repository.model_score_snapshots(
+            model_id=str(resolved["model_id"]),
+            model_version=int(resolved["model_version"]),
+            date_start=date_start,
+            date_end=date_end,
+            topk=(int(topk_value) if topk_value not in (None, "") else None),
+        )
+        return {"ok": True, "resolved_model": resolved, "snapshots": snapshots}
     except Exception as exc:
         _raise(exc)
 
@@ -3034,33 +3058,6 @@ def get_negative_selection(
             model_id=model_id,
             model_version=version,
             trade_date=trade_date or None,
-        )
-        return {"ok": True, **result}
-    except Exception as exc:
-        _raise(exc)
-
-
-@router.post("/models/{model_id}/versions/{version}/inference-backtests")
-def create_inference_backtest(
-    model_id: str,
-    version: int,
-    payload: dict[str, Any] = Body(default={}),
-) -> dict[str, Any]:
-    """事件驱动推理回测（stored 信号：读已有模型预测，对齐 QuantMind 推理回测）。"""
-    try:
-        model = repository.get_model(model_id, version)
-        _assert_stock_prediction_scope(model, "运行推理回测")
-        strategy = payload.get("strategy") or {}
-        start_date = str(payload.get("start_date") or "")
-        end_date = str(payload.get("end_date") or "")
-        if not start_date or not end_date:
-            raise ValueError("start_date 与 end_date 必填")
-        result = run_inference_backtest(
-            model_id=model_id,
-            model_version=version,
-            start_date=start_date,
-            end_date=end_date,
-            strategy=strategy,
         )
         return {"ok": True, **result}
     except Exception as exc:

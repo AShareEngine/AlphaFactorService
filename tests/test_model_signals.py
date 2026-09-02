@@ -14,16 +14,16 @@ def test_model_score_snapshot_requires_exact_date_and_stable_order(monkeypatch) 
     target_date = date(2026, 8, 28)
     cutoff = datetime(2026, 8, 28, 15, 0)
     responses = [
-        [(4000,)],
+        [(target_date, 2, 2, 0)],
         [
-            ("000002.SZ", 0.9, 0.8, 1, 1.0, cutoff, cutoff, "v1", "hash", "run"),
-            ("000001.SZ", 0.7, 0.6, 2, 0.5, cutoff, cutoff, "v1", "hash", "run"),
+            (target_date, "000002.SZ", 0.9, 0.8, 1, 1.0, cutoff, cutoff, "v1", "hash", "run"),
         ],
     ]
 
     class _Client:
         def query(self, _query, parameters):
-            assert parameters["trade_date"] == target_date
+            assert parameters["date_start"] == target_date
+            assert parameters["date_end"] == target_date
             return SimpleNamespace(result_rows=responses.pop(0))
 
     monkeypatch.setattr(model_repository, "client", lambda: _Client())

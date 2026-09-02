@@ -248,7 +248,15 @@ def model_score_snapshot(
     topk: int | None = None,
 ) -> dict[str, Any]:
     """Return one exact, complete score cross-section without date fallback."""
-
+    snapshots = model_score_snapshots(
+        model_id=model_id,
+        model_version=model_version,
+        date_start=trade_date,
+        date_end=trade_date,
+        topk=topk,
+    )
+    if snapshots:
+        return snapshots[0]
     trading_rows = client().query(
         """
         SELECT count()
@@ -259,50 +267,117 @@ def model_score_snapshot(
     ).result_rows
     if not trading_rows or int(trading_rows[0][0]) <= 0:
         raise ValueError(f"{trade_date.isoformat()}不是有效交易日")
+    raise ValueError(
+        f"模型{model_id} v{model_version}在{trade_date.isoformat()}没有分数截面"
+    )
+
+
+def model_score_snapshots(
+    *,
+    model_id: str,
+    model_version: int,
+    date_start: date,
+    date_end: date,
+    topk: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return validated immutable score snapshots for a bounded date range."""
+
+    if date_end < date_start:
+        raise ValueError("模型分数开始日期不能晚于结束日期")
+    if (date_end - date_start).days > 366:
+        raise ValueError("模型分数批量查询范围不能超过366天")
     database = settings().model_database
-    rows = client().query(
+    params = {
+        "model_id": str(model_id),
+        "model_version": int(model_version),
+        "date_start": date_start,
+        "date_end": date_end,
+    }
+    stats_rows = client().query(
         f"""
-        SELECT entity_code, score, raw_prediction, rank_value, percentile,
-               feature_cutoff_at, computed_at, source_vintage, dataset_hash,
-               inference_run_id
+        SELECT trade_date, count() AS row_count,
+               uniqExact(entity_code) AS unique_count,
+               countIf(NOT isFinite(toFloat64(score))) AS invalid_score_count
         FROM {database}.model_predictions_daily FINAL
         WHERE model_id = {{model_id:String}}
           AND model_version = {{model_version:UInt32}}
-          AND trade_date = {{trade_date:Date}}
-        ORDER BY score DESC, entity_code ASC
-        LIMIT 10000
+          AND trade_date BETWEEN {{date_start:Date}} AND {{date_end:Date}}
+        GROUP BY trade_date
+        ORDER BY trade_date ASC
         """,
-        parameters={
-            "model_id": str(model_id),
-            "model_version": int(model_version),
-            "trade_date": trade_date,
-        },
+        parameters=params,
     ).result_rows
-    if not rows:
-        raise ValueError(
-            f"模型{model_id} v{model_version}在{trade_date.isoformat()}没有分数截面"
+    if not stats_rows:
+        return []
+    stats = {
+        row[0]: {
+            "row_count": int(row[1]),
+            "unique_count": int(row[2]),
+            "invalid_score_count": int(row[3]),
+        }
+        for row in stats_rows
+    }
+    for trade_date, values in stats.items():
+        if values["unique_count"] != values["row_count"]:
+            raise ValueError(f"模型分数截面{trade_date.isoformat()}包含重复股票")
+        if values["invalid_score_count"]:
+            raise ValueError(f"模型分数截面{trade_date.isoformat()}包含缺失或非有限分数")
+    limit = 10_000 if topk is None else max(1, min(int(topk), 10_000))
+    row_params = {**params, "limit": limit}
+    rows = client().query(
+        f"""
+        SELECT trade_date, entity_code, score, raw_prediction, rank_value,
+               percentile, feature_cutoff_at, computed_at, source_vintage,
+               dataset_hash, inference_run_id
+        FROM (
+            SELECT trade_date, entity_code, score, raw_prediction, rank_value,
+                   percentile, feature_cutoff_at, computed_at, source_vintage,
+                   dataset_hash, inference_run_id,
+                   row_number() OVER (
+                       PARTITION BY trade_date ORDER BY score DESC, entity_code ASC
+                   ) AS score_position
+            FROM {database}.model_predictions_daily FINAL
+            WHERE model_id = {{model_id:String}}
+              AND model_version = {{model_version:UInt32}}
+              AND trade_date BETWEEN {{date_start:Date}} AND {{date_end:Date}}
         )
-    if len({str(row[0]) for row in rows}) != len(rows):
-        raise ValueError("模型分数截面包含重复股票")
-    if any(row[1] is None or not np.isfinite(float(row[1])) for row in rows):
-        raise ValueError("模型分数截面包含缺失或非有限分数")
-    limit = len(rows) if topk is None else max(1, min(int(topk), len(rows)))
-    selected = rows[:limit]
+        WHERE score_position <= {{limit:UInt32}}
+        ORDER BY trade_date ASC, score DESC, entity_code ASC
+        """,
+        parameters=row_params,
+    ).result_rows
+    grouped: dict[date, list[tuple[Any, ...]]] = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append(row[1:])
+    return [
+        _model_score_snapshot_payload(
+            model_id=model_id,
+            model_version=model_version,
+            trade_date=trade_date,
+            row_count=values["row_count"],
+            rows=grouped.get(trade_date, []),
+        )
+        for trade_date, values in stats.items()
+    ]
+
+
+def _model_score_snapshot_payload(
+    *, model_id: str, model_version: int, trade_date: date,
+    row_count: int, rows: list[tuple[Any, ...]],
+) -> dict[str, Any]:
     return {
         "schema_version": "alphablocks.model-score-snapshot.v1",
         "model_id": str(model_id),
         "model_version": int(model_version),
         "trade_date": trade_date.isoformat(),
-        "row_count": len(rows),
-        "returned_count": len(selected),
+        "row_count": int(row_count),
+        "returned_count": len(rows),
         "order": "score_desc_entity_code_asc",
         "rows": [
             {
                 "entity_code": str(row[0]),
                 "score": float(row[1]),
-                "raw_prediction": (
-                    float(row[2]) if row[2] is not None else None
-                ),
+                "raw_prediction": float(row[2]) if row[2] is not None else None,
                 "rank_value": int(row[3]) if row[3] is not None else None,
                 "percentile": float(row[4]) if row[4] is not None else None,
                 "feature_cutoff_at": row[5].isoformat(),
@@ -311,7 +386,7 @@ def model_score_snapshot(
                 "dataset_hash": str(row[8]),
                 "inference_run_id": str(row[9]),
             }
-            for row in selected
+            for row in rows
         ],
     }
 

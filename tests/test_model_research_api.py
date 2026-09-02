@@ -450,6 +450,39 @@ def test_model_score_query_freezes_resolved_version_and_exact_date(monkeypatch) 
     }
 
 
+def test_model_score_range_query_freezes_one_revision_and_bounded_dates(monkeypatch) -> None:
+    repository = _Repository()
+    client = _client(monkeypatch, repository, _Scheduler())
+    captured = {}
+
+    def snapshots(**kwargs):
+        captured.update(kwargs)
+        return [{"trade_date": kwargs["date_start"].isoformat(), "rows": []}]
+
+    monkeypatch.setattr(
+        model_research.model_repository, "model_score_snapshots", snapshots,
+    )
+    response = client.post(
+        "/model-research/model-scores/query-range",
+        json={
+            "model": "大小盘选股",
+            "date_start": "2026-08-01",
+            "date_end": "2026-08-28",
+            "topk": 20,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["resolved_model"]["model_version"] == 3
+    assert captured == {
+        "model_id": "model-a",
+        "model_version": 3,
+        "date_start": date(2026, 8, 1),
+        "date_end": date(2026, 8, 28),
+        "topk": 20,
+    }
+
+
 def test_training_job_freezes_configured_database_binding(monkeypatch) -> None:
     repository = _Repository()
     client = _client(monkeypatch, repository, _Scheduler())
