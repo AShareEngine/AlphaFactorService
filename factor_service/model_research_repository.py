@@ -5553,9 +5553,13 @@ def _incremental_training_assessment(
     }
 
 
-def _dataset_spec(source: Mapping[str, Any]) -> dict[str, Any]:
+def _dataset_spec(
+    source: Mapping[str, Any], *, allow_empty_factors: bool = False,
+) -> dict[str, Any]:
     factors = source.get("factors")
-    if not isinstance(factors, list) or not factors:
+    if not isinstance(factors, list):
+        raise ModelResearchError("训练特征必须是列表")
+    if not factors and not allow_empty_factors:
         raise ModelResearchError("至少选择一个训练特征")
     if len(factors) > 100:
         raise ModelResearchError("一次最多选择100个训练特征")
@@ -6607,6 +6611,16 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
             raise ModelResearchError("Walk-Forward样本外起止日期必须是ISO日期") from exc
         if oos_start > oos_end:
             raise ModelResearchError("Walk-Forward样本外开始日期不得晚于结束日期")
+    oos_date_start_mode = str(
+        source.get("oos_date_start_mode") or "manual"
+    ).strip().lower()
+    oos_date_end_mode = str(
+        source.get("oos_date_end_mode") or "manual"
+    ).strip().lower()
+    if oos_date_start_mode not in {"automatic", "manual"}:
+        raise ModelResearchError("Walk-Forward样本外开始日期模式无效")
+    if oos_date_end_mode not in {"automatic", "manual"}:
+        raise ModelResearchError("Walk-Forward样本外结束日期模式无效")
     return {
         "enabled": enabled,
         "strategy": strategy,
@@ -6617,6 +6631,8 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         "embargo_sessions": embargo_sessions,
         "oos_date_start": oos_date_start,
         "oos_date_end": oos_date_end,
+        "oos_date_start_mode": oos_date_start_mode,
+        "oos_date_end_mode": oos_date_end_mode,
     }
 
 
