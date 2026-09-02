@@ -102,6 +102,34 @@ def test_preflight_can_resolve_calendar_before_features_are_selected() -> None:
     )
 
 
+def test_preflight_supports_zero_validation_without_fake_validation_window() -> None:
+    calendar = pd.bdate_range("2020-01-02", periods=800)
+    payload = _payload(calendar, {
+        "mode": "ratio", "train": 0.6, "valid": 0.2, "test": 0.2,
+        "embargo_days": 5,
+    })
+    payload["walk_forward"] = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_sessions": 504,
+        "valid_sessions": 0,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "",
+        "oos_date_end": "",
+    }
+
+    result = _service(calendar).validate(payload)
+    walk_forward = result["walk_forward"]
+
+    assert walk_forward["required_history_sessions"] == 509
+    assert walk_forward["prediction_date_start"] == calendar[509].date().isoformat()
+    assert "valid" not in walk_forward["first_window"]
+    assert walk_forward["windows"][0]["valid"]["sessions"] == 0
+    assert walk_forward["windows"][0]["train_test_embargo"]["sessions"] == 5
+
+
 def test_preflight_replay_rejects_calendar_drift() -> None:
     calendar = pd.bdate_range("2024-01-02", periods=105)
     result = _service(calendar).validate(_payload(calendar, {

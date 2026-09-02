@@ -509,6 +509,23 @@ def test_walk_forward_rolling_windows_use_embargo_and_do_not_overlap_tests() -> 
         assert pd.Timestamp(previous["test"][1]) < pd.Timestamp(current["test"][0])
 
 
+def test_walk_forward_zero_validation_uses_single_train_test_embargo() -> None:
+    dates = pd.date_range("2018-01-02", periods=1000, freq="B")
+    windows = walk_forward_segments(
+        pd.Index(dates), train_sessions=252, valid_sessions=0,
+        test_sessions=20, step_sessions=20, embargo_sessions=5,
+        oos_date_start=dates[500].date().isoformat(),
+        oos_date_end=dates[539].date().isoformat(),
+    )
+
+    assert len(windows) == 2
+    for window in windows:
+        assert "valid" not in window
+        train_end = dates.get_loc(pd.Timestamp(window["train"][1]))
+        test_start = dates.get_loc(pd.Timestamp(window["test"][0]))
+        assert test_start - train_end == 6
+
+
 def test_walk_forward_expanding_windows_keep_original_train_start() -> None:
     dates = pd.date_range("2018-01-02", periods=1600, freq="B")
     windows = walk_forward_segments(

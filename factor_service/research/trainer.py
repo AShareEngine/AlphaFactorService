@@ -154,18 +154,18 @@ class QlibTrainer:
         model_spec = dict(config.get("model") or {})
         raw_params = dict(model_spec.get("params") or {})
         model_kind = str(model_spec.get("kind") or "lightgbm")
-        handler = DataHandlerLP.from_df(training_prepared.frame)
+        validation_enabled = not (
+            walk_forward_config.get("enabled") is True
+            and int(walk_forward_config.get("valid_sessions", 60)) == 0
+        )
+        if not validation_enabled:
+            raw_params["early_stopping_rounds"] = 0
+            if model_kind == "catboost":
+                raw_params["od_wait"] = 0
         dataset = None
         model: Any = None
         model_params: dict[str, Any] = dict(raw_params)
-        if model_kind != "stacking":
-            dataset = _dataset_for_model(
-                handler, training_prepared.segments, model_kind, raw_params, DatasetH,
-            )
-            model, model_params = _create_model(
-                model_kind, raw_params, len(training_prepared.feature_names),
-            )
-        elif incremental_config:
+        if model_kind == "stacking" and incremental_config:
             raise ValueError("Stacking暂不支持增量续训")
         if model_kind == "stacking" and walk_forward_config.get("enabled") is True:
             raise ValueError("Stacking已使用时序OOF，不能同时开启Walk-Forward")
@@ -181,6 +181,41 @@ class QlibTrainer:
         recorder_uri = f"sqlite:///{recorder_db.as_posix()}"
         experiment_name = f"alphablocks_{job['model_id']}"
         _prepare_recorder_experiment(recorder_uri, experiment_name, recorder_root)
+        optuna_result: dict[str, Any] | None = None
+        optuna_config = dict(config.get("optuna") or {})
+        if optuna_config.get("enabled") is True:
+            tuning_experiment_name = (
+                f"{experiment_name}_optuna_v"
+                f"{int(config.get('planned_model_version') or 1)}"
+            )
+            _prepare_recorder_experiment(
+                recorder_uri, tuning_experiment_name, recorder_root,
+            )
+            with R.start(
+                experiment_name=tuning_experiment_name,
+                recorder_name=f"{job['job_id']}_optuna",
+                uri=recorder_uri,
+            ):
+                optuna_result = _tune_tree_hyperparameters(
+                    training_prepared,
+                    model_kind=model_kind,
+                    base_params=raw_params,
+                    config=optuna_config,
+                    DataHandlerLP=DataHandlerLP,
+                    DatasetH=DatasetH,
+                    classification=classification,
+                    cancellation=cancellation,
+                    progress=progress,
+                )
+            raw_params = {**raw_params, **dict(optuna_result["best_params"])}
+        handler = DataHandlerLP.from_df(training_prepared.frame)
+        if model_kind != "stacking":
+            dataset = _dataset_for_model(
+                handler, training_prepared.segments, model_kind, raw_params, DatasetH,
+            )
+            model, model_params = _create_model(
+                model_kind, raw_params, len(training_prepared.feature_names),
+            )
         evals_result: dict[str, Any] = {}
         walk_forward_report: dict[str, Any] | None = None
         walk_forward_prediction: pd.Series | None = None
@@ -252,9 +287,13 @@ class QlibTrainer:
                     model, model_kind, dataset, "train",
                     classification=classification,
                 )
-                valid_prediction = _predict_dataset(
-                    model, model_kind, dataset, "valid",
-                    classification=classification,
+                valid_prediction = (
+                    _predict_dataset(
+                        model, model_kind, dataset, "valid",
+                        classification=classification,
+                    )
+                    if "valid" in walk_forward_result.latest_segments
+                    else None
                 )
                 test_prediction = _predict_dataset(
                     model, model_kind, dataset, "test",
@@ -318,28 +357,37 @@ class QlibTrainer:
             classification=classification,
         )
         del train_prediction
-        raw_validation_metrics = _metrics(
-            valid_prediction, metric_frame,
-            metric_segments["valid"],
-            classification=classification,
-        )
-        validation_metrics = {
-            "rows": raw_validation_metrics["test_rows"],
-            "days": raw_validation_metrics["test_days"],
-            "rmse": raw_validation_metrics["rmse"],
-            "ic": raw_validation_metrics["ic"],
-            "rank_ic": raw_validation_metrics["rank_ic"],
-            "ic_ir": raw_validation_metrics["ic_ir"],
-            "rank_icir": raw_validation_metrics["rank_icir"],
-            **{
-                key: raw_validation_metrics[key]
-                for key in (
-                    "mse", "l2", "mae", "auc", "log_loss",
-                    "accuracy", "precision", "recall", "f1",
-                )
-                if key in raw_validation_metrics
-            },
-        }
+        if valid_prediction is None or "valid" not in metric_segments:
+            validation_metrics = {
+                "enabled": False,
+                "reason": "walk_forward_valid_sessions_zero",
+                "rows": 0,
+                "days": 0,
+            }
+        else:
+            raw_validation_metrics = _metrics(
+                valid_prediction, metric_frame,
+                metric_segments["valid"],
+                classification=classification,
+            )
+            validation_metrics = {
+                "enabled": True,
+                "rows": raw_validation_metrics["test_rows"],
+                "days": raw_validation_metrics["test_days"],
+                "rmse": raw_validation_metrics["rmse"],
+                "ic": raw_validation_metrics["ic"],
+                "rank_ic": raw_validation_metrics["rank_ic"],
+                "ic_ir": raw_validation_metrics["ic_ir"],
+                "rank_icir": raw_validation_metrics["rank_icir"],
+                **{
+                    key: raw_validation_metrics[key]
+                    for key in (
+                        "mse", "l2", "mae", "auc", "log_loss",
+                        "accuracy", "precision", "recall", "f1",
+                    )
+                    if key in raw_validation_metrics
+                },
+            }
         normalized_train_metrics = {
             "rows": train_metrics["test_rows"],
             "days": train_metrics["test_days"],
@@ -410,6 +458,7 @@ class QlibTrainer:
                 else "primary_model"
             ),
             "model_params": model_params,
+            "hyperparameter_optimization": optuna_result,
             "ensemble": (
                 {
                     **dict(model_spec.get("ensemble") or {}),
@@ -465,6 +514,7 @@ class QlibTrainer:
         metrics_path = work_dir / "metrics.json"
         importance_path = work_dir / "feature_importance.json"
         training_diagnostics_path = work_dir / "training_diagnostics.json"
+        optuna_path = work_dir / "optuna_trials.json"
         config_path = work_dir / "task_config.json"
         model_path = work_dir / "model.pkl"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -473,6 +523,11 @@ class QlibTrainer:
         training_diagnostics_path.write_text(
             json.dumps(training_diagnostics, ensure_ascii=False, indent=2), encoding="utf-8",
         )
+        if optuna_result is not None:
+            optuna_path.write_text(
+                json.dumps(optuna_result, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
         config_path.write_text(json.dumps(job.get("config_json") or {}, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         with model_path.open("wb") as target:
             pickle.dump(model, target)
@@ -480,6 +535,8 @@ class QlibTrainer:
         with tarfile.open(bundle_path, "w:gz") as archive:
             for path in [manifest_path, metrics_path, importance_path, training_diagnostics_path, config_path, model_path, predictions_path, dataset_manifest_path]:
                 archive.add(path, arcname=path.name)
+            if optuna_path.is_file():
+                archive.add(optuna_path, arcname=optuna_path.name)
             if recorder_db.exists():
                 archive.add(recorder_db, arcname=recorder_db.name)
             if recorder_root.exists():
@@ -514,6 +571,8 @@ class QlibTrainer:
         ]
         if walk_forward_report is not None:
             artifacts.append(("walk_forward_series", walk_forward_bundle_path))
+        if optuna_path.is_file():
+            artifacts.append(("optuna_trials", optuna_path))
         _checkpoint(cancellation)
         _progress(progress, "packaged", 88, {
             "artifact_count": len(artifacts), "prediction_rows": prediction_rows,
@@ -676,7 +735,7 @@ def _run_walk_forward(
         dates,
         strategy=str(config.get("strategy") or "rolling"),
         train_sessions=int(config.get("train_sessions") or 756),
-        valid_sessions=int(config.get("valid_sessions") or 60),
+        valid_sessions=int(config.get("valid_sessions", 60)),
         test_sessions=int(config.get("test_sessions") or 20),
         step_sessions=int(config.get("step_sessions") or 20),
         embargo_sessions=int(config.get("embargo_sessions") or 5),
@@ -724,6 +783,14 @@ def _run_walk_forward(
                 task["dataset"]["kwargs"]["segments"]
             ).items()
         }
+        validation_enabled = "valid" in segments
+        training_segments = dict(segments)
+        if not validation_enabled:
+            # Qlib's model adapters expect a named valid segment.  Reusing the
+            # train bounds is an internal API-compatibility alias only; every
+            # trainer receives validation_enabled=False and must not early-stop,
+            # select a checkpoint, or publish metrics from this alias.
+            training_segments["valid"] = training_segments["train"]
         _checkpoint(cancellation)
         start_percent = 58 + int(14 * (index - 1) / total)
         end_percent = 58 + int(14 * index / total)
@@ -731,8 +798,10 @@ def _run_walk_forward(
         _progress(progress, "walk_forward_training", start_percent, details)
         window_frame, medians = _walk_forward_frame(prepared, segments)
         window_dataset = _dataset_for_model(
-            DataHandlerLP.from_df(window_frame), segments, model_kind, raw_params, DatasetH,
+            DataHandlerLP.from_df(window_frame), training_segments,
+            model_kind, raw_params, DatasetH,
         )
+        setattr(window_dataset, "_alphablocks_validation_enabled", validation_enabled)
         window_model, _ = _create_model(
             model_kind, raw_params, len(prepared.feature_names),
         )
@@ -881,7 +950,8 @@ def _run_walk_forward(
         "publish_state": "ready",
         "strategy": str(config.get("strategy") or "rolling"),
         "train_sessions": int(config.get("train_sessions") or 756),
-        "valid_sessions": int(config.get("valid_sessions") or 60),
+        "valid_sessions": int(config.get("valid_sessions", 60)),
+        "validation_enabled": int(config.get("valid_sessions", 60)) > 0,
         "test_sessions": int(config.get("test_sessions") or 20),
         "step_sessions": int(config.get("step_sessions") or 20),
         "embargo_sessions": int(config.get("embargo_sessions") or 5),
@@ -1489,19 +1559,74 @@ def _fit_model(
     initial_model: Any | None = None,
 ) -> None:
     """Fit one Qlib model; LightGBM retains per-iteration cancellation points."""
+    validation_enabled = bool(
+        getattr(dataset, "_alphablocks_validation_enabled", True)
+    )
     if initial_model is not None and model_kind != "lightgbm":
         raise ValueError("首版增量续训只支持LightGBM")
     if model_kind != "lightgbm":
         _checkpoint(cancellation)
         if model_kind in {"xgboost", "catboost"}:
-            model.fit(
-                dataset,
-                num_boost_round=int(getattr(model, "_alphablocks_num_boost_round", 1000)),
-                early_stopping_rounds=int(getattr(model, "_alphablocks_early_stopping_rounds", 50)),
-                verbose_eval=20,
-                evals_result=evals_result,
+            early_stopping_rounds = int(
+                getattr(model, "_alphablocks_early_stopping_rounds", 50)
             )
-            if model_kind == "catboost" and not evals_result:
+            num_boost_round = int(
+                getattr(model, "_alphablocks_num_boost_round", 1000)
+            )
+            if validation_enabled:
+                model.fit(
+                    dataset,
+                    num_boost_round=num_boost_round,
+                    early_stopping_rounds=early_stopping_rounds,
+                    verbose_eval=20,
+                    evals_result=evals_result,
+                )
+            else:
+                from qlib.data.dataset import DataHandlerLP
+
+                train = dataset.prepare(
+                    "train", col_set=["feature", "label"],
+                    data_key=DataHandlerLP.DK_L,
+                )
+                x_train = train["feature"]
+                y_train = np.asarray(train["label"].values).reshape(-1)
+                if model_kind == "xgboost":
+                    import xgboost as xgb
+
+                    native_evals: dict[str, Any] = {}
+                    matrix = xgb.DMatrix(x_train.values, label=y_train)
+                    model.model = xgb.train(
+                        model._params,
+                        dtrain=matrix,
+                        num_boost_round=num_boost_round,
+                        evals=[(matrix, "train")],
+                        verbose_eval=20,
+                        evals_result=native_evals,
+                    )
+                    evals_result["train"] = list(
+                        native_evals["train"].values()
+                    )[0]
+                else:
+                    from catboost import CatBoost, Pool
+
+                    native_params = dict(model._params)
+                    native_params.update({
+                        "iterations": num_boost_round,
+                        "verbose": 20,
+                    })
+                    native_params.pop("early_stopping_rounds", None)
+                    model.model = CatBoost(native_params)
+                    model.model.fit(
+                        Pool(data=x_train, label=y_train),
+                        use_best_model=False,
+                    )
+                    raw_evaluations = model.model.get_evals_result()
+                    train_metrics = dict(raw_evaluations.get("learn") or {})
+                    if train_metrics:
+                        evals_result["train"] = list(
+                            train_metrics.values()
+                        )[0]
+            if model_kind == "catboost" and validation_enabled and not evals_result:
                 raw_evaluations = model.model.get_evals_result()
                 train_metrics = dict(raw_evaluations.get("learn") or {})
                 valid_metrics = dict(raw_evaluations.get("validation") or {})
@@ -1555,6 +1680,8 @@ def _fit_model(
 
     prepared_sets = model._prepare_data(dataset)  # Qlib's canonical DatasetH adapter.
     datasets, names = list(zip(*prepared_sets))
+    if not validation_enabled:
+        datasets, names = datasets[:1], names[:1]
     total = max(1, int(model.num_boost_round))
 
     def cooperative_callback(environment: Any) -> None:
@@ -1579,12 +1706,14 @@ def _fit_model(
     cooperative_callback.order = 0  # type: ignore[attr-defined]
     cooperative_callback.before_iteration = True  # type: ignore[attr-defined]
     def training_callbacks() -> list[Any]:
-        return [
+        callbacks = [
             cooperative_callback,
-            lgb.early_stopping(model.early_stopping_rounds),
             lgb.log_evaluation(period=20),
             lgb.record_evaluation(evals_result),
         ]
+        if validation_enabled:
+            callbacks.insert(1, lgb.early_stopping(model.early_stopping_rounds))
+        return callbacks
 
     initial_booster = getattr(initial_model, "model", None) if initial_model is not None else None
     if initial_model is not None and initial_booster is None:
@@ -1634,6 +1763,191 @@ def _fit_model(
         progress, stage, progress_end,
         {**(progress_details or {}), "model_kind": model_kind, "completed": True},
     )
+
+
+def _suggest_tree_hyperparameters(trial: Any, model_kind: str) -> dict[str, Any]:
+    """QuantMind-compatible tree search spaces with AlphaBlocks field names."""
+    if model_kind == "lightgbm":
+        return {
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.005, 0.1, log=True,
+            ),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "min_child_samples": trial.suggest_int(
+                "min_child_samples", 20, 500,
+            ),
+            "feature_fraction": trial.suggest_float(
+                "feature_fraction", 0.4, 0.9,
+            ),
+            "bagging_fraction": trial.suggest_float(
+                "bagging_fraction", 0.4, 0.9,
+            ),
+            "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
+            "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 10.0),
+        }
+    if model_kind == "xgboost":
+        return {
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.005, 0.1, log=True,
+            ),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+            "colsample_bytree": trial.suggest_float(
+                "colsample_bytree", 0.4, 0.9,
+            ),
+            "min_child_weight": trial.suggest_int(
+                "min_child_weight", 20, 300,
+            ),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
+        }
+    if model_kind == "catboost":
+        return {
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.005, 0.1, log=True,
+            ),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "l2_leaf_reg": trial.suggest_float(
+                "l2_leaf_reg", 1.0, 10.0, log=True,
+            ),
+            "random_strength": trial.suggest_float(
+                "random_strength", 0.5, 5.0,
+            ),
+        }
+    raise ValueError("Optuna只支持LightGBM、XGBoost或CatBoost")
+
+
+def _tune_tree_hyperparameters(
+    prepared: PreparedDataset,
+    *,
+    model_kind: str,
+    base_params: dict[str, Any],
+    config: dict[str, Any],
+    DataHandlerLP: Any,
+    DatasetH: Any,
+    classification: bool,
+    cancellation: CancellationToken | None,
+    progress: ProgressCallback | None,
+) -> dict[str, Any]:
+    """Search only on the frozen validation split, then return auditable trials."""
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError("Optuna尚未安装，请更新AlphaFactorService训练环境") from exc
+
+    n_trials = int(config.get("n_trials") or 20)
+    seed = int(config.get("seed") if config.get("seed") is not None else 42)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    handler = DataHandlerLP.from_df(prepared.frame)
+    validation_segment = prepared.segments.get("valid")
+    if not validation_segment:
+        raise ValueError("Optuna需要非空验证集")
+
+    def objective(trial: Any) -> float:
+        _checkpoint(cancellation)
+        suggested = _suggest_tree_hyperparameters(trial, model_kind)
+        trial_params = {**base_params, **suggested}
+        trial_dataset = _dataset_for_model(
+            handler, prepared.segments, model_kind, trial_params, DatasetH,
+        )
+        trial_model, _ = _create_model(
+            model_kind, trial_params, len(prepared.feature_names),
+        )
+        evals_result: dict[str, Any] = {}
+        _fit_model(
+            model_kind, trial_model, trial_dataset, evals_result,
+            cancellation=cancellation,
+            progress=progress,
+            stage="optuna_trial",
+            progress_start=58,
+            progress_end=58,
+            progress_details={
+                "trial": int(trial.number) + 1,
+                "trial_count": n_trials,
+            },
+            metric_prefix=f"optuna.trial_{int(trial.number) + 1}.",
+        )
+        prediction = _predict_dataset(
+            trial_model, model_kind, trial_dataset, "valid",
+            classification=classification,
+        )
+        metrics = _metrics(
+            prediction, prepared.frame, validation_segment,
+            classification=classification,
+        )
+        for key in ("test_rows", "test_days", "rmse", "rank_ic", "rank_icir"):
+            trial.set_user_attr(key, metrics[key])
+        value = float(metrics["rank_icir"])
+        if not np.isfinite(value):
+            raise optuna.TrialPruned("验证集Rank ICIR不是有限值")
+        return value
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+        study_name=f"{model_kind}_validation_rank_icir",
+    )
+
+    def report_trial(_study: Any, frozen_trial: Any) -> None:
+        _progress(progress, "optuna_trial_completed", 58, {
+            "trial": int(frozen_trial.number) + 1,
+            "trial_count": n_trials,
+            "state": frozen_trial.state.name.lower(),
+            "value": (
+                float(frozen_trial.value)
+                if frozen_trial.value is not None else None
+            ),
+        })
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        callbacks=[report_trial],
+        show_progress_bar=False,
+    )
+    completed = [
+        trial for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    ]
+    if not completed:
+        raise ValueError("Optuna没有完成任何有效试验")
+    trials = []
+    for trial in study.trials:
+        duration = (
+            (trial.datetime_complete - trial.datetime_start).total_seconds()
+            if trial.datetime_start is not None and trial.datetime_complete is not None
+            else None
+        )
+        trials.append({
+            "trial_number": int(trial.number) + 1,
+            "state": trial.state.name.lower(),
+            "value": float(trial.value) if trial.value is not None else None,
+            "params": dict(trial.params),
+            "validation": dict(trial.user_attrs),
+            "duration_seconds": float(duration) if duration is not None else None,
+        })
+    result = {
+        "schema_version": "alphablocks.optuna-search-result.v1",
+        "enabled": True,
+        "backend": "optuna",
+        "model_kind": model_kind,
+        "objective": "validation_rank_icir",
+        "direction": "maximize",
+        "sampler": "tpe",
+        "seed": seed,
+        "requested_trials": n_trials,
+        "completed_trials": len(completed),
+        "best_trial_number": int(study.best_trial.number) + 1,
+        "best_value": float(study.best_value),
+        "best_params": dict(study.best_params),
+        "trials": trials,
+    }
+    _progress(progress, "optuna_completed", 58, {
+        "completed_trials": len(completed),
+        "best_trial_number": result["best_trial_number"],
+        "best_value": result["best_value"],
+        "best_params": result["best_params"],
+    })
+    return result
 
 
 def _checkpoint(cancellation: CancellationToken | None) -> None:

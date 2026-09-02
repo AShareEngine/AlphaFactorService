@@ -152,6 +152,9 @@ class QlibTorchMLPModel:
         from qlib.data.dataset import DataHandlerLP
 
         evaluations = evals_result if evals_result is not None else {}
+        validation_enabled = bool(
+            getattr(dataset, "_alphablocks_validation_enabled", True)
+        )
         train, valid = dataset.prepare(
             ["train", "valid"], col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
@@ -160,7 +163,7 @@ class QlibTorchMLPModel:
         y_train = torch.as_tensor(train["label"].values.reshape(-1), dtype=torch.float32, device=self.device)
         x_valid = torch.as_tensor(valid["feature"].values, dtype=torch.float32, device=self.device)
         y_valid = torch.as_tensor(valid["label"].values.reshape(-1), dtype=torch.float32, device=self.device)
-        if not len(x_train) or not len(x_valid):
+        if not len(x_train) or (validation_enabled and not len(x_valid)):
             raise ValueError("MLP训练集或验证集为空")
         optimizer = torch.optim.AdamW(
             self.network.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
@@ -175,7 +178,9 @@ class QlibTorchMLPModel:
         best_loss = float("inf")
         best_state = deepcopy(self.network.state_dict())
         stale = 0
-        evaluations.update({"train": [], "valid": [], "steps": []})
+        evaluations.update({"train": [], "steps": []})
+        if validation_enabled:
+            evaluations["valid"] = []
         started_at = time.perf_counter()
         self.network.train()
         for step in range(1, self.max_steps + 1):
@@ -193,14 +198,15 @@ class QlibTorchMLPModel:
             scaler.update()
             if step % self.eval_steps != 0 and step != self.max_steps:
                 continue
-            self.network.eval()
-            with torch.no_grad():
-                with _autocast(torch, self.device, amp_enabled):
-                    valid_output = self.network(x_valid).reshape(-1)
-                    valid_loss = loss_fn(valid_output.float(), y_valid).item()
             evaluations["train"].append(float(train_loss.item()))
-            evaluations["valid"].append(float(valid_loss))
             evaluations["steps"].append(step)
+            if validation_enabled:
+                self.network.eval()
+                with torch.no_grad():
+                    with _autocast(torch, self.device, amp_enabled):
+                        valid_output = self.network(x_valid).reshape(-1)
+                        valid_loss = loss_fn(valid_output.float(), y_valid).item()
+                evaluations["valid"].append(float(valid_loss))
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
@@ -216,25 +222,28 @@ class QlibTorchMLPModel:
                         ),
                     },
                 )
-            if valid_loss + 1e-12 < best_loss:
-                best_loss = valid_loss
-                best_state = deepcopy(self.network.state_dict())
-                stale = 0
-            else:
-                stale += 1
-                if stale >= self.early_stopping_rounds:
-                    break
+            if validation_enabled:
+                if valid_loss + 1e-12 < best_loss:
+                    best_loss = valid_loss
+                    best_state = deepcopy(self.network.state_dict())
+                    stale = 0
+                else:
+                    stale += 1
+                    if stale >= self.early_stopping_rounds:
+                        break
             self.network.train()
-        self.network.load_state_dict(best_state)
+        if validation_enabled:
+            self.network.load_state_dict(best_state)
         self.network.eval()
         self.fitted = True
         try:
             from qlib.workflow import R
 
-            for step, (train_loss, valid_loss) in enumerate(
-                zip(evaluations["train"], evaluations["valid"]), start=1,
-            ):
-                R.log_metrics(train_loss=train_loss, valid_loss=valid_loss, step=step)
+            for step, train_loss in enumerate(evaluations["train"], start=1):
+                metrics = {"train_loss": train_loss}
+                if validation_enabled:
+                    metrics["valid_loss"] = evaluations["valid"][step - 1]
+                R.log_metrics(**metrics, step=step)
         except (AttributeError, RuntimeError):
             pass
 
@@ -338,24 +347,32 @@ class QlibTorchLSTMModel:
         from qlib.data.dataset import DataHandlerLP
 
         evaluations = evals_result if evals_result is not None else {}
+        validation_enabled = bool(
+            getattr(dataset, "_alphablocks_validation_enabled", True)
+        )
         train, valid = dataset.prepare(
             ["train", "valid"], col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
         )
-        if not len(train) or not len(valid):
+        if not len(train) or (validation_enabled and not len(valid)):
             raise ValueError(f"{self.model_name}训练集或验证集为空")
-        valid_indices = _validation_indices(
-            len(valid), _validation_sample_limit(),
+        valid_indices = (
+            _validation_indices(len(valid), _validation_sample_limit())
+            if validation_enabled else []
         )
-        valid_features, valid_labels = _materialize_sequence_rows(
-            valid, valid_indices, self.input_dim,
+        valid_features, valid_labels = (
+            _materialize_sequence_rows(valid, valid_indices, self.input_dim)
+            if validation_enabled
+            else (np.empty((0,)), np.empty((0,)))
         )
-        if not len(valid_features):
+        if validation_enabled and not len(valid_features):
             raise ValueError(f"{self.model_name}验证集没有完整历史窗口")
         self.runtime_profile.update({
-            "validation_rows_total": int(len(valid)),
+            "validation_rows_total": int(len(valid)) if validation_enabled else 0,
             "validation_rows_used": int(len(valid_features)),
-            "validation_sampled": len(valid_features) < len(valid),
+            "validation_sampled": (
+                len(valid_features) < len(valid) if validation_enabled else False
+            ),
         })
         optimizer = torch.optim.AdamW(
             [*self.encoder.parameters(), *self.head.parameters()],
@@ -374,7 +391,9 @@ class QlibTorchLSTMModel:
         best_head = deepcopy(self.head.state_dict())
         stale = 0
         successful_steps = 0
-        evaluations.update({"train": [], "valid": [], "steps": []})
+        evaluations.update({"train": [], "steps": []})
+        if validation_enabled:
+            evaluations["valid"] = []
         started_at = time.perf_counter()
         self.encoder.train()
         self.head.train()
@@ -399,12 +418,13 @@ class QlibTorchLSTMModel:
             scaler.update()
             if step % self.eval_steps != 0 and step != self.max_steps:
                 continue
-            valid_loss = self._validation_loss(
-                valid_features, valid_labels, loss_fn, cancellation,
-            )
             evaluations["train"].append(float(train_loss.item()))
-            evaluations["valid"].append(float(valid_loss))
             evaluations["steps"].append(step)
+            if validation_enabled:
+                valid_loss = self._validation_loss(
+                    valid_features, valid_labels, loss_fn, cancellation,
+                )
+                evaluations["valid"].append(float(valid_loss))
             if progress is not None:
                 progress(
                     "training", min(80, 58 + int(22 * step / self.max_steps)),
@@ -421,18 +441,19 @@ class QlibTorchLSTMModel:
                         ),
                     },
                 )
-            if valid_loss + 1e-12 < best_loss:
-                best_loss = valid_loss
-                best_encoder = deepcopy(self.encoder.state_dict())
-                best_head = deepcopy(self.head.state_dict())
-                stale = 0
-            else:
-                stale += 1
-                if stale >= self.early_stopping_rounds:
-                    break
+            if validation_enabled:
+                if valid_loss + 1e-12 < best_loss:
+                    best_loss = valid_loss
+                    best_encoder = deepcopy(self.encoder.state_dict())
+                    best_head = deepcopy(self.head.state_dict())
+                    stale = 0
+                else:
+                    stale += 1
+                    if stale >= self.early_stopping_rounds:
+                        break
             self.encoder.train()
             self.head.train()
-        if successful_steps and not np.isfinite(best_loss):
+        if validation_enabled and successful_steps and not np.isfinite(best_loss):
             valid_loss = self._validation_loss(
                 valid_features, valid_labels, loss_fn, cancellation,
             )
@@ -442,20 +463,24 @@ class QlibTorchLSTMModel:
             best_loss = valid_loss
             best_encoder = deepcopy(self.encoder.state_dict())
             best_head = deepcopy(self.head.state_dict())
-        if successful_steps == 0 or not np.isfinite(best_loss):
+        if successful_steps == 0 or (
+            validation_enabled and not np.isfinite(best_loss)
+        ):
             raise ValueError(f"{self.model_name}没有可用的完整历史窗口样本")
-        self.encoder.load_state_dict(best_encoder)
-        self.head.load_state_dict(best_head)
+        if validation_enabled:
+            self.encoder.load_state_dict(best_encoder)
+            self.head.load_state_dict(best_head)
         self.encoder.eval()
         self.head.eval()
         self.fitted = True
         try:
             from qlib.workflow import R
 
-            for step, (train_loss, valid_loss) in enumerate(
-                zip(evaluations["train"], evaluations["valid"]), start=1,
-            ):
-                R.log_metrics(train_loss=train_loss, valid_loss=valid_loss, step=step)
+            for step, train_loss in enumerate(evaluations["train"], start=1):
+                metrics = {"train_loss": train_loss}
+                if validation_enabled:
+                    metrics["valid_loss"] = evaluations["valid"][step - 1]
+                R.log_metrics(**metrics, step=step)
         except (AttributeError, RuntimeError):
             pass
 
@@ -995,6 +1020,9 @@ class _QlibSklearnMixin:
         from qlib.data.dataset import DataHandlerLP
 
         evaluations = evals_result if evals_result is not None else {}
+        validation_enabled = bool(
+            getattr(dataset, "_alphablocks_validation_enabled", True)
+        )
         if cancellation is not None:
             cancellation.checkpoint()
         train, valid = dataset.prepare(
@@ -1003,23 +1031,30 @@ class _QlibSklearnMixin:
         )
         train = train.dropna()
         valid = valid.dropna()
-        if train.empty or valid.empty:
+        if train.empty or (validation_enabled and valid.empty):
             raise ValueError(f"{self.model_name}训练集或验证集为空")
         x_train = np.asarray(train["feature"].values, dtype=float)
         y_train = np.asarray(train["label"].values, dtype=float).reshape(-1)
-        x_valid = np.asarray(valid["feature"].values, dtype=float)
-        y_valid = np.asarray(valid["label"].values, dtype=float).reshape(-1)
         self.model.fit(x_train, y_train)
-        prediction = self._predict_values(x_valid)
-        loss = float(np.sqrt(np.mean(np.square(prediction - y_valid))))
-        evaluations.update({"train": [loss], "valid": [loss], "steps": [1]})
+        train_prediction = self._predict_values(x_train)
+        train_loss = float(np.sqrt(np.mean(np.square(train_prediction - y_train))))
+        evaluations.update({"train": [train_loss], "steps": [1]})
+        if validation_enabled:
+            x_valid = np.asarray(valid["feature"].values, dtype=float)
+            y_valid = np.asarray(valid["label"].values, dtype=float).reshape(-1)
+            prediction = self._predict_values(x_valid)
+            valid_loss = float(np.sqrt(np.mean(np.square(prediction - y_valid))))
+            evaluations["valid"] = [valid_loss]
         self.fitted = True
         if progress is not None:
             progress("training", 80, {"iteration": 1, "total_iterations": 1})
         try:
             from qlib.workflow import R
 
-            R.log_metrics(train_loss=loss, valid_loss=loss, step=1)
+            metrics = {"train_loss": train_loss}
+            if validation_enabled:
+                metrics["valid_loss"] = valid_loss
+            R.log_metrics(**metrics, step=1)
         except (AttributeError, RuntimeError):
             pass
 
@@ -1140,24 +1175,32 @@ class QlibNativeTabNetAdapter:
         from qlib.data.dataset import DataHandlerLP
 
         evaluations = evals_result if evals_result is not None else {}
+        validation_enabled = bool(
+            getattr(dataset, "_alphablocks_validation_enabled", True)
+        )
         if cancellation is not None:
             cancellation.checkpoint()
         train, valid = dataset.prepare(
             ["train", "valid"], col_set=["feature", "label"],
             data_key=DataHandlerLP.DK_L,
         )
-        if train.empty or valid.empty:
+        if train.empty or (validation_enabled and valid.empty):
             raise ValueError("TabNet训练集或验证集为空")
         batch_size = int(self.kwargs.get("batch_size", 4096))
         # qlib的test_epoch会丢弃最后一个不足batch_size的批次，小样本下会得到
         # 空指标并触发best_param未初始化错误，这里把batch钳制到样本量以内。
         batch_size = max(1, min(batch_size, len(train), len(valid)))
         torch.manual_seed(self.seed)
+        model_kwargs = {**self.kwargs, "loss": "mse", "batch_size": batch_size, "GPU": -1}
+        if not validation_enabled:
+            model_kwargs["early_stop"] = int(model_kwargs.get("n_epochs", 200)) + 1
         self.model = TabnetModel(
             d_feat=self.input_dim,
-            **{**self.kwargs, "loss": "mse", "batch_size": batch_size, "GPU": -1},
+            **model_kwargs,
         )
         self.model.fit(dataset, evals_result=evaluations)
+        if not validation_enabled:
+            evaluations.pop("valid", None)
         self.fitted = True
         if progress is not None:
             progress("training", 80, {"iteration": 1, "total_iterations": 1})

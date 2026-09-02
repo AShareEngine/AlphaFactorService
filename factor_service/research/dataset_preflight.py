@@ -129,7 +129,7 @@ def _resolve_walk_forward(
 
     strategy = str(source.get("strategy") or "rolling").strip().lower()
     train_sessions = int(source.get("train_sessions") or 756)
-    valid_sessions = int(source.get("valid_sessions") or 60)
+    valid_sessions = int(source.get("valid_sessions", 60))
     test_sessions = int(source.get("test_sessions") or 20)
     step_sessions = int(source.get("step_sessions") or 20)
     embargo_sessions = int(source.get("embargo_sessions") or 5)
@@ -138,13 +138,16 @@ def _resolve_walk_forward(
             "Walk-Forward隔离交易日不得小于标签预测周期"
         )
 
+    validation_enabled = valid_sessions > 0
     required_history_sessions = (
-        train_sessions + valid_sessions + embargo_sessions * 2
+        train_sessions + valid_sessions
+        + embargo_sessions * (2 if validation_enabled else 1)
     )
     if len(trainable_calendar) <= required_history_sessions:
         raise ModelResearchError(
             "训练日期范围不足：首个样本外截面前至少需要"
-            f"{required_history_sessions}个交易日用于训练、验证和双重隔离"
+            f"{required_history_sessions}个交易日用于训练"
+            + ("、验证和双重隔离" if validation_enabled else "和单段隔离")
         )
     earliest_oos_date = trainable_calendar[
         required_history_sessions
@@ -157,7 +160,9 @@ def _resolve_walk_forward(
     if requested_start and requested_start < earliest_oos_date:
         raise ModelResearchError(
             f"Walk-Forward样本外开始日期最早为{earliest_oos_date}；"
-            "该日期由训练、验证、双重隔离和冻结交易日历共同确定，只能向后调整"
+            "该日期由训练、冻结交易日历"
+            + ("、验证和双重隔离" if validation_enabled else "和单段隔离")
+            + "共同确定，只能向后调整"
         )
 
     resolved_spec = {
@@ -264,6 +269,17 @@ def _walk_forward_window_timeline(
             "sessions": sessions,
         }
 
+    if "valid" not in window:
+        empty = {"date_start": "", "date_end": "", "sessions": 0}
+        return {
+            "index": int(index),
+            "train": segment("train"),
+            "train_valid_embargo": dict(empty),
+            "valid": dict(empty),
+            "valid_test_embargo": dict(empty),
+            "train_test_embargo": embargo("train", "test"),
+            "test": segment("test"),
+        }
     return {
         "index": int(index),
         "train": segment("train"),

@@ -28,9 +28,121 @@ from factor_service.research.trainer import (
     _prepare_recorder_experiment,
     _prediction_frame,
     _qlib_lgb_params,
+    _suggest_tree_hyperparameters,
+    _tune_tree_hyperparameters,
     _walk_forward_frame,
     predict_feature_frame,
 )
+
+
+class _RecordingTrial:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def suggest_float(self, name, low, high, *, log=False):
+        self.calls.append(("float", name, low, high, log))
+        return low
+
+    def suggest_int(self, name, low, high):
+        self.calls.append(("int", name, low, high))
+        return low
+
+
+def test_optuna_tree_search_spaces_match_quantmind_ranges() -> None:
+    lightgbm_trial = _RecordingTrial()
+    xgboost_trial = _RecordingTrial()
+    catboost_trial = _RecordingTrial()
+
+    lightgbm = _suggest_tree_hyperparameters(lightgbm_trial, "lightgbm")
+    xgboost = _suggest_tree_hyperparameters(xgboost_trial, "xgboost")
+    catboost = _suggest_tree_hyperparameters(catboost_trial, "catboost")
+
+    assert set(lightgbm) == {
+        "learning_rate", "num_leaves", "min_child_samples",
+        "feature_fraction", "bagging_fraction", "lambda_l1", "lambda_l2",
+    }
+    assert set(xgboost) == {
+        "learning_rate", "max_depth", "subsample", "colsample_bytree",
+        "min_child_weight", "reg_alpha",
+    }
+    assert set(catboost) == {
+        "learning_rate", "depth", "l2_leaf_reg", "random_strength",
+    }
+    assert ("float", "learning_rate", 0.005, 0.1, True) in lightgbm_trial.calls
+    assert ("int", "max_depth", 3, 8) in xgboost_trial.calls
+    assert ("int", "depth", 4, 10) in catboost_trial.calls
+
+
+def test_optuna_runs_trials_and_returns_auditable_best_params(monkeypatch) -> None:
+    class _FakeDataHandler:
+        @staticmethod
+        def from_df(frame):
+            assert not frame.empty
+            return "handler"
+
+    monkeypatch.setattr(
+        "factor_service.research.trainer._dataset_for_model",
+        lambda handler, segments, model_kind, params, DatasetH: {
+            "params": params,
+        },
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._create_model",
+        lambda model_kind, params, feature_count: ({"params": params}, params),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._fit_model",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._predict_dataset",
+        lambda *args, **kwargs: pd.Series([0.1, 0.2]),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._metrics",
+        lambda *args, **kwargs: {
+            "test_rows": 2,
+            "test_days": 1,
+            "rmse": 0.1,
+            "rank_ic": 0.2,
+            "rank_icir": 0.3,
+        },
+    )
+    frame = pd.DataFrame({("feature", "f1"): [1.0, 2.0]})
+    prepared = PreparedDataset(
+        frame=frame,
+        segments={
+            "train": ("2024-01-02", "2024-01-02"),
+            "valid": ("2024-01-03", "2024-01-03"),
+            "test": ("2024-01-04", "2024-01-04"),
+        },
+        feature_names=["f1"],
+        coverage={},
+        medians={},
+        manifest={},
+    )
+    progress_events: list[tuple[str, int, dict]] = []
+
+    result = _tune_tree_hyperparameters(
+        prepared,
+        model_kind="lightgbm",
+        base_params={"n_estimators": 5},
+        config={"n_trials": 2, "seed": 7},
+        DataHandlerLP=_FakeDataHandler,
+        DatasetH=object,
+        classification=False,
+        cancellation=None,
+        progress=lambda stage, percent, details: progress_events.append(
+            (stage, percent, details)
+        ),
+    )
+
+    assert result["completed_trials"] == 2
+    assert result["best_value"] == 0.3
+    assert result["best_params"]
+    assert len(result["trials"]) == 2
+    assert all(trial["validation"]["rank_icir"] == 0.3 for trial in result["trials"])
+    assert progress_events[-1][0] == "optuna_completed"
 
 
 def test_incremental_bundle_uses_recorded_training_identity_after_registration(
@@ -474,6 +586,54 @@ def test_lightgbm_incremental_fit_appends_trees_to_source_booster() -> None:
             initial_model=source,
         )
         assert updated.model.num_trees() > source_trees
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False, capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_lightgbm_zero_validation_trains_fixed_rounds_without_valid_metrics() -> None:
+    script = """
+        import numpy as np
+        import pandas as pd
+        from qlib.data.dataset import DataHandlerLP, DatasetH
+        from qlib.workflow import R
+        from factor_service.research.trainer import _create_model, _fit_model
+
+        R.log_metrics = lambda **kwargs: None
+        dates = pd.date_range("2024-01-02", periods=60, freq="B")
+        index = pd.MultiIndex.from_product(
+            [dates, ["A", "B"]], names=["datetime", "instrument"],
+        )
+        rng = np.random.default_rng(7)
+        feature = rng.normal(size=len(index))
+        frame = pd.DataFrame(
+            np.column_stack((feature, feature * 0.3 + rng.normal(scale=0.2, size=len(index)))),
+            index=index,
+            columns=pd.MultiIndex.from_tuples([
+                ("feature", "f1"), ("label", "LABEL0"),
+            ]),
+        )
+        segments = {
+            "train": (dates[0].date().isoformat(), dates[39].date().isoformat()),
+            "valid": (dates[0].date().isoformat(), dates[39].date().isoformat()),
+            "test": (dates[45].date().isoformat(), dates[-1].date().isoformat()),
+        }
+        dataset = DatasetH(handler=DataHandlerLP.from_df(frame), segments=segments)
+        dataset._alphablocks_validation_enabled = False
+        model, _ = _create_model("lightgbm", {
+            "n_estimators": 7, "early_stopping_rounds": 0, "num_threads": 1,
+            "min_data_in_leaf": 2, "min_child_samples": 2,
+        }, 1)
+        evaluations = {}
+        _fit_model(
+            "lightgbm", model, dataset, evaluations,
+            cancellation=None, progress=None,
+        )
+        assert model.model.num_trees() == 7
+        assert set(evaluations) == {"train"}
     """
     completed = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

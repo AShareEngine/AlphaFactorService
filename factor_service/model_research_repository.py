@@ -57,6 +57,7 @@ MAX_EXPERIMENT_TRIALS = 24
 MAX_EXPERIMENT_ITERATIONS = 3
 MAX_LINEAGE_TRIALS = 24
 ATTEMPT_AUDIT_MIGRATION = "0036_model_job_attempt_audit"
+OPTUNA_MODEL_KINDS = frozenset({"lightgbm", "xgboost", "catboost"})
 
 CLASSICAL_STACKING_KINDS = frozenset({
     "lightgbm", "xgboost", "catboost", "random_forest", "linear",
@@ -239,6 +240,12 @@ class ModelResearchRepository:
             model=model,
             walk_forward=walk_forward,
         )
+        optuna = _optuna_spec(
+            payload.get("optuna") or {},
+            model_kind=str(model["kind"]),
+            walk_forward=walk_forward,
+            incremental=bool(payload.get("incremental_from")),
+        )
         spec_json = _canonical_json(spec)
         spec_hash = sha256(spec_json.encode("utf-8")).hexdigest()
         dataset_id = f"dataset_{spec_hash[:24]}"
@@ -256,6 +263,7 @@ class ModelResearchRepository:
                 "dataset": spec,
                 "model": model,
                 "walk_forward": walk_forward,
+                "optuna": optuna,
                 "execution": execution,
                 "research_origin": research_origin,
                 "incremental_from": dict(payload.get("incremental_from") or {}),
@@ -318,6 +326,8 @@ class ModelResearchRepository:
         experiment = _experiment_ref(payload.get("experiment") or {})
         if experiment:
             config["experiment"] = experiment
+        if optuna:
+            config["optuna"] = optuna
         if research_origin:
             config["research_origin"] = research_origin
         if incremental_training:
@@ -619,6 +629,23 @@ class ModelResearchRepository:
         if strategy not in {"grid", "horizon_grid", "factor_ablation", "model_ensemble"}:
             raise ModelResearchError(
                 "实验策略只支持grid、horizon_grid、factor_ablation或model_ensemble"
+            )
+        experiment_optuna = payload.get("optuna") or {}
+        if not isinstance(experiment_optuna, Mapping):
+            raise ModelResearchError("optuna必须是对象")
+        if bool(experiment_optuna.get("enabled")):
+            raise ModelResearchError(
+                "Optuna首版只支持单模型训练，不能与参数实验、多周期研究、"
+                "因子消融或多模型对比同时开启"
+            )
+        if (
+            walk_forward.get("enabled") is True
+            and int(walk_forward.get("valid_sessions", 60)) == 0
+            and strategy in {"grid", "factor_ablation"}
+        ):
+            raise ModelResearchError(
+                "无验证集模式不能执行参数搜索或因子消融；"
+                "请恢复验证集，或使用固定参数的单模型训练"
             )
         submission_seed = (
             _bounded_identity(payload.get("client_study_id"), "client_study_id")
@@ -4167,6 +4194,72 @@ def _grid_search_trials(
     return trials
 
 
+def _optuna_spec(
+    source: Mapping[str, Any],
+    *,
+    model_kind: str,
+    walk_forward: Mapping[str, Any],
+    incremental: bool,
+) -> dict[str, Any]:
+    """Normalize the single-job Optuna contract.
+
+    Optuna is deliberately separate from the multi-job experiment contract:
+    every trial shares one frozen dataset and only the selected parameters are
+    used by the final model that may be registered.
+    """
+    if not source:
+        return {}
+    if not isinstance(source, Mapping):
+        raise ModelResearchError("optuna必须是对象")
+    unknown = sorted(set(source) - {
+        "enabled", "n_trials", "objective", "sampler", "seed",
+    })
+    if unknown:
+        raise ModelResearchError(
+            "optuna包含未允许字段: " + ", ".join(unknown)
+        )
+    enabled = source.get("enabled") is True
+    if not enabled:
+        return {}
+    kind = str(model_kind or "").strip().lower()
+    if kind not in OPTUNA_MODEL_KINDS:
+        raise ModelResearchError("Optuna只支持LightGBM、XGBoost或CatBoost")
+    if incremental:
+        raise ModelResearchError("增量续训不能同时开启Optuna")
+    if (
+        walk_forward.get("enabled") is True
+        and int(walk_forward.get("valid_sessions", 60)) == 0
+    ):
+        raise ModelResearchError("验证长度为0时不能开启Optuna")
+    try:
+        n_trials = int(source.get("n_trials") or 20)
+        seed = int(source.get("seed") if source.get("seed") is not None else 42)
+    except (TypeError, ValueError) as exc:
+        raise ModelResearchError("Optuna搜索次数或随机种子格式无效") from exc
+    if not 10 <= n_trials <= 100:
+        raise ModelResearchError("Optuna搜索次数必须在10到100之间")
+    if not 0 <= seed <= 2_147_483_647:
+        raise ModelResearchError("Optuna随机种子无效")
+    objective = str(
+        source.get("objective") or "validation_rank_icir"
+    ).strip().lower()
+    if objective != "validation_rank_icir":
+        raise ModelResearchError("Optuna目标只支持validation_rank_icir")
+    sampler = str(source.get("sampler") or "tpe").strip().lower()
+    if sampler != "tpe":
+        raise ModelResearchError("Optuna采样器只支持tpe")
+    return {
+        "enabled": True,
+        "backend": "optuna",
+        "n_trials": n_trials,
+        "objective": objective,
+        "direction": "maximize",
+        "sampler": sampler,
+        "seed": seed,
+        "search_space_version": "alphablocks.tree-optuna.v1",
+    }
+
+
 def _experiment_ref(source: Mapping[str, Any]) -> dict[str, Any]:
     if not source:
         return {}
@@ -6593,7 +6686,7 @@ def _walk_forward_spec(source: Mapping[str, Any]) -> dict[str, Any]:
         return value
 
     train_sessions = integer("train_sessions", 756, 252, 2520)
-    valid_sessions = integer("valid_sessions", 60, 21, 504)
+    valid_sessions = integer("valid_sessions", 60, 0, 504)
     test_sessions = integer("test_sessions", 20, 1, 252)
     step_sessions = integer("step_sessions", 20, 1, 252)
     embargo_sessions = integer("embargo_sessions", 5, 1, 252)

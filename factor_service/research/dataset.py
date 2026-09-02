@@ -2254,7 +2254,7 @@ def walk_forward_segments(
 ) -> list[dict[str, tuple[str, str]]]:
     """Generate Qlib rolling tasks and return their normalized date segments.
 
-    AlphaBlocks supplies the frozen trading calendar and explicit dual embargo.
+    AlphaBlocks supplies the frozen trading calendar and explicit embargo.
     Qlib's ``RollingGen`` remains responsible for shifting the task template,
     including the sliding-versus-expanding training-window semantics.
     """
@@ -2266,7 +2266,7 @@ def walk_forward_segments(
     test_sessions = int(test_sessions)
     step_sessions = int(step_sessions)
     embargo = int(embargo_sessions)
-    if train_sessions < 252 or valid_sessions < 21 or test_sessions < 1:
+    if train_sessions < 252 or valid_sessions < 0 or test_sessions < 1:
         raise ValueError("Walk-Forward训练、验证或测试窗口长度无效")
     if step_sessions != test_sessions:
         raise ValueError("Walk-Forward步长必须等于测试窗口，确保样本外日期完整且不重叠")
@@ -2284,17 +2284,24 @@ def walk_forward_segments(
     if oos_start > oos_end:
         raise ValueError("Walk-Forward样本外开始日期不得晚于结束日期")
 
-    minimum_history = train_sessions + valid_sessions + embargo * 2
+    validation_enabled = valid_sessions > 0
+    embargo_count = 2 if validation_enabled else 1
+    minimum_history = train_sessions + valid_sessions + embargo * embargo_count
     first_oos_index = int(unique.get_loc(oos_start))
     if first_oos_index < minimum_history:
         raise ValueError(
-            f"样本外开始日前至少需要{minimum_history}个交易日用于训练、验证和隔离"
+            f"样本外开始日前至少需要{minimum_history}个交易日用于训练和隔离"
+            + ("，其中包含独立验证集" if validation_enabled else "（无验证集模式）")
         )
 
     last_oos_index = int(unique.get_loc(oos_end))
-    valid_end_index = first_oos_index - embargo - 1
-    valid_start_index = valid_end_index - valid_sessions + 1
-    train_end_index = valid_start_index - embargo - 1
+    if validation_enabled:
+        valid_end_index = first_oos_index - embargo - 1
+        valid_start_index = valid_end_index - valid_sessions + 1
+        train_end_index = valid_start_index - embargo - 1
+    else:
+        valid_start_index = valid_end_index = -1
+        train_end_index = first_oos_index - embargo - 1
     train_start_index = (
         0 if strategy == "expanding"
         else train_end_index - train_sessions + 1
@@ -2302,9 +2309,8 @@ def walk_forward_segments(
     if train_start_index < 0:
         raise ValueError("Walk-Forward训练历史不足，无法覆盖完整样本外区间")
 
-    initial_segments = {
+    initial_segments: dict[str, tuple[str, str]] = {
         "train": _date_range(unique, train_start_index, train_end_index),
-        "valid": _date_range(unique, valid_start_index, valid_end_index),
         # RollingGen reads this end as the requested rolling horizon, then
         # replaces the first test segment with exactly one rolling step.
         "test": (
@@ -2312,6 +2318,10 @@ def walk_forward_segments(
             unique[last_oos_index].date().isoformat(),
         ),
     }
+    if validation_enabled:
+        initial_segments["valid"] = _date_range(
+            unique, valid_start_index, valid_end_index,
+        )
     tasks = _qlib_rolling_tasks(
         unique,
         initial_segments,

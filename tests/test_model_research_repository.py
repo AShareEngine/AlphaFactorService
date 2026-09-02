@@ -28,6 +28,7 @@ from factor_service.model_research_repository import (
     _model_spec,
     _model_payload_references,
     _research_origin_spec,
+    _optuna_spec,
     _registration_payloads,
     _training_dataset_source,
     _walk_forward_spec,
@@ -2358,6 +2359,17 @@ def test_walk_forward_contract_has_strict_independent_test_defaults() -> None:
     assert spec["embargo_sessions"] == 5
 
 
+def test_walk_forward_contract_accepts_explicit_zero_validation() -> None:
+    spec = _walk_forward_spec({
+        "enabled": True,
+        "valid_sessions": 0,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
+    })
+
+    assert spec["valid_sessions"] == 0
+
+
 def test_walk_forward_contract_rejects_overlapping_test_windows() -> None:
     with pytest.raises(ModelResearchError, match="步长必须等于测试窗口"):
         _walk_forward_spec({
@@ -2416,6 +2428,40 @@ def test_grid_search_supports_mlp_architecture_candidates() -> None:
     assert [trial["hidden_layers"] for trial in trials] == [
         [64, 128], [64, 128, 256],
     ]
+
+
+def test_optuna_spec_freezes_single_tree_search_contract() -> None:
+    spec = _optuna_spec(
+        {"enabled": True, "n_trials": 25},
+        model_kind="lightgbm",
+        walk_forward={"enabled": True, "valid_sessions": 60},
+        incremental=False,
+    )
+
+    assert spec == {
+        "enabled": True,
+        "backend": "optuna",
+        "n_trials": 25,
+        "objective": "validation_rank_icir",
+        "direction": "maximize",
+        "sampler": "tpe",
+        "seed": 42,
+        "search_space_version": "alphablocks.tree-optuna.v1",
+    }
+
+
+def test_optuna_spec_rejects_unsupported_or_validationless_training() -> None:
+    with pytest.raises(ModelResearchError, match="只支持LightGBM"):
+        _optuna_spec(
+            {"enabled": True}, model_kind="mlp",
+            walk_forward={}, incremental=False,
+        )
+    with pytest.raises(ModelResearchError, match="验证长度为0"):
+        _optuna_spec(
+            {"enabled": True}, model_kind="xgboost",
+            walk_forward={"enabled": True, "valid_sessions": 0},
+            incremental=False,
+        )
 
 
 def test_horizon_search_normalizes_supported_unique_values() -> None:

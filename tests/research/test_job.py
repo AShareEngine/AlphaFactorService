@@ -472,6 +472,66 @@ def test_job_validation_accepts_walk_forward_contract() -> None:
     assert job["config_json"]["walk_forward"]["train_sessions"] == 756
 
 
+def test_job_validation_accepts_zero_validation_and_disabled_early_stopping() -> None:
+    source = valid_job()
+    source["config_json"]["model"]["params"]["early_stopping_rounds"] = 0
+    source["config_json"]["walk_forward"] = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_sessions": 756,
+        "valid_sessions": 0,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["walk_forward"]["valid_sessions"] == 0
+    assert job["config_json"]["model"]["params"]["early_stopping_rounds"] == 0
+
+
+def test_job_validation_accepts_frozen_optuna_contract() -> None:
+    source = valid_job()
+    source["config_json"]["optuna"] = {
+        "enabled": True,
+        "backend": "optuna",
+        "n_trials": 20,
+        "objective": "validation_rank_icir",
+        "direction": "maximize",
+        "sampler": "tpe",
+        "seed": 42,
+        "search_space_version": "alphablocks.tree-optuna.v1",
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["optuna"]["n_trials"] == 20
+
+
+def test_job_validation_rejects_optuna_without_validation() -> None:
+    source = valid_job()
+    source["config_json"]["walk_forward"] = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_sessions": 756,
+        "valid_sessions": 0,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "2023-01-03",
+        "oos_date_end": "2024-12-31",
+    }
+    source["config_json"]["optuna"] = {
+        "enabled": True, "n_trials": 20,
+    }
+
+    with pytest.raises(PermanentJobError, match="验证长度为0"):
+        validate_job(source)
+
+
 def test_job_validation_accepts_strict_lightgbm_incremental_contract() -> None:
     source = valid_job()
     source["config_json"]["planned_model_version"] = 2

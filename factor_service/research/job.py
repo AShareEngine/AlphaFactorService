@@ -145,6 +145,7 @@ DEEP_STACKING_KINDS = frozenset({
     "mlp", "gru", "lstm", "alstm", "transformer", "tabnet", "tcn",
     "nativetft", "transformer_lstm",
 })
+OPTUNA_MODEL_KINDS = frozenset({"lightgbm", "xgboost", "catboost"})
 
 
 def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -446,7 +447,22 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         raise PermanentJobError(
             f"{model_kind}参数包含未允许字段: {', '.join(unknown_params)}"
         )
-    _validate_model_params(model_kind, params)
+    walk_forward = config.get("walk_forward") or {}
+    _validate_walk_forward(walk_forward)
+    validationless_walk_forward = (
+        walk_forward.get("enabled") is True
+        and int(walk_forward.get("valid_sessions", 60)) == 0
+    )
+    _validate_optuna(
+        config.get("optuna") or {},
+        model_kind=model_kind,
+        validationless_walk_forward=validationless_walk_forward,
+        incremental=bool(config.get("incremental_training")),
+    )
+    _validate_model_params(
+        model_kind, params,
+        allow_disabled_early_stopping=validationless_walk_forward,
+    )
     if model_kind == "stacking":
         _validate_stacking_model(model, target_mode=target_mode)
     execution = config.get("execution") or {"node_id": "local"}
@@ -492,7 +508,6 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         _integer(params.get(field, 42), field, 0, 2_147_483_647)
     if params.get("deterministic", True) is not True:
         raise PermanentJobError("训练必须启用deterministic")
-    _validate_walk_forward(config.get("walk_forward") or {})
     if config.get("incremental_training"):
         _validate_incremental_training(
             config["incremental_training"],
@@ -511,6 +526,47 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     result["config_json"]["planned_model_version"] = version
     result["dataset_spec"]["data_cutoff"] = cutoff.isoformat()
     return result
+
+
+def _validate_optuna(
+    source: Any,
+    *,
+    model_kind: str,
+    validationless_walk_forward: bool,
+    incremental: bool,
+) -> None:
+    if not source:
+        return
+    if not isinstance(source, dict):
+        raise PermanentJobError("optuna必须是对象")
+    unknown = sorted(set(source) - {
+        "enabled", "backend", "n_trials", "objective", "direction",
+        "sampler", "seed", "search_space_version",
+    })
+    if unknown:
+        raise PermanentJobError(
+            "optuna包含未允许字段: " + ", ".join(unknown)
+        )
+    if source.get("enabled") is not True:
+        raise PermanentJobError("optuna.enabled必须为true或省略整个配置")
+    if model_kind not in OPTUNA_MODEL_KINDS:
+        raise PermanentJobError("Optuna只支持LightGBM、XGBoost或CatBoost")
+    if validationless_walk_forward:
+        raise PermanentJobError("验证长度为0时不能开启Optuna")
+    if incremental:
+        raise PermanentJobError("增量续训不能同时开启Optuna")
+    _integer(source.get("n_trials", 20), "optuna.n_trials", 10, 100)
+    _integer(source.get("seed", 42), "optuna.seed", 0, 2_147_483_647)
+    if str(source.get("backend") or "optuna").strip().lower() != "optuna":
+        raise PermanentJobError("optuna.backend必须为optuna")
+    if str(source.get("objective") or "validation_rank_icir").strip().lower() != "validation_rank_icir":
+        raise PermanentJobError("Optuna目标只支持validation_rank_icir")
+    if str(source.get("direction") or "maximize").strip().lower() != "maximize":
+        raise PermanentJobError("Optuna方向必须为maximize")
+    if str(source.get("sampler") or "tpe").strip().lower() != "tpe":
+        raise PermanentJobError("Optuna采样器只支持tpe")
+    if str(source.get("search_space_version") or "alphablocks.tree-optuna.v1") != "alphablocks.tree-optuna.v1":
+        raise PermanentJobError("Optuna搜索空间版本无效")
 
 
 def _validate_stacking_model(model: dict[str, Any], *, target_mode: str) -> None:
@@ -554,7 +610,13 @@ def _validate_stacking_model(model: dict[str, Any], *, target_mode: str) -> None
             raise PermanentJobError(f"Stacking基模型{kind}Objective与目标类型不一致")
 
 
-def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
+def _validate_model_params(
+    kind: str,
+    params: dict[str, Any],
+    *,
+    allow_disabled_early_stopping: bool = False,
+) -> None:
+    early_stopping_minimum = 0 if allow_disabled_early_stopping else 1
     if kind == "stacking":
         _integer(params.get("n_folds", 3), "n_folds", 2, 10)
         _number(params.get("meta_alpha", 1.0), "meta_alpha", 0.01, 100.0)
@@ -584,7 +646,10 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _number(params.get("l2_leaf_reg", 3.0), "l2_leaf_reg", 0.0, 1_000_000.0)
         _number(params.get("random_strength", 1.5), "random_strength", 0.0, 1_000_000.0)
         _number(params.get("bagging_temperature", 0.8), "bagging_temperature", 0.0, 10.0)
-        _integer(params.get("od_wait", 100), "od_wait", 1, 1000)
+        _integer(
+            params.get("od_wait", 100), "od_wait",
+            early_stopping_minimum, 1000,
+        )
     elif kind == "random_forest":
         _integer(params.get("n_estimators", 300), "n_estimators", 1, 100_000)
         _integer(params.get("max_depth", 0), "max_depth", 0, 128)
@@ -621,7 +686,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 2048), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", early_stopping_minimum, 10_000)
         return
     elif kind in {"gru", "lstm", "alstm"}:
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -632,7 +697,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 512), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", early_stopping_minimum, 10_000)
         return
     elif kind in {"transformer", "nativetft"}:
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -647,7 +712,10 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
             _integer(params.get("num_layers", 1), "num_layers", 1, 8)
         _integer(params.get("dim_feedforward", 256), "dim_feedforward", 16, 16_384)
         _number(params.get("dropout", 0.2), "dropout", 0.0, 0.9)
-        _validate_deep_training_loop(params, default_batch_size=256)
+        _validate_deep_training_loop(
+            params, default_batch_size=256,
+            allow_disabled_early_stopping=allow_disabled_early_stopping,
+        )
         return
     elif kind == "tcn":
         _integer(params.get("lookback_window", 60), "lookback_window", 2, 252)
@@ -655,7 +723,10 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("kernel_size", 5), "kernel_size", 2, 64)
         _integer(params.get("num_layers", 5), "num_layers", 1, 16)
         _number(params.get("dropout", 0.5), "dropout", 0.0, 0.9)
-        _validate_deep_training_loop(params, default_batch_size=256)
+        _validate_deep_training_loop(
+            params, default_batch_size=256,
+            allow_disabled_early_stopping=allow_disabled_early_stopping,
+        )
         return
     elif kind == "tabnet":
         _integer(params.get("n_d", 64), "n_d", 4, 4096)
@@ -665,7 +736,7 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("n_ind", 2), "n_ind", 0, 16)
         _integer(params.get("max_steps", 100), "max_steps", 1, 100_000)
         _integer(params.get("batch_size", 4096), "batch_size", 16, 1_000_000)
-        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", early_stopping_minimum, 10_000)
         if not isinstance(params.get("pretrain", False), bool):
             raise PermanentJobError("tabnet.pretrain必须是布尔值")
         return
@@ -684,10 +755,10 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
         _integer(params.get("batch_size", 256), "batch_size", 16, 1_000_000)
         _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
         _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+        _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", early_stopping_minimum, 10_000)
         return
     _integer(params.get("n_estimators", 1000), "n_estimators", 1, 100_000)
-    _integer(params.get("early_stopping_rounds", 50), "early_stopping_rounds", 1, 10_000)
+    _integer(params.get("early_stopping_rounds", 50), "early_stopping_rounds", early_stopping_minimum, 10_000)
     if kind in {"lightgbm", "xgboost"}:
         _number(params.get("subsample", 0.9), "subsample", 0.01, 1.0)
         _number(params.get("colsample_bytree", 0.9), "colsample_bytree", 0.01, 1.0)
@@ -697,12 +768,16 @@ def _validate_model_params(kind: str, params: dict[str, Any]) -> None:
 
 def _validate_deep_training_loop(
     params: dict[str, Any], *, default_batch_size: int,
+    allow_disabled_early_stopping: bool = False,
 ) -> None:
     _integer(params.get("max_steps", 300), "max_steps", 1, 100_000)
     _integer(params.get("batch_size", default_batch_size), "batch_size", 16, 1_000_000)
     _integer(params.get("eval_steps", 10), "eval_steps", 1, 10_000)
     _number(params.get("weight_decay", 0.0001), "weight_decay", 0.0, 1_000_000.0)
-    _integer(params.get("early_stopping_rounds", 20), "early_stopping_rounds", 1, 10_000)
+    _integer(
+        params.get("early_stopping_rounds", 20), "early_stopping_rounds",
+        0 if allow_disabled_early_stopping else 1, 10_000,
+    )
 
 
 def _validate_walk_forward(source: Any) -> None:
@@ -719,7 +794,7 @@ def _validate_walk_forward(source: Any) -> None:
     )
     _integer(
         source.get("valid_sessions", 60),
-        "walk_forward.valid_sessions", 21, 504,
+        "walk_forward.valid_sessions", 0, 504,
     )
     test_sessions = _integer(
         source.get("test_sessions", 20),
