@@ -88,6 +88,7 @@ class DatasetPreflightService:
         calendar_contract = dict(resolution["calendar"])
         walk_forward = _resolve_walk_forward(
             payload.get("walk_forward"),
+            optuna=payload.get("optuna"),
             trainable_calendar=calendar[:-horizon],
             label_horizon_trading_days=horizon,
         )
@@ -120,6 +121,7 @@ class DatasetPreflightService:
 def _resolve_walk_forward(
     value: Any,
     *,
+    optuna: Any = None,
     trainable_calendar: pd.DatetimeIndex,
     label_horizon_trading_days: int,
 ) -> dict[str, Any]:
@@ -139,9 +141,24 @@ def _resolve_walk_forward(
         )
 
     validation_enabled = valid_sessions > 0
+    optuna_source = dict(optuna or {}) if isinstance(optuna, Mapping) else {}
+    optuna_enabled = optuna_source.get("enabled") is True
+    if optuna_enabled and not validation_enabled:
+        raise ModelResearchError("验证长度为0时不能开启Optuna")
+    tuning_fold_count = (
+        int(optuna_source.get("validation_windows") or 3)
+        if optuna_enabled else 1
+    )
+    if optuna_enabled and not 2 <= tuning_fold_count <= 8:
+        raise ModelResearchError("Optuna Walk-Forward调参折数必须在2到8之间")
+    tuning_history_sessions = (
+        (tuning_fold_count - 1) * valid_sessions
+        if optuna_enabled else 0
+    )
     required_history_sessions = (
         train_sessions + valid_sessions
         + embargo_sessions * (2 if validation_enabled else 1)
+        + tuning_history_sessions
     )
     if len(trainable_calendar) <= required_history_sessions:
         raise ModelResearchError(
@@ -225,6 +242,8 @@ def _resolve_walk_forward(
         "spec": resolved_spec,
         "earliest_oos_date": earliest_oos_date,
         "required_history_sessions": required_history_sessions,
+        "optuna_tuning_fold_count": tuning_fold_count if optuna_enabled else 0,
+        "optuna_extra_history_sessions": tuning_history_sessions,
         "prediction_date_start": oos_date_start,
         "prediction_date_end": oos_date_end,
         "prediction_session_count": prediction_end_index - prediction_start_index + 1,

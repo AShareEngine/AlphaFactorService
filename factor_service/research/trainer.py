@@ -201,6 +201,7 @@ class QlibTrainer:
                     model_kind=model_kind,
                     base_params=raw_params,
                     config=optuna_config,
+                    walk_forward_config=walk_forward_config,
                     DataHandlerLP=DataHandlerLP,
                     DatasetH=DatasetH,
                     classification=classification,
@@ -1008,7 +1009,10 @@ def _walk_forward_frame(
     if missing:
         raise ValueError("Walk-Forward训练段无法计算因子中位数: " + ", ".join(missing))
     window_start = segments["train"][0]
-    window_end = segments["test"][1]
+    evaluation_segment = (
+        segments.get("test") or segments.get("valid") or segments["train"]
+    )
+    window_end = evaluation_segment[1]
     window_raw = raw_frame.loc[
         pd.IndexSlice[window_start:window_end, :], :
     ].copy()
@@ -1854,12 +1858,73 @@ def _seeded_tree_params(
     return params
 
 
+def _walk_forward_optuna_segments(
+    prepared: PreparedDataset,
+    walk_forward_config: dict[str, Any],
+    fold_count: int,
+) -> list[dict[str, tuple[str, str]]]:
+    """Build chronological inner tuning folds before the sealed OOS start."""
+    raw_frame = prepared.raw_frame
+    if raw_frame is None:
+        raise ValueError("Walk-Forward Optuna缺少未填充的冻结数据集")
+    valid_sessions = int(walk_forward_config.get("valid_sessions", 60))
+    if valid_sessions < 2:
+        raise ValueError("Walk-Forward Optuna要求验证长度至少为2个交易日")
+    dates = pd.Index(sorted(
+        pd.to_datetime(
+            raw_frame.index.get_level_values("datetime"),
+        ).normalize().unique()
+    ))
+    outer_windows = walk_forward_segments(
+        dates,
+        strategy=str(walk_forward_config.get("strategy") or "rolling"),
+        train_sessions=int(walk_forward_config.get("train_sessions") or 756),
+        valid_sessions=valid_sessions,
+        test_sessions=int(walk_forward_config.get("test_sessions") or 20),
+        step_sessions=int(walk_forward_config.get("step_sessions") or 20),
+        embargo_sessions=int(walk_forward_config.get("embargo_sessions") or 5),
+        oos_date_start=str(walk_forward_config.get("oos_date_start") or ""),
+        oos_date_end=str(walk_forward_config.get("oos_date_end") or ""),
+    )
+    if not outer_windows:
+        raise ValueError("Walk-Forward Optuna无法生成正式样本外窗口")
+    first = outer_windows[0]
+    base_train_start = int(dates.get_loc(pd.Timestamp(first["train"][0])))
+    base_train_end = int(dates.get_loc(pd.Timestamp(first["train"][1])))
+    base_valid_start = int(dates.get_loc(pd.Timestamp(first["valid"][0])))
+    base_valid_end = int(dates.get_loc(pd.Timestamp(first["valid"][1])))
+    strategy = str(walk_forward_config.get("strategy") or "rolling")
+    folds: list[dict[str, tuple[str, str]]] = []
+    for reverse_offset in range(int(fold_count) - 1, -1, -1):
+        shift = reverse_offset * valid_sessions
+        train_start = 0 if strategy == "expanding" else base_train_start - shift
+        train_end = base_train_end - shift
+        valid_start = base_valid_start - shift
+        valid_end = base_valid_end - shift
+        if train_start < 0 or train_end - train_start + 1 < 252:
+            raise ValueError(
+                "Walk-Forward Optuna历史不足：请减少调参折数或推迟样本外开始日期"
+            )
+        folds.append({
+            "train": (
+                dates[train_start].date().isoformat(),
+                dates[train_end].date().isoformat(),
+            ),
+            "valid": (
+                dates[valid_start].date().isoformat(),
+                dates[valid_end].date().isoformat(),
+            ),
+        })
+    return folds
+
+
 def _tune_tree_hyperparameters(
     prepared: PreparedDataset,
     *,
     model_kind: str,
     base_params: dict[str, Any],
     config: dict[str, Any],
+    walk_forward_config: dict[str, Any] | None = None,
     DataHandlerLP: Any,
     DatasetH: Any,
     classification: bool,
@@ -1868,9 +1933,9 @@ def _tune_tree_hyperparameters(
 ) -> dict[str, Any]:
     """Search frozen validation data and return auditable trials.
 
-    The v2 contract scores every parameter set across contiguous validation
-    sub-windows and repeated seeds. The sealed test segment is never read.
-    Legacy v1 jobs retain the original single-window, single-seed behaviour.
+    V2 scores fixed validation sub-windows. V3 uses those sub-windows for a
+    single split, but switches to independently refitted inner folds when the
+    job enables Walk-Forward. The sealed outer test segment is never read.
     """
     try:
         import optuna
@@ -1882,7 +1947,16 @@ def _tune_tree_hyperparameters(
     search_space_version = str(
         config.get("search_space_version") or "alphablocks.tree-optuna.v1"
     )
-    robust_selection = search_space_version == "alphablocks.tree-optuna.v2"
+    robust_selection = search_space_version in {
+        "alphablocks.tree-optuna.v2", "alphablocks.tree-optuna.v3",
+    }
+    validation_mode = str(config.get("validation_mode") or (
+        "walk_forward_folds"
+        if search_space_version == "alphablocks.tree-optuna.v3"
+        and dict(walk_forward_config or {}).get("enabled") is True
+        else "fixed_subwindows"
+    ))
+    walk_forward_tuning = validation_mode == "walk_forward_folds"
     requested_windows = (
         int(config.get("validation_windows") or 3) if robust_selection else 1
     )
@@ -1898,15 +1972,24 @@ def _tune_tree_hyperparameters(
         if robust_selection else 0.0
     )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    handler = DataHandlerLP.from_df(prepared.frame)
     validation_segment = prepared.segments.get("valid")
     if not validation_segment:
         raise ValueError("Optuna需要非空验证集")
-    validation_windows = (
-        _validation_subsegments(
-            prepared.frame, validation_segment, requested_windows,
+    tuning_folds = (
+        _walk_forward_optuna_segments(
+            prepared, dict(walk_forward_config or {}), requested_windows,
         )
-        if robust_selection else [validation_segment]
+        if walk_forward_tuning else []
+    )
+    validation_windows = (
+        [fold["valid"] for fold in tuning_folds]
+        if walk_forward_tuning
+        else (
+            _validation_subsegments(
+                prepared.frame, validation_segment, requested_windows,
+            )
+            if robust_selection else [validation_segment]
+        )
     )
     trial_seeds = [
         (seed + offset) % 2_147_483_648 for offset in range(seed_count)
@@ -1919,18 +2002,34 @@ def _tune_tree_hyperparameters(
         window_values: list[float] = []
         window_rank_ics: list[float] = []
         first_full_metrics: dict[str, Any] | None = None
-        for repeat_index, trial_seed in enumerate(trial_seeds, start=1):
-            _checkpoint(cancellation)
-            trial_params = _seeded_tree_params(
-                {**base_params, **suggested}, model_kind, trial_seed,
-            )
+
+        def fit_candidate(
+            trial_params: dict[str, Any],
+            frame: pd.DataFrame,
+            segments: dict[str, tuple[str, str]],
+            *,
+            repeat_index: int,
+            fold_number: int | None,
+        ) -> pd.Series:
             trial_dataset = _dataset_for_model(
-                handler, prepared.segments, model_kind, trial_params, DatasetH,
+                DataHandlerLP.from_df(frame), segments,
+                model_kind, trial_params, DatasetH,
             )
             trial_model, _ = _create_model(
                 model_kind, trial_params, len(prepared.feature_names),
             )
             evals_result: dict[str, Any] = {}
+            progress_details = {
+                "trial": int(trial.number) + 1,
+                "trial_count": n_trials,
+                "seed_repeat": repeat_index,
+                "seed_count": seed_count,
+            }
+            if fold_number is not None:
+                progress_details.update({
+                    "tuning_fold": fold_number,
+                    "tuning_fold_count": len(tuning_folds),
+                })
             _fit_model(
                 model_kind, trial_model, trial_dataset, evals_result,
                 cancellation=cancellation,
@@ -1938,20 +2037,68 @@ def _tune_tree_hyperparameters(
                 stage="optuna_trial",
                 progress_start=58,
                 progress_end=58,
-                progress_details={
-                    "trial": int(trial.number) + 1,
-                    "trial_count": n_trials,
-                    "seed_repeat": repeat_index,
-                    "seed_count": seed_count,
-                },
+                progress_details=progress_details,
                 metric_prefix=(
                     f"optuna.trial_{int(trial.number) + 1}."
                     f"seed_{repeat_index}."
+                    + (f"fold_{fold_number}." if fold_number is not None else "")
                 ),
             )
             prediction = _predict_dataset(
                 trial_model, model_kind, trial_dataset, "valid",
                 classification=classification,
+            )
+            if hasattr(trial_model, "to_cpu"):
+                trial_model.to_cpu()
+            del trial_model, trial_dataset
+            return prediction
+
+        for repeat_index, trial_seed in enumerate(trial_seeds, start=1):
+            _checkpoint(cancellation)
+            trial_params = _seeded_tree_params(
+                {**base_params, **suggested}, model_kind, trial_seed,
+            )
+            if walk_forward_tuning:
+                windows: list[dict[str, Any]] = []
+                metric_frame = (
+                    prepared.raw_frame
+                    if prepared.raw_frame is not None else prepared.frame
+                )
+                for fold_number, fold_segments in enumerate(tuning_folds, start=1):
+                    fold_frame, _ = _walk_forward_frame(prepared, fold_segments)
+                    prediction = fit_candidate(
+                        trial_params, fold_frame, fold_segments,
+                        repeat_index=repeat_index, fold_number=fold_number,
+                    )
+                    metrics = _metrics(
+                        prediction, metric_frame, fold_segments["valid"],
+                        classification=classification,
+                    )
+                    rank_icir = float(metrics["rank_icir"])
+                    rank_ic = float(metrics["rank_ic"])
+                    if not np.isfinite(rank_icir):
+                        raise optuna.TrialPruned("验证折Rank ICIR不是有限值")
+                    window_values.append(rank_icir)
+                    window_rank_ics.append(rank_ic)
+                    windows.append({
+                        "window": fold_number,
+                        "train": fold_segments["train"],
+                        "date_start": fold_segments["valid"][0],
+                        "date_end": fold_segments["valid"][1],
+                        "test_rows": int(metrics["test_rows"]),
+                        "test_days": int(metrics["test_days"]),
+                        "rmse": float(metrics["rmse"]),
+                        "rank_ic": rank_ic,
+                        "rank_icir": rank_icir,
+                    })
+                seed_evaluations.append({
+                    "seed": trial_seed,
+                    "windows": windows,
+                })
+                continue
+            prediction = fit_candidate(
+                trial_params, prepared.frame, prepared.segments,
+                repeat_index=repeat_index, fold_number=None,
             )
             full_metrics = _metrics(
                 prediction, prepared.frame, validation_segment,
@@ -1975,7 +2122,9 @@ def _tune_tree_hyperparameters(
                     "window": window_number,
                     "date_start": segment[0],
                     "date_end": segment[1],
+                    "test_rows": int(metrics["test_rows"]),
                     "test_days": int(metrics["test_days"]),
+                    "rmse": float(metrics["rmse"]),
                     "rank_ic": rank_ic,
                     "rank_icir": rank_icir,
                 })
@@ -1991,7 +2140,22 @@ def _tune_tree_hyperparameters(
         std_rank_icir = float(np.std(window_values, ddof=0))
         positive_window_ratio = float(np.mean(np.asarray(window_rank_ics) > 0.0))
         value = mean_rank_icir - stability_penalty * std_rank_icir
-        full_metrics = first_full_metrics or {}
+        if first_full_metrics is None:
+            first_windows = list(seed_evaluations[0]["windows"])
+            first_full_metrics = {
+                "test_rows": sum(item["test_rows"] for item in first_windows),
+                "test_days": sum(item["test_days"] for item in first_windows),
+                "rmse": float(np.mean([
+                    item["rmse"] for item in first_windows
+                ])),
+                "rank_ic": float(np.mean([
+                    item["rank_ic"] for item in first_windows
+                ])),
+                "rank_icir": float(np.mean([
+                    item["rank_icir"] for item in first_windows
+                ])),
+            }
+        full_metrics = first_full_metrics
         for key in ("test_rows", "test_days", "rmse", "rank_ic", "rank_icir"):
             trial.set_user_attr(key, full_metrics.get(key))
         trial.set_user_attr("validation_windows", seed_evaluations)
@@ -2061,8 +2225,12 @@ def _tune_tree_hyperparameters(
         })
     result = {
         "schema_version": (
-            "alphablocks.optuna-search-result.v2"
-            if robust_selection else "alphablocks.optuna-search-result.v1"
+            "alphablocks.optuna-search-result.v3"
+            if search_space_version == "alphablocks.tree-optuna.v3"
+            else (
+                "alphablocks.optuna-search-result.v2"
+                if robust_selection else "alphablocks.optuna-search-result.v1"
+            )
         ),
         "enabled": True,
         "backend": "optuna",
@@ -2072,6 +2240,8 @@ def _tune_tree_hyperparameters(
         "sampler": "tpe",
         "seed": seed,
         "search_space_version": search_space_version,
+        "validation_mode": validation_mode,
+        "tuning_fold_segments": tuning_folds,
         "selection_metric": (
             "validation_rank_icir_stability_score"
             if robust_selection else "validation_rank_icir"

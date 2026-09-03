@@ -215,12 +215,13 @@ AlphaFactorService不通过AlphaBlocks API回写模型状态或元数据。只�
 物化到本地因子源视图时，计算器才通过AlphaBlocks只读统一数据SDK查询股票实体资产的日频复合
 视图；字段授权、实体关系和财务PIT对齐仍由AlphaBlocks统一数据层负责。
 
-单模型LightGBM、XGBoost和CatBoost支持冻结`optuna`配置后执行10至100次TPE搜索。新任务把
-验证段切成连续时间窗口并跨多个随机种子计算“平均Rank ICIR减去波动惩罚”，优先选择达到正向
+单模型LightGBM、XGBoost和CatBoost支持冻结`optuna`配置后执行10至100次TPE搜索。非滚动任务
+把固定验证段切成连续子窗口；Walk-Forward任务在正式样本外起点之前生成多个内层调参折，每折
+独立移动训练/验证区间并重新拟合。两种模式都跨多个随机种子计算“平均Rank ICIR减去波动惩罚”，优先选择达到正向
 窗口比例门槛的参数。搜索trial、窗口/种子指标与最佳参数写入模型Manifest和
 `optuna_trials.json`，测试段不参与选择；最佳参数随后用于正式训练。验证长度为0、增量续训、
 参数实验、多模型对比和Stacking不允许
-同时开启Optuna。Walk-Forward任务只在固定训练/验证切分搜索一次，再把最佳参数冻结到全部窗口。
+同时开启Optuna。内层调参完成后把最佳参数冻结到全部外层Walk-Forward窗口，外层测试不参与选参。
 
 ### Walk-Forward滚动评估
 

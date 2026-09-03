@@ -367,6 +367,13 @@ class RemoteTransport:
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop(REMOTE_NODE_SECRET_KEY_ENV, None)
+        # Do not forward a workstation-specific locale through SSH.  Minimal
+        # remote images (including MatPool) often do not install en_US.UTF-8;
+        # OpenSSH then emits a misleading shell warning before the actual
+        # runner diagnostics.  C.UTF-8 is available on the supported Linux
+        # images and keeps Python/rsync output UTF-8 safe.
+        environment["LANG"] = "C.UTF-8"
+        environment["LC_ALL"] = "C.UTF-8"
         if self.node.ssh_password:
             environment["SSHPASS"] = self.node.ssh_password
         process = subprocess.Popen(

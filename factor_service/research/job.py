@@ -456,6 +456,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     _validate_optuna(
         config.get("optuna") or {},
         model_kind=model_kind,
+        walk_forward_enabled=walk_forward.get("enabled") is True,
         validationless_walk_forward=validationless_walk_forward,
         incremental=bool(config.get("incremental_training")),
     )
@@ -532,6 +533,7 @@ def _validate_optuna(
     source: Any,
     *,
     model_kind: str,
+    walk_forward_enabled: bool,
     validationless_walk_forward: bool,
     incremental: bool,
 ) -> None:
@@ -543,7 +545,7 @@ def _validate_optuna(
         "enabled", "backend", "n_trials", "objective", "direction",
         "sampler", "seed", "search_space_version",
         "validation_windows", "seed_count", "stability_penalty",
-        "minimum_positive_window_ratio",
+        "minimum_positive_window_ratio", "validation_mode",
     })
     if unknown:
         raise PermanentJobError(
@@ -562,7 +564,9 @@ def _validate_optuna(
     version = str(
         source.get("search_space_version") or "alphablocks.tree-optuna.v1"
     )
-    if version == "alphablocks.tree-optuna.v2":
+    if version in {
+        "alphablocks.tree-optuna.v2", "alphablocks.tree-optuna.v3",
+    }:
         _integer(
             source.get("validation_windows", 3),
             "optuna.validation_windows", 2, 8,
@@ -576,6 +580,13 @@ def _validate_optuna(
             source.get("minimum_positive_window_ratio", 0.6),
             "optuna.minimum_positive_window_ratio", 0.0, 1.0,
         )
+    if version == "alphablocks.tree-optuna.v3":
+        expected_mode = (
+            "walk_forward_folds"
+            if walk_forward_enabled else "fixed_subwindows"
+        )
+        if str(source.get("validation_mode") or "") != expected_mode:
+            raise PermanentJobError("Optuna验证模式与Walk-Forward配置不一致")
     if str(source.get("backend") or "optuna").strip().lower() != "optuna":
         raise PermanentJobError("optuna.backend必须为optuna")
     if str(source.get("objective") or "validation_rank_icir").strip().lower() != "validation_rank_icir":
@@ -586,6 +597,7 @@ def _validate_optuna(
         raise PermanentJobError("Optuna采样器只支持tpe")
     if version not in {
         "alphablocks.tree-optuna.v1", "alphablocks.tree-optuna.v2",
+        "alphablocks.tree-optuna.v3",
     }:
         raise PermanentJobError("Optuna搜索空间版本无效")
 

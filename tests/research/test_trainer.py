@@ -11,7 +11,7 @@ import textwrap
 import numpy as np
 import pandas as pd
 
-from factor_service.research.dataset import PreparedDataset
+from factor_service.research.dataset import PreparedDataset, walk_forward_segments
 from factor_service.research.models import _validation_indices
 from factor_service.research.preprocessing import normalize_feature_preprocessing
 from factor_service.research.trainer import (
@@ -30,6 +30,7 @@ from factor_service.research.trainer import (
     _qlib_lgb_params,
     _suggest_tree_hyperparameters,
     _tune_tree_hyperparameters,
+    _walk_forward_optuna_segments,
     _walk_forward_frame,
     predict_feature_frame,
 )
@@ -236,6 +237,153 @@ def test_optuna_v2_scores_multiple_validation_windows_and_seeds(monkeypatch) -> 
         len(seed_result["windows"]) == 2
         for trial in result["trials"]
         for seed_result in trial["validation"]["validation_windows"]
+    )
+
+
+def test_optuna_v3_refits_each_inner_walk_forward_fold(monkeypatch) -> None:
+    class _FakeDataHandler:
+        @staticmethod
+        def from_df(frame):
+            return {"rows": len(frame)}
+
+    fitted: list[dict] = []
+    measured_segments: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "factor_service.research.trainer._dataset_for_model",
+        lambda handler, segments, model_kind, params, DatasetH: {
+            "params": params, "segments": segments,
+        },
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._create_model",
+        lambda model_kind, params, feature_count: ({"params": params}, params),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._fit_model",
+        lambda model_kind, model, dataset, *args, **kwargs: fitted.append({
+            "seed": model["params"]["seed"],
+            "segments": dataset["segments"],
+        }),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._predict_dataset",
+        lambda *args, **kwargs: pd.Series(dtype=float),
+    )
+
+    def fake_metrics(prediction, frame, segment, **kwargs):
+        measured_segments.append(segment)
+        return {
+            "test_rows": 20,
+            "test_days": 20,
+            "rmse": 0.1,
+            "rank_ic": 0.2,
+            "rank_icir": 0.3,
+        }
+
+    monkeypatch.setattr("factor_service.research.trainer._metrics", fake_metrics)
+    dates = pd.bdate_range("2020-01-02", periods=600)
+    index = pd.MultiIndex.from_product(
+        [dates, ["000001.SZ"]], names=["datetime", "instrument"],
+    )
+    columns = pd.MultiIndex.from_tuples([
+        ("feature", "f1"), ("label", "LABEL0"),
+    ])
+    frame = pd.DataFrame(np.ones((len(index), 2)), index=index, columns=columns)
+    prepared = PreparedDataset(
+        frame=frame,
+        segments={
+            "train": (dates[0].date().isoformat(), dates[399].date().isoformat()),
+            "valid": (dates[405].date().isoformat(), dates[424].date().isoformat()),
+            "test": (dates[430].date().isoformat(), dates[449].date().isoformat()),
+        },
+        feature_names=["f1"], coverage={}, medians={}, manifest={},
+        raw_frame=frame,
+    )
+    walk_forward = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_sessions": 252,
+        "valid_sessions": 20,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": dates[500].date().isoformat(),
+        "oos_date_end": dates[539].date().isoformat(),
+    }
+
+    result = _tune_tree_hyperparameters(
+        prepared,
+        model_kind="lightgbm",
+        base_params={"n_estimators": 5},
+        config={
+            "n_trials": 2,
+            "seed": 7,
+            "validation_windows": 2,
+            "seed_count": 2,
+            "stability_penalty": 0.5,
+            "minimum_positive_window_ratio": 0.6,
+            "validation_mode": "walk_forward_folds",
+            "search_space_version": "alphablocks.tree-optuna.v3",
+        },
+        walk_forward_config=walk_forward,
+        DataHandlerLP=_FakeDataHandler,
+        DatasetH=object,
+        classification=False,
+        cancellation=None,
+        progress=None,
+    )
+
+    assert result["schema_version"] == "alphablocks.optuna-search-result.v3"
+    assert result["validation_mode"] == "walk_forward_folds"
+    assert len(result["tuning_fold_segments"]) == 2
+    assert len(fitted) == 2 * 2 * 2
+    assert all(item["segments"]["valid"] in measured_segments for item in fitted)
+    outer_tests = {
+        window["test"] for window in walk_forward_segments(
+            pd.Index(dates),
+            strategy="rolling", train_sessions=252, valid_sessions=20,
+            test_sessions=20, step_sessions=20, embargo_sessions=5,
+            oos_date_start=walk_forward["oos_date_start"],
+            oos_date_end=walk_forward["oos_date_end"],
+        )
+    }
+    assert outer_tests.isdisjoint(measured_segments)
+
+
+def test_walk_forward_optuna_segments_shift_training_and_validation() -> None:
+    dates = pd.bdate_range("2020-01-02", periods=600)
+    index = pd.MultiIndex.from_product(
+        [dates, ["A"]], names=["datetime", "instrument"],
+    )
+    columns = pd.MultiIndex.from_tuples([
+        ("feature", "f1"), ("label", "LABEL0"),
+    ])
+    frame = pd.DataFrame(np.ones((len(index), 2)), index=index, columns=columns)
+    prepared = PreparedDataset(
+        frame=frame, segments={}, feature_names=["f1"], coverage={},
+        medians={}, manifest={}, raw_frame=frame,
+    )
+    folds = _walk_forward_optuna_segments(prepared, {
+        "enabled": True, "strategy": "rolling", "train_sessions": 252,
+        "valid_sessions": 20, "test_sessions": 20, "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": dates[500].date().isoformat(),
+        "oos_date_end": dates[539].date().isoformat(),
+    }, 3)
+
+    assert len(folds) == 3
+    assert all(
+        dates.get_loc(pd.Timestamp(fold["train"][1]))
+        - dates.get_loc(pd.Timestamp(fold["train"][0])) + 1 == 252
+        for fold in folds
+    )
+    assert all(
+        dates.get_loc(pd.Timestamp(fold["valid"][1]))
+        - dates.get_loc(pd.Timestamp(fold["valid"][0])) + 1 == 20
+        for fold in folds
+    )
+    assert [fold["valid"] for fold in folds] == sorted(
+        [fold["valid"] for fold in folds]
     )
 
 

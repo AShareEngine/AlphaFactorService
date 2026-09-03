@@ -4214,7 +4214,7 @@ def _optuna_spec(
     unknown = sorted(set(source) - {
         "enabled", "n_trials", "objective", "sampler", "seed",
         "validation_windows", "seed_count", "stability_penalty",
-        "minimum_positive_window_ratio",
+        "minimum_positive_window_ratio", "validation_mode",
     })
     if unknown:
         raise ModelResearchError(
@@ -4264,6 +4264,13 @@ def _optuna_spec(
     sampler = str(source.get("sampler") or "tpe").strip().lower()
     if sampler != "tpe":
         raise ModelResearchError("Optuna采样器只支持tpe")
+    validation_mode = (
+        "walk_forward_folds"
+        if walk_forward.get("enabled") is True else "fixed_subwindows"
+    )
+    requested_mode = str(source.get("validation_mode") or validation_mode)
+    if requested_mode != validation_mode:
+        raise ModelResearchError("Optuna验证模式必须与Walk-Forward配置一致")
     return {
         "enabled": True,
         "backend": "optuna",
@@ -4276,7 +4283,8 @@ def _optuna_spec(
         "seed_count": seed_count,
         "stability_penalty": stability_penalty,
         "minimum_positive_window_ratio": minimum_positive_window_ratio,
-        "search_space_version": "alphablocks.tree-optuna.v2",
+        "validation_mode": validation_mode,
+        "search_space_version": "alphablocks.tree-optuna.v3",
     }
 
 

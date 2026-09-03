@@ -207,6 +207,28 @@ def test_remote_transport_drains_large_stdout_and_stderr() -> None:
     assert len(completed.stderr) == size
 
 
+def test_remote_transport_uses_portable_utf8_locale() -> None:
+    transport = object.__new__(RemoteTransport)
+    transport.node = SimpleNamespace(ssh_password="")
+
+    completed = transport._run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "print(os.environ['LANG']); "
+                "print(os.environ['LC_ALL'])"
+            ),
+        ],
+        timeout=5,
+        cancellation=None,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == ["C.UTF-8", "C.UTF-8"]
+
+
 def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -258,6 +258,38 @@ def test_walk_forward_preflight_resolves_earliest_oos_from_frozen_calendar() -> 
     assert walk_forward["spec"]["oos_date_start_mode"] == "automatic"
 
 
+def test_walk_forward_optuna_preflight_reserves_inner_fold_history() -> None:
+    calendar = pd.bdate_range("2020-01-02", periods=900)
+    payload = _payload(calendar, {
+        "mode": "ratio", "train": 0.6, "valid": 0.2, "test": 0.2,
+        "embargo_days": 5,
+    })
+    payload["walk_forward"] = {
+        "enabled": True,
+        "strategy": "rolling",
+        "train_sessions": 504,
+        "valid_sessions": 60,
+        "test_sessions": 20,
+        "step_sessions": 20,
+        "embargo_sessions": 5,
+        "oos_date_start": "",
+        "oos_date_end": "",
+    }
+    payload["optuna"] = {
+        "enabled": True,
+        "validation_windows": 3,
+    }
+
+    walk_forward = _service(calendar).validate(payload)["walk_forward"]
+
+    assert walk_forward["required_history_sessions"] == 694
+    assert walk_forward["optuna_tuning_fold_count"] == 3
+    assert walk_forward["optuna_extra_history_sessions"] == 120
+    assert walk_forward["prediction_date_start"] == (
+        calendar[694].date().isoformat()
+    )
+
+
 def test_walk_forward_preflight_timeline_preserves_expanding_train_start() -> None:
     calendar = pd.bdate_range("2020-01-02", periods=900)
     payload = _payload(calendar, {

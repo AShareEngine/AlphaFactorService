@@ -2450,8 +2450,16 @@ def test_optuna_spec_freezes_robust_tree_search_contract() -> None:
         "seed_count": 3,
         "stability_penalty": 0.5,
         "minimum_positive_window_ratio": 0.6,
-        "search_space_version": "alphablocks.tree-optuna.v2",
+        "validation_mode": "walk_forward_folds",
+        "search_space_version": "alphablocks.tree-optuna.v3",
     }
+
+    fixed = _optuna_spec(
+        {"enabled": True}, model_kind="lightgbm",
+        walk_forward={"enabled": False}, incremental=False,
+    )
+    assert fixed["validation_mode"] == "fixed_subwindows"
+    assert fixed["search_space_version"] == "alphablocks.tree-optuna.v3"
 
 
 def test_optuna_spec_rejects_unsupported_or_validationless_training() -> None:
