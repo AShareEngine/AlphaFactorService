@@ -108,6 +108,16 @@ def _submitted_node(
         and not api_token
     ):
         api_token = existing.api_token
+    compute_type = str(
+        payload.get("compute_type")
+        or (existing.compute_type if existing else "")
+    ).strip().lower()
+    if payload.get("gpus") is not None and payload.get("gpus") != "":
+        gpus = str(payload["gpus"]).strip()
+    elif existing and compute_type == existing.compute_type:
+        gpus = existing.gpus
+    else:
+        gpus = "0" if compute_type == "cpu" else "all"
     return {
         "id": node_id,
         "name": str(payload.get("name") or node_id).strip(),
@@ -129,7 +139,8 @@ def _submitted_node(
         "docker_image": str(
             payload.get("docker_image") or "alphafactor-research:latest"
         ).strip(),
-        "gpus": str(payload.get("gpus") or "all").strip(),
+        "compute_type": compute_type,
+        "gpus": gpus,
         "max_runtime_minutes": int(payload.get("max_runtime_minutes") or 240),
         "cleanup_success": _boolean(payload.get("cleanup_success"), True),
         "lifecycle_provider": lifecycle_provider,

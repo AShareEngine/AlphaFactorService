@@ -511,6 +511,29 @@ def test_job_validation_accepts_frozen_optuna_contract() -> None:
     assert job["config_json"]["optuna"]["n_trials"] == 20
 
 
+def test_job_validation_accepts_frozen_robust_optuna_contract() -> None:
+    source = valid_job()
+    source["config_json"]["optuna"] = {
+        "enabled": True,
+        "backend": "optuna",
+        "n_trials": 20,
+        "objective": "validation_rank_icir",
+        "direction": "maximize",
+        "sampler": "tpe",
+        "seed": 42,
+        "validation_windows": 3,
+        "seed_count": 3,
+        "stability_penalty": 0.5,
+        "minimum_positive_window_ratio": 0.6,
+        "search_space_version": "alphablocks.tree-optuna.v2",
+    }
+
+    job = validate_job(source)
+
+    assert job["config_json"]["optuna"]["validation_windows"] == 3
+    assert job["config_json"]["optuna"]["seed_count"] == 3
+
+
 def test_job_validation_rejects_optuna_without_validation() -> None:
     source = valid_job()
     source["config_json"]["walk_forward"] = {

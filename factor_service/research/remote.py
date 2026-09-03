@@ -37,6 +37,7 @@ _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
 _USER = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,63}$")
 _IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,255}$")
 _GPU_SPEC = re.compile(r"^[A-Za-z0-9=,._-]{0,128}$")
+_COMPUTE_TYPES = {"cpu", "gpu"}
 _REMOTE_RUNNERS = {"docker", "direct_python"}
 _LIFECYCLE_PROVIDERS = {"", "autodl_pro"}
 _AUTHENTICATION_TYPES = {"ssh_private_key", "password"}
@@ -58,6 +59,7 @@ class RemoteNode:
     runner: str
     python_executable: str
     docker_image: str
+    compute_type: str
     gpus: str
     authentication_type: str
     ssh_private_key: str = field(repr=False)
@@ -86,6 +88,7 @@ class RemoteNode:
             "runner": self.runner,
             "python_executable": self.python_executable,
             "docker_image": self.docker_image,
+            "compute_type": self.compute_type,
             "gpus": self.gpus,
             "enabled": self.enabled,
             "available": (
@@ -162,6 +165,7 @@ def remote_node_storage_payload(node: RemoteNode) -> dict[str, Any]:
         "runner": node.runner,
         "python_executable": node.python_executable,
         "docker_image": node.docker_image,
+        "compute_type": node.compute_type,
         "gpus": node.gpus,
         "max_runtime_minutes": node.max_runtime_minutes,
         "cleanup_success": node.cleanup_success,
@@ -1149,7 +1153,14 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
     runner = str(source.get("runner") or "docker").strip().lower()
     python_executable = str(source.get("python_executable") or "python").strip()
     image = str(source.get("docker_image") or "alphafactor-research:latest").strip()
-    gpus = str(source.get("gpus") or "all").strip()
+    configured_gpus = str(source.get("gpus") or "").strip()
+    configured_compute_type = str(
+        source.get("compute_type") or ""
+    ).strip().lower()
+    compute_type = configured_compute_type or (
+        "cpu" if configured_gpus == "0" else "gpu"
+    )
+    gpus = configured_gpus or ("0" if compute_type == "cpu" else "all")
     authentication_type = str(
         source.get("authentication_type") or ""
     ).strip().lower()
@@ -1186,6 +1197,10 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         raise ValueError(f"远程训练docker_image无效: {image}")
     if not _GPU_SPEC.fullmatch(gpus):
         raise ValueError(f"远程训练gpus配置无效: {gpus}")
+    if compute_type not in _COMPUTE_TYPES:
+        raise ValueError("远程训练compute_type只允许gpu或cpu")
+    if (compute_type == "cpu") != (gpus == "0"):
+        raise ValueError("CPU节点必须禁用GPU挂载，GPU节点必须配置GPU挂载")
     if authentication_type not in _AUTHENTICATION_TYPES:
         raise ValueError("远程训练认证只允许ssh_private_key或password")
     if "\x00" in ssh_password:
@@ -1220,6 +1235,7 @@ def _normalize_node(source: dict[str, Any]) -> RemoteNode:
         runner=runner,
         python_executable=python_executable,
         docker_image=image,
+        compute_type=compute_type,
         gpus=gpus,
         authentication_type=authentication_type,
         ssh_private_key=(

@@ -1816,6 +1816,44 @@ def _suggest_tree_hyperparameters(trial: Any, model_kind: str) -> dict[str, Any]
     raise ValueError("Optuna只支持LightGBM、XGBoost或CatBoost")
 
 
+def _validation_subsegments(
+    frame: pd.DataFrame,
+    validation_segment: tuple[str, str],
+    requested_windows: int,
+) -> list[tuple[str, str]]:
+    """Split the frozen validation period into contiguous trading-date windows."""
+    label = frame[("label", "LABEL0")]
+    start, end = validation_segment
+    validation = label.loc[pd.IndexSlice[start:end, :]]
+    dates = pd.Index(
+        validation.index.get_level_values("datetime").unique()
+    ).sort_values()
+    window_count = max(1, int(requested_windows))
+    if window_count > 1 and len(dates) < window_count * 2:
+        raise ValueError(
+            f"Optuna稳健验证需要每个窗口至少2个交易日；"
+            f"当前验证集{len(dates)}日，配置{window_count}个窗口"
+        )
+    chunks = np.array_split(dates.to_numpy(), window_count)
+    return [
+        (
+            pd.Timestamp(chunk[0]).date().isoformat(),
+            pd.Timestamp(chunk[-1]).date().isoformat(),
+        )
+        for chunk in chunks
+        if len(chunk)
+    ]
+
+
+def _seeded_tree_params(
+    base_params: dict[str, Any], model_kind: str, seed: int,
+) -> dict[str, Any]:
+    params = {**base_params, "seed": int(seed)}
+    if model_kind == "catboost":
+        params["random_seed"] = int(seed)
+    return params
+
+
 def _tune_tree_hyperparameters(
     prepared: PreparedDataset,
     *,
@@ -1828,7 +1866,12 @@ def _tune_tree_hyperparameters(
     cancellation: CancellationToken | None,
     progress: ProgressCallback | None,
 ) -> dict[str, Any]:
-    """Search only on the frozen validation split, then return auditable trials."""
+    """Search frozen validation data and return auditable trials.
+
+    The v2 contract scores every parameter set across contiguous validation
+    sub-windows and repeated seeds. The sealed test segment is never read.
+    Legacy v1 jobs retain the original single-window, single-seed behaviour.
+    """
     try:
         import optuna
     except ImportError as exc:
@@ -1836,49 +1879,128 @@ def _tune_tree_hyperparameters(
 
     n_trials = int(config.get("n_trials") or 20)
     seed = int(config.get("seed") if config.get("seed") is not None else 42)
+    search_space_version = str(
+        config.get("search_space_version") or "alphablocks.tree-optuna.v1"
+    )
+    robust_selection = search_space_version == "alphablocks.tree-optuna.v2"
+    requested_windows = (
+        int(config.get("validation_windows") or 3) if robust_selection else 1
+    )
+    seed_count = (
+        int(config.get("seed_count") or 3) if robust_selection else 1
+    )
+    stability_penalty = (
+        float(config.get("stability_penalty", 0.5))
+        if robust_selection else 0.0
+    )
+    minimum_positive_window_ratio = (
+        float(config.get("minimum_positive_window_ratio", 0.6))
+        if robust_selection else 0.0
+    )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     handler = DataHandlerLP.from_df(prepared.frame)
     validation_segment = prepared.segments.get("valid")
     if not validation_segment:
         raise ValueError("Optuna需要非空验证集")
+    validation_windows = (
+        _validation_subsegments(
+            prepared.frame, validation_segment, requested_windows,
+        )
+        if robust_selection else [validation_segment]
+    )
+    trial_seeds = [
+        (seed + offset) % 2_147_483_648 for offset in range(seed_count)
+    ]
 
     def objective(trial: Any) -> float:
         _checkpoint(cancellation)
         suggested = _suggest_tree_hyperparameters(trial, model_kind)
-        trial_params = {**base_params, **suggested}
-        trial_dataset = _dataset_for_model(
-            handler, prepared.segments, model_kind, trial_params, DatasetH,
-        )
-        trial_model, _ = _create_model(
-            model_kind, trial_params, len(prepared.feature_names),
-        )
-        evals_result: dict[str, Any] = {}
-        _fit_model(
-            model_kind, trial_model, trial_dataset, evals_result,
-            cancellation=cancellation,
-            progress=progress,
-            stage="optuna_trial",
-            progress_start=58,
-            progress_end=58,
-            progress_details={
-                "trial": int(trial.number) + 1,
-                "trial_count": n_trials,
-            },
-            metric_prefix=f"optuna.trial_{int(trial.number) + 1}.",
-        )
-        prediction = _predict_dataset(
-            trial_model, model_kind, trial_dataset, "valid",
-            classification=classification,
-        )
-        metrics = _metrics(
-            prediction, prepared.frame, validation_segment,
-            classification=classification,
-        )
+        seed_evaluations: list[dict[str, Any]] = []
+        window_values: list[float] = []
+        window_rank_ics: list[float] = []
+        first_full_metrics: dict[str, Any] | None = None
+        for repeat_index, trial_seed in enumerate(trial_seeds, start=1):
+            _checkpoint(cancellation)
+            trial_params = _seeded_tree_params(
+                {**base_params, **suggested}, model_kind, trial_seed,
+            )
+            trial_dataset = _dataset_for_model(
+                handler, prepared.segments, model_kind, trial_params, DatasetH,
+            )
+            trial_model, _ = _create_model(
+                model_kind, trial_params, len(prepared.feature_names),
+            )
+            evals_result: dict[str, Any] = {}
+            _fit_model(
+                model_kind, trial_model, trial_dataset, evals_result,
+                cancellation=cancellation,
+                progress=progress,
+                stage="optuna_trial",
+                progress_start=58,
+                progress_end=58,
+                progress_details={
+                    "trial": int(trial.number) + 1,
+                    "trial_count": n_trials,
+                    "seed_repeat": repeat_index,
+                    "seed_count": seed_count,
+                },
+                metric_prefix=(
+                    f"optuna.trial_{int(trial.number) + 1}."
+                    f"seed_{repeat_index}."
+                ),
+            )
+            prediction = _predict_dataset(
+                trial_model, model_kind, trial_dataset, "valid",
+                classification=classification,
+            )
+            full_metrics = _metrics(
+                prediction, prepared.frame, validation_segment,
+                classification=classification,
+            )
+            if first_full_metrics is None:
+                first_full_metrics = full_metrics
+            windows: list[dict[str, Any]] = []
+            for window_number, segment in enumerate(validation_windows, start=1):
+                metrics = _metrics(
+                    prediction, prepared.frame, segment,
+                    classification=classification,
+                )
+                rank_icir = float(metrics["rank_icir"])
+                rank_ic = float(metrics["rank_ic"])
+                if not np.isfinite(rank_icir):
+                    raise optuna.TrialPruned("验证窗口Rank ICIR不是有限值")
+                window_values.append(rank_icir)
+                window_rank_ics.append(rank_ic)
+                windows.append({
+                    "window": window_number,
+                    "date_start": segment[0],
+                    "date_end": segment[1],
+                    "test_days": int(metrics["test_days"]),
+                    "rank_ic": rank_ic,
+                    "rank_icir": rank_icir,
+                })
+            seed_evaluations.append({
+                "seed": trial_seed,
+                "full_validation": {
+                    key: full_metrics[key]
+                    for key in ("test_rows", "test_days", "rmse", "rank_ic", "rank_icir")
+                },
+                "windows": windows,
+            })
+        mean_rank_icir = float(np.mean(window_values))
+        std_rank_icir = float(np.std(window_values, ddof=0))
+        positive_window_ratio = float(np.mean(np.asarray(window_rank_ics) > 0.0))
+        value = mean_rank_icir - stability_penalty * std_rank_icir
+        full_metrics = first_full_metrics or {}
         for key in ("test_rows", "test_days", "rmse", "rank_ic", "rank_icir"):
-            trial.set_user_attr(key, metrics[key])
-        value = float(metrics["rank_icir"])
+            trial.set_user_attr(key, full_metrics.get(key))
+        trial.set_user_attr("validation_windows", seed_evaluations)
+        trial.set_user_attr("mean_rank_icir", mean_rank_icir)
+        trial.set_user_attr("std_rank_icir", std_rank_icir)
+        trial.set_user_attr("positive_window_ratio", positive_window_ratio)
+        trial.set_user_attr("stability_score", value)
         if not np.isfinite(value):
-            raise optuna.TrialPruned("验证集Rank ICIR不是有限值")
+            raise optuna.TrialPruned("验证集稳健性得分不是有限值")
         return value
 
     study = optuna.create_study(
@@ -1910,6 +2032,18 @@ def _tune_tree_hyperparameters(
     ]
     if not completed:
         raise ValueError("Optuna没有完成任何有效试验")
+    eligible = [
+        trial for trial in completed
+        if float(trial.user_attrs.get("positive_window_ratio") or 0.0)
+        >= minimum_positive_window_ratio
+    ]
+    selection_pool = eligible or completed
+    selected_trial = max(
+        selection_pool,
+        key=lambda item: (
+            float(item.value) if item.value is not None else float("-inf")
+        ),
+    )
     trials = []
     for trial in study.trials:
         duration = (
@@ -1926,7 +2060,10 @@ def _tune_tree_hyperparameters(
             "duration_seconds": float(duration) if duration is not None else None,
         })
     result = {
-        "schema_version": "alphablocks.optuna-search-result.v1",
+        "schema_version": (
+            "alphablocks.optuna-search-result.v2"
+            if robust_selection else "alphablocks.optuna-search-result.v1"
+        ),
         "enabled": True,
         "backend": "optuna",
         "model_kind": model_kind,
@@ -1934,11 +2071,24 @@ def _tune_tree_hyperparameters(
         "direction": "maximize",
         "sampler": "tpe",
         "seed": seed,
+        "search_space_version": search_space_version,
+        "selection_metric": (
+            "validation_rank_icir_stability_score"
+            if robust_selection else "validation_rank_icir"
+        ),
+        "validation_windows": len(validation_windows),
+        "seed_count": seed_count,
+        "stability_penalty": stability_penalty,
+        "minimum_positive_window_ratio": minimum_positive_window_ratio,
+        "positive_ratio_gate_satisfied": bool(eligible),
+        "selection_fallback": (
+            None if eligible else "no_trial_met_positive_window_ratio"
+        ),
         "requested_trials": n_trials,
         "completed_trials": len(completed),
-        "best_trial_number": int(study.best_trial.number) + 1,
-        "best_value": float(study.best_value),
-        "best_params": dict(study.best_params),
+        "best_trial_number": int(selected_trial.number) + 1,
+        "best_value": float(selected_trial.value),
+        "best_params": dict(selected_trial.params),
         "trials": trials,
     }
     _progress(progress, "optuna_completed", 58, {
@@ -1993,10 +2143,10 @@ def _qlib_lgb_params(source: dict[str, Any]) -> dict[str, Any]:
         "path_smooth": float(source.get("path_smooth", 1.0)),
         "bagging_freq": int(source.get("bagging_freq", 5)),
         "num_threads": _effective_num_threads(source),
-        "seed": 42,
-        "feature_fraction_seed": 42,
-        "bagging_seed": 42,
-        "data_random_seed": 42,
+        "seed": int(source.get("seed", 42)),
+        "feature_fraction_seed": int(source.get("seed", 42)),
+        "bagging_seed": int(source.get("seed", 42)),
+        "data_random_seed": int(source.get("seed", 42)),
         "deterministic": True,
         "force_col_wise": True,
         "verbosity": -1,

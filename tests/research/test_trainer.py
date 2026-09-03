@@ -145,6 +145,100 @@ def test_optuna_runs_trials_and_returns_auditable_best_params(monkeypatch) -> No
     assert progress_events[-1][0] == "optuna_completed"
 
 
+def test_optuna_v2_scores_multiple_validation_windows_and_seeds(monkeypatch) -> None:
+    class _FakeDataHandler:
+        @staticmethod
+        def from_df(frame):
+            return "handler"
+
+    fitted_seeds: list[int] = []
+    measured_segments: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "factor_service.research.trainer._dataset_for_model",
+        lambda handler, segments, model_kind, params, DatasetH: {
+            "params": params,
+        },
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._create_model",
+        lambda model_kind, params, feature_count: ({"params": params}, params),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._fit_model",
+        lambda model_kind, model, *args, **kwargs: fitted_seeds.append(
+            model["params"]["seed"]
+        ),
+    )
+    monkeypatch.setattr(
+        "factor_service.research.trainer._predict_dataset",
+        lambda *args, **kwargs: pd.Series(dtype=float),
+    )
+
+    def fake_metrics(prediction, frame, segment, **kwargs):
+        measured_segments.append(segment)
+        return {
+            "test_rows": 8,
+            "test_days": 4,
+            "rmse": 0.1,
+            "rank_ic": 0.2,
+            "rank_icir": 0.3,
+        }
+
+    monkeypatch.setattr("factor_service.research.trainer._metrics", fake_metrics)
+    dates = pd.date_range("2024-01-02", periods=8, freq="D")
+    index = pd.MultiIndex.from_product(
+        [dates, ["000001.SZ"]], names=["datetime", "instrument"],
+    )
+    columns = pd.MultiIndex.from_tuples([
+        ("feature", "f1"), ("label", "LABEL0"),
+    ])
+    frame = pd.DataFrame(np.ones((len(index), 2)), index=index, columns=columns)
+    prepared = PreparedDataset(
+        frame=frame,
+        segments={
+            "train": ("2024-01-02", "2024-01-02"),
+            "valid": ("2024-01-02", "2024-01-09"),
+            "test": ("2024-01-10", "2024-01-12"),
+        },
+        feature_names=["f1"],
+        coverage={},
+        medians={},
+        manifest={},
+    )
+
+    result = _tune_tree_hyperparameters(
+        prepared,
+        model_kind="lightgbm",
+        base_params={"n_estimators": 5},
+        config={
+            "n_trials": 2,
+            "seed": 7,
+            "validation_windows": 2,
+            "seed_count": 2,
+            "stability_penalty": 0.5,
+            "minimum_positive_window_ratio": 0.6,
+            "search_space_version": "alphablocks.tree-optuna.v2",
+        },
+        DataHandlerLP=_FakeDataHandler,
+        DatasetH=object,
+        classification=False,
+        cancellation=None,
+        progress=None,
+    )
+
+    assert result["schema_version"] == "alphablocks.optuna-search-result.v2"
+    assert result["validation_windows"] == 2
+    assert result["seed_count"] == 2
+    assert result["best_value"] == 0.3
+    assert fitted_seeds == [7, 8, 7, 8]
+    assert prepared.segments["test"] not in measured_segments
+    assert all(
+        len(seed_result["windows"]) == 2
+        for trial in result["trials"]
+        for seed_result in trial["validation"]["validation_windows"]
+    )
+
+
 def test_incremental_bundle_uses_recorded_training_identity_after_registration(
     tmp_path: Path,
 ) -> None:
@@ -441,6 +535,12 @@ def test_lightgbm_parameters_are_deterministic() -> None:
     assert params["deterministic"] is True
     assert params["num_threads"] == 2
     assert params["metric"] == "rmse"
+
+    repeated = _qlib_lgb_params({"seed": 43})
+    assert repeated["seed"] == 43
+    assert repeated["feature_fraction_seed"] == 43
+    assert repeated["bagging_seed"] == 43
+    assert repeated["data_random_seed"] == 43
 
     binary = _qlib_lgb_params({"loss": "binary", "metric": "binary_logloss"})
     assert binary["loss"] == "binary"

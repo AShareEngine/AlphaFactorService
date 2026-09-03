@@ -56,6 +56,7 @@ def test_remote_node_public_contract_does_not_expose_secret(
     public = node.public()
 
     assert public["id"] == "autodl-gpu-01"
+    assert public["compute_type"] == "gpu"
     assert public["available"] is True
     assert public["credential_type"] == "password"
     assert "ssh_password" not in public
@@ -89,8 +90,21 @@ def test_remote_node_storage_excludes_secret_values(
     stored = remote_node_storage_payload(node)
 
     assert stored["authentication_type"] == "password"
+    assert stored["compute_type"] == "gpu"
     assert "ssh_password" not in stored
     assert "private-value" not in repr(stored)
+
+
+def test_legacy_cpu_node_infers_compute_type_from_disabled_gpu_mount(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime["research"]["execution"]["remote_nodes"][0]["gpus"] = "0"
+
+    node = load_remote_nodes(runtime)[0]
+
+    assert node.compute_type == "cpu"
+    assert node.public()["compute_type"] == "cpu"
 
 
 @pytest.mark.parametrize(
@@ -101,6 +115,7 @@ def test_remote_node_storage_excludes_secret_values(
         ("docker_image", "image;shutdown"),
         ("authentication_type", "password;shutdown"),
         ("runner", "direct;shutdown"),
+        ("compute_type", "tpu"),
     ],
 )
 def test_remote_node_rejects_command_injection_fields(
@@ -109,6 +124,19 @@ def test_remote_node_rejects_command_injection_fields(
     runtime = _runtime(tmp_path)
     runtime["research"]["execution"]["remote_nodes"][0][field] = value
     with pytest.raises(ValueError):
+        load_remote_nodes(runtime)
+
+
+def test_remote_node_rejects_compute_type_and_gpu_mount_mismatch(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    runtime["research"]["execution"]["remote_nodes"][0].update({
+        "compute_type": "cpu",
+        "gpus": "all",
+    })
+
+    with pytest.raises(ValueError, match="CPU节点必须禁用GPU挂载"):
         load_remote_nodes(runtime)
 
 

@@ -542,6 +542,8 @@ def _validate_optuna(
     unknown = sorted(set(source) - {
         "enabled", "backend", "n_trials", "objective", "direction",
         "sampler", "seed", "search_space_version",
+        "validation_windows", "seed_count", "stability_penalty",
+        "minimum_positive_window_ratio",
     })
     if unknown:
         raise PermanentJobError(
@@ -557,6 +559,23 @@ def _validate_optuna(
         raise PermanentJobError("增量续训不能同时开启Optuna")
     _integer(source.get("n_trials", 20), "optuna.n_trials", 10, 100)
     _integer(source.get("seed", 42), "optuna.seed", 0, 2_147_483_647)
+    version = str(
+        source.get("search_space_version") or "alphablocks.tree-optuna.v1"
+    )
+    if version == "alphablocks.tree-optuna.v2":
+        _integer(
+            source.get("validation_windows", 3),
+            "optuna.validation_windows", 2, 8,
+        )
+        _integer(source.get("seed_count", 3), "optuna.seed_count", 1, 5)
+        _number(
+            source.get("stability_penalty", 0.5),
+            "optuna.stability_penalty", 0.0, 2.0,
+        )
+        _number(
+            source.get("minimum_positive_window_ratio", 0.6),
+            "optuna.minimum_positive_window_ratio", 0.0, 1.0,
+        )
     if str(source.get("backend") or "optuna").strip().lower() != "optuna":
         raise PermanentJobError("optuna.backend必须为optuna")
     if str(source.get("objective") or "validation_rank_icir").strip().lower() != "validation_rank_icir":
@@ -565,7 +584,9 @@ def _validate_optuna(
         raise PermanentJobError("Optuna方向必须为maximize")
     if str(source.get("sampler") or "tpe").strip().lower() != "tpe":
         raise PermanentJobError("Optuna采样器只支持tpe")
-    if str(source.get("search_space_version") or "alphablocks.tree-optuna.v1") != "alphablocks.tree-optuna.v1":
+    if version not in {
+        "alphablocks.tree-optuna.v1", "alphablocks.tree-optuna.v2",
+    }:
         raise PermanentJobError("Optuna搜索空间版本无效")
 
 

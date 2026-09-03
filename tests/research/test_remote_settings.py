@@ -71,6 +71,7 @@ def _node(**overrides) -> dict:
         "runner": "direct_python",
         "python_executable": "/root/miniconda3/bin/python",
         "docker_image": "alphafactor-research:latest",
+        "compute_type": "gpu",
         "gpus": "all",
         "max_runtime_minutes": 240,
         "cleanup_success": True,
@@ -90,6 +91,7 @@ def test_remote_node_settings_crud_stores_secrets_outside_config_json(
     )
 
     assert created["available"] is True
+    assert created["compute_type"] == "gpu"
     assert created["ssh_password_configured"] is True
     assert created["authentication_hint"] == "PostgreSQL加密SSH密码"
     assert listed[0]["credential_type"] == "password"
@@ -107,6 +109,21 @@ def test_remote_node_settings_crud_stores_secrets_outside_config_json(
 
     assert deleted == {"id": "autodl-gpu-01", "deleted": True}
     assert list_remote_node_settings() == []
+
+
+def test_remote_node_settings_persists_cpu_compute_type(
+    node_repository,
+) -> None:
+    created = create_remote_node_setting(_node(
+        id="autodl-cpu-01",
+        name="AutoDL CPU",
+        compute_type="cpu",
+        gpus="0",
+    ))
+
+    assert created["compute_type"] == "cpu"
+    assert created["gpus"] == "0"
+    assert node_repository.nodes["autodl-cpu-01"]["compute_type"] == "cpu"
 
 
 def test_remote_node_settings_rejects_invalid_duplicate_or_missing_secret() -> None:

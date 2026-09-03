@@ -4213,6 +4213,8 @@ def _optuna_spec(
         raise ModelResearchError("optuna必须是对象")
     unknown = sorted(set(source) - {
         "enabled", "n_trials", "objective", "sampler", "seed",
+        "validation_windows", "seed_count", "stability_penalty",
+        "minimum_positive_window_ratio",
     })
     if unknown:
         raise ModelResearchError(
@@ -4234,12 +4236,26 @@ def _optuna_spec(
     try:
         n_trials = int(source.get("n_trials") or 20)
         seed = int(source.get("seed") if source.get("seed") is not None else 42)
+        validation_windows = int(source.get("validation_windows") or 3)
+        seed_count = int(source.get("seed_count") or 3)
+        stability_penalty = float(source.get("stability_penalty", 0.5))
+        minimum_positive_window_ratio = float(
+            source.get("minimum_positive_window_ratio", 0.6)
+        )
     except (TypeError, ValueError) as exc:
         raise ModelResearchError("Optuna搜索次数或随机种子格式无效") from exc
     if not 10 <= n_trials <= 100:
         raise ModelResearchError("Optuna搜索次数必须在10到100之间")
     if not 0 <= seed <= 2_147_483_647:
         raise ModelResearchError("Optuna随机种子无效")
+    if not 2 <= validation_windows <= 8:
+        raise ModelResearchError("Optuna稳健验证窗口数必须在2到8之间")
+    if not 1 <= seed_count <= 5:
+        raise ModelResearchError("Optuna随机种子重复次数必须在1到5之间")
+    if not 0.0 <= stability_penalty <= 2.0:
+        raise ModelResearchError("Optuna稳定性惩罚必须在0到2之间")
+    if not 0.0 <= minimum_positive_window_ratio <= 1.0:
+        raise ModelResearchError("Optuna正向窗口比例门槛必须在0到1之间")
     objective = str(
         source.get("objective") or "validation_rank_icir"
     ).strip().lower()
@@ -4256,7 +4272,11 @@ def _optuna_spec(
         "direction": "maximize",
         "sampler": sampler,
         "seed": seed,
-        "search_space_version": "alphablocks.tree-optuna.v1",
+        "validation_windows": validation_windows,
+        "seed_count": seed_count,
+        "stability_penalty": stability_penalty,
+        "minimum_positive_window_ratio": minimum_positive_window_ratio,
+        "search_space_version": "alphablocks.tree-optuna.v2",
     }
 
 

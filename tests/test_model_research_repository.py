@@ -2430,7 +2430,7 @@ def test_grid_search_supports_mlp_architecture_candidates() -> None:
     ]
 
 
-def test_optuna_spec_freezes_single_tree_search_contract() -> None:
+def test_optuna_spec_freezes_robust_tree_search_contract() -> None:
     spec = _optuna_spec(
         {"enabled": True, "n_trials": 25},
         model_kind="lightgbm",
@@ -2446,7 +2446,11 @@ def test_optuna_spec_freezes_single_tree_search_contract() -> None:
         "direction": "maximize",
         "sampler": "tpe",
         "seed": 42,
-        "search_space_version": "alphablocks.tree-optuna.v1",
+        "validation_windows": 3,
+        "seed_count": 3,
+        "stability_penalty": 0.5,
+        "minimum_positive_window_ratio": 0.6,
+        "search_space_version": "alphablocks.tree-optuna.v2",
     }
 
 
