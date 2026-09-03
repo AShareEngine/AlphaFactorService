@@ -76,7 +76,7 @@ def load_settings() -> Settings:
             source.get("entity_asset_query_timeout_seconds") or 120
         ),
         entity_asset_query_concurrency=max(
-            1, int(source.get("entity_asset_query_concurrency") or 4)
+            1, int(source.get("entity_asset_query_concurrency") or 2)
         ),
         model_database=str(clickhouse.get("model_database") or "ab_model").strip(),
         model_artifacts_root=resolve_project_path(

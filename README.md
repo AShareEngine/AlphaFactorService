@@ -215,6 +215,13 @@ AlphaFactorService不通过AlphaBlocks API回写模型状态或元数据。只�
 物化到本地因子源视图时，计算器才通过AlphaBlocks只读统一数据SDK查询股票实体资产的日频复合
 视图；字段授权、实体关系和财务PIT对齐仍由AlphaBlocks统一数据层负责。
 
+同一Dataset中的多个因子共享复合实体资产时，FactorService优先调用AlphaBlocks内部日期范围暂存
+接口。主行情字段由ClickHouse按范围直接物化，PIT扩展字段由统一数据层关联后在服务端写入同一
+受控暂存；返回绑定还会由FactorService自己的ClickHouse连接二次确认。暂存身份包含Dataset、
+交易日、字段、`data_cutoff`和来源版本，支持任务重试时按已完成日期续跑，并由24小时TTL清理。
+当旧版AlphaBlocks尚未提供该内部接口时，FactorService保留按日查询兼容路径；兼容路径同样必须
+传递冻结`data_cutoff`，不能使用执行时的当前时间代替训练计划时点。
+
 单模型LightGBM、XGBoost和CatBoost支持冻结`optuna`配置后执行10至100次TPE搜索。非滚动任务
 把固定验证段切成连续子窗口；Walk-Forward任务在正式样本外起点之前生成多个内层调参折，每折
 独立移动训练/验证区间并重新拟合。两种模式都跨多个随机种子计算“平均Rank ICIR减去波动惩罚”，优先选择达到正向

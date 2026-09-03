@@ -34,7 +34,7 @@ class Settings:
     stock_daily_table: str = "stock_daily_factor_source"
     data_sdk_api_base_url: str = ""
     data_sdk_query_timeout_seconds: float = 120.0
-    data_sdk_query_concurrency: int = 4
+    data_sdk_query_concurrency: int = 2
 
 
 def load_settings() -> Settings:
@@ -130,7 +130,7 @@ def load_settings() -> Settings:
         ),
         data_sdk_query_concurrency=max(
             1,
-            int(factor_source.get("entity_asset_query_concurrency") or 4),
+            int(factor_source.get("entity_asset_query_concurrency") or 2),
         ),
     )
     return result

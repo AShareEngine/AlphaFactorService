@@ -326,6 +326,13 @@ class DatasetBuilder:
                         cutoff_for_clickhouse,
                         date_start,
                         date_end,
+                        data_cutoff=str(spec["data_cutoff"]),
+                        stage_key=str(
+                            job.get("dataset_hash")
+                            or job.get("dataset_id")
+                            or job.get("job_id")
+                            or "model-dataset"
+                        ),
                         cancellation=cancellation,
                         progress=progress,
                     ))
@@ -1560,6 +1567,8 @@ class DatasetBuilder:
         date_start: str,
         date_end: str,
         *,
+        data_cutoff: str = "",
+        stage_key: str = "model-dataset",
         cancellation: CancellationToken | None = None,
         progress: ProgressCallback | None = None,
     ) -> dict[tuple[str, str], pd.DataFrame]:
@@ -1658,6 +1667,10 @@ class DatasetBuilder:
                 date_start=chunk_start,
                 date_end=chunk_end,
                 job_id="model-dataset-batch",
+                data_cutoff=data_cutoff,
+                stage_key=(
+                    f"{stage_key}:{chunk_start.isoformat()}:{chunk_end.isoformat()}"
+                ),
             ) as source_binding:
                 for item, factor in items:
                     _checkpoint(cancellation)
