@@ -802,10 +802,10 @@ def test_lightgbm_incremental_fit_appends_trees_to_source_booster() -> None:
         import numpy as np
         import pandas as pd
         from qlib.data.dataset import DataHandlerLP, DatasetH
-        from qlib.workflow import R
+        from factor_service.research import trainer
         from factor_service.research.trainer import _create_model, _fit_model
 
-        R.log_metrics = lambda **kwargs: None
+        trainer.log_evaluation_history = lambda *args, **kwargs: None
         dates = pd.date_range("2024-01-02", periods=80, freq="B")
         index = pd.MultiIndex.from_product(
             [dates, ["A", "B"]], names=["datetime", "instrument"],
@@ -852,10 +852,10 @@ def test_lightgbm_zero_validation_trains_fixed_rounds_without_valid_metrics() ->
         import numpy as np
         import pandas as pd
         from qlib.data.dataset import DataHandlerLP, DatasetH
-        from qlib.workflow import R
+        from factor_service.research import trainer
         from factor_service.research.trainer import _create_model, _fit_model
 
-        R.log_metrics = lambda **kwargs: None
+        trainer.log_evaluation_history = lambda *args, **kwargs: None
         dates = pd.date_range("2024-01-02", periods=60, freq="B")
         index = pd.MultiIndex.from_product(
             [dates, ["A", "B"]], names=["datetime", "instrument"],

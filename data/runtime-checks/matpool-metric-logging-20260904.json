@@ -1,0 +1,57 @@
+{
+  "schema_version": "alphablocks.metric-logging-benchmark.v1",
+  "synthetic": true,
+  "steps_per_series": 50,
+  "series": 2,
+  "samples": [
+    {
+      "mode": "per_point",
+      "repeat": 1,
+      "seconds": 41.75216281414032,
+      "metric_count": 100,
+      "write_calls": 100,
+      "all_points_verified": true
+    },
+    {
+      "mode": "batch",
+      "repeat": 1,
+      "seconds": 0.7005175948143005,
+      "metric_count": 100,
+      "write_calls": 1,
+      "all_points_verified": true
+    },
+    {
+      "mode": "batch",
+      "repeat": 2,
+      "seconds": 0.7021677494049072,
+      "metric_count": 100,
+      "write_calls": 1,
+      "all_points_verified": true
+    },
+    {
+      "mode": "per_point",
+      "repeat": 2,
+      "seconds": 43.059238240122795,
+      "metric_count": 100,
+      "write_calls": 100,
+      "all_points_verified": true
+    }
+  ],
+  "median_seconds": {
+    "per_point": 42.40570052713156,
+    "batch": 0.7013426721096039
+  },
+  "speedup": 60.46359677442315,
+  "resources": {
+    "cpu_cores": 8,
+    "memory_limit_bytes": 17179869184,
+    "memory_available_bytes": 10829795328,
+    "memory_source": "cgroup_v2",
+    "process_rss_bytes": 272162816,
+    "oom_kill_count": 1,
+    "memory_reserve_bytes": 2576980377,
+    "training_headroom_bytes": 8252814951,
+    "memory_used_bytes": 6350073856
+  },
+  "note": "Logging-only microbenchmark; not an end-to-end training speedup. SQLite durability unchanged."
+}

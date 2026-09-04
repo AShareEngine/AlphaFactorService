@@ -236,6 +236,17 @@ ClickHouse连接二次确认。暂存身份包含Dataset、交易日、字段、
 参数实验、多模型对比和Stacking不允许
 同时开启Optuna。内层调参完成后把最佳参数冻结到全部外层Walk-Forward窗口，外层测试不参与选参。
 
+LightGBM完整迭代指标通过当前Qlib Recorder的MLflow客户端，每批最多1000条同步写入，
+不再逐指标进入异步队列。普通训练、Optuna内层折、Walk-Forward及Stacking中的LightGBM
+共享这条路径；指标名、trial/窗口前缀、step和数值保持不变。每批之间响应取消，写入错误
+直接上报，进度显示`training_metrics_writing`/`training_metrics_written`及已保存条数。
+不关闭SQLite同步落盘，不丢弃训练曲线，也不改变模型、早停或选参结果。此优化只对加载
+新版程序的新任务生效，不热修改正在运行的进程或已有MLflow数据库。
+
+可用`PYTHONPATH=. python scripts/benchmark_training_metrics.py --work-dir <新的临时目录>`
+对比旧Qlib逐条队列写入（包含结束时排空队列）和新批量写入。只生成合成指标与独立SQLite库，
+反向交换两轮执行顺序并回读每条曲线；`report.json`中的加速比仅代表指标保存，不是训练总耗时。
+
 ### Walk-Forward滚动评估
 
 远程节点使用独立、轻量的内存监护进程启动训练子进程。有效资源取宿主机可用内存、

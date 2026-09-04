@@ -25,6 +25,7 @@ from factor_service.research.dataset import (
     walk_forward_segments,
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
+from factor_service.research.metric_logging import log_evaluation_history
 from factor_service.research.industry_feature import normalize_industry_feature
 from factor_service.research.preprocessing import (
     normalize_feature_preprocessing,
@@ -1688,8 +1689,6 @@ def _fit_model(
         return
 
     import lightgbm as lgb
-    from qlib.workflow import R
-
     prepared_sets = model._prepare_data(dataset)  # Qlib's canonical DatasetH adapter.
     datasets, names = list(zip(*prepared_sets))
     if not validation_enabled:
@@ -1766,11 +1765,18 @@ def _fit_model(
             init_model=initial_booster,
             keep_training_booster=True,
         )
-    for name in names:
-        for metric, values in evals_result[name].items():
-            for epoch, value in enumerate(values):
-                metric_name = f"{metric_prefix}{metric}.{name}".replace("@", "_")
-                R.log_metrics(**{metric_name: value}, step=epoch)
+    log_evaluation_history(
+        {name: evals_result[name] for name in names},
+        metric_prefix=metric_prefix,
+        cancellation=cancellation,
+        progress=progress,
+        progress_percent=progress_end,
+        progress_details={
+            **(progress_details or {}),
+            "model_kind": model_kind,
+            "training_stage": stage,
+        },
+    )
     _progress(
         progress, stage, progress_end,
         {**(progress_details or {}), "model_kind": model_kind, "completed": True},
