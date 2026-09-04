@@ -31,6 +31,7 @@ from factor_service.research.preprocessing import (
     preprocess_qlib_frame,
 )
 from factor_service.research.snapshot import DatasetSnapshotStore
+from factor_service.research.runtime_resources import release_training_memory
 from factor_service.research.training_diagnostics import build_training_diagnostics
 
 
@@ -55,6 +56,7 @@ class WalkForwardTrainingResult:
     latest_dataset: Any
     latest_evals_result: dict[str, Any]
     latest_segments: dict[str, tuple[str, str]]
+    latest_model_params: dict[str, Any]
 
 
 @dataclass
@@ -209,8 +211,8 @@ class QlibTrainer:
                     progress=progress,
                 )
             raw_params = {**raw_params, **dict(optuna_result["best_params"])}
-        handler = DataHandlerLP.from_df(training_prepared.frame)
-        if model_kind != "stacking":
+        if model_kind != "stacking" and walk_forward_config.get("enabled") is not True:
+            handler = DataHandlerLP.from_df(training_prepared.frame)
             dataset = _dataset_for_model(
                 handler, training_prepared.segments, model_kind, raw_params, DatasetH,
             )
@@ -249,6 +251,7 @@ class QlibTrainer:
             model = walk_forward_result.latest_model
             dataset = walk_forward_result.latest_dataset
             evals_result = walk_forward_result.latest_evals_result
+            model_params = walk_forward_result.latest_model_params
         with R.start(
             experiment_name=experiment_name,
             recorder_name=str(job["job_id"]),
@@ -769,7 +772,11 @@ def _run_walk_forward(
         }
         for index, segments in enumerate(windows, start=1)
     ]
-    trained: dict[int, dict[str, Any]] = {}
+    # Keep only small manifests in memory. Retaining each DatasetH here used to
+    # retain every overlapping window's full DataFrame until the final window.
+    reports: list[dict[str, Any]] = []
+    prediction_paths: list[Path] = []
+    latest: dict[str, Any] = {}
 
     def train_task(
         task: dict[str, Any],
@@ -803,7 +810,7 @@ def _run_walk_forward(
             model_kind, raw_params, DatasetH,
         )
         setattr(window_dataset, "_alphablocks_validation_enabled", validation_enabled)
-        window_model, _ = _create_model(
+        window_model, window_params = _create_model(
             model_kind, raw_params, len(prepared.feature_names),
         )
         window_evals: dict[str, Any] = {}
@@ -854,38 +861,7 @@ def _run_walk_forward(
                 "metrics.pkl": window_metrics,
             })
             recorder = R.get_recorder()
-        trained[index] = {
-            "segments": segments,
-            "model": window_model,
-            "dataset": window_dataset,
-            "evals_result": window_evals,
-            "prediction": prediction,
-            "metrics": window_metrics,
-            "medians": medians,
-            "recorder_id": recorder.id,
-            "task": task,
-        }
-        return recorder
-
-    qlib_trainer = TrainerR(
-        experiment_name=experiment_name,
-        train_func=train_task,
-    )
-    with R.uri_context(recorder_uri):
-        recorders = qlib_trainer.train(tasks)
-        qlib_trainer.end_train(recorders)
-    if len(recorders) != total or len(trained) != total:
-        raise ValueError("Qlib滚动任务训练结果数量与窗口计划不一致")
-
-    predictions: list[pd.Series] = []
-    reports: list[dict[str, Any]] = []
-    for index in range(1, total + 1):
-        payload = trained[index]
-        segments = payload["segments"]
-        window_model = payload["model"]
-        prediction = payload["prediction"]
-        window_metrics = payload["metrics"]
-        medians = payload["medians"]
+        _checkpoint(cancellation)
         window_root = series_root / f"window_{index:04d}"
         window_root.mkdir()
         window_model_path = window_root / "model.pkl"
@@ -903,22 +879,25 @@ def _run_walk_forward(
             "feature_names": list(prepared.feature_names),
             "train_medians": medians,
             "metrics": window_metrics,
-            "qlib_recorder_id": payload["recorder_id"],
-            "qlib_task": payload["task"],
+            "qlib_recorder_id": recorder.id,
+            "qlib_task": task,
             "model_sha256": _file_sha256(window_model_path),
         }
+        prediction_path = window_root / "prediction.parquet"
+        prediction.to_frame("prediction").to_parquet(prediction_path)
+        window_manifest["prediction_sha256"] = _file_sha256(prediction_path)
         window_manifest_path = window_root / "manifest.json"
         window_manifest_path.write_text(
             json.dumps(window_manifest, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        predictions.append(prediction)
+        prediction_paths.append(prediction_path)
         reports.append({
             "window": index,
             "segments": segments,
             "metrics": window_metrics,
             "train_medians": medians,
-            "qlib_recorder_id": payload["recorder_id"],
+            "qlib_recorder_id": recorder.id,
             "effective_date_start": segments["test"][0],
             "effective_date_end": segments["test"][1],
             "artifact": {
@@ -927,8 +906,37 @@ def _run_walk_forward(
                 "manifest_sha256": _file_sha256(window_manifest_path),
             },
         })
+        if index == total:
+            latest.update({
+                "model": window_model,
+                "dataset": window_dataset,
+                "evals_result": window_evals,
+                "segments": segments,
+                "model_params": window_params,
+            })
+        del window_frame, window_dataset, window_model, window_evals, prediction
+        release_training_memory()
+        _progress(progress, "walk_forward_window_saved", end_percent, {
+            **details,
+            "completed_windows": index,
+            "retained_training_windows": int(index == total),
+            "artifact_path": f"walk_forward/window_{index:04d}",
+        })
+        return recorder
 
+    qlib_trainer = TrainerR(
+        experiment_name=experiment_name,
+        train_func=train_task,
+    )
+    with R.uri_context(recorder_uri):
+        recorders = qlib_trainer.train(tasks)
+        qlib_trainer.end_train(recorders)
+    if len(recorders) != total or len(reports) != total:
+        raise ValueError("Qlib滚动任务训练结果数量与窗口计划不一致")
+
+    predictions = [pd.read_parquet(path)["prediction"] for path in prediction_paths]
     stitched = pd.concat(predictions).sort_index()
+    del predictions
     if stitched.index.duplicated().any():
         raise ValueError("Walk-Forward样本外预测日期重叠")
     aggregate = _metrics(
@@ -975,7 +983,6 @@ def _run_walk_forward(
             aggregate, window_count=total,
         ),
     }
-    latest = trained[total]
     return WalkForwardTrainingResult(
         prediction=stitched,
         report=report,
@@ -983,6 +990,7 @@ def _run_walk_forward(
         latest_dataset=latest["dataset"],
         latest_evals_result=latest["evals_result"],
         latest_segments=latest["segments"],
+        latest_model_params=latest["model_params"],
     )
 
 
@@ -1015,7 +1023,7 @@ def _walk_forward_frame(
     window_end = evaluation_segment[1]
     window_raw = raw_frame.loc[
         pd.IndexSlice[window_start:window_end, :], :
-    ].copy()
+    ]
     manifest = dict(getattr(prepared, "manifest", {}) or {})
     preprocessing = normalize_feature_preprocessing(
         manifest.get("preprocessing"), default_enabled=False,
@@ -1023,7 +1031,7 @@ def _walk_forward_frame(
     frozen_frame = getattr(prepared, "frame", raw_frame)
     processed_frame = frozen_frame.loc[
         pd.IndexSlice[window_start:window_end, :], :
-    ].copy()
+    ]
     frame = _training_frame_for_preprocessing_contract(
         window_raw,
         processed_frame,
@@ -2050,7 +2058,9 @@ def _tune_tree_hyperparameters(
             )
             if hasattr(trial_model, "to_cpu"):
                 trial_model.to_cpu()
-            del trial_model, trial_dataset
+            _prepare_model_for_serialization(model_kind, trial_model)
+            del trial_model, trial_dataset, evals_result
+            release_training_memory()
             return prediction
 
         for repeat_index, trial_seed in enumerate(trial_seeds, start=1):
@@ -2091,6 +2101,8 @@ def _tune_tree_hyperparameters(
                         "rank_ic": rank_ic,
                         "rank_icir": rank_icir,
                     })
+                    del fold_frame, prediction
+                    release_training_memory()
                 seed_evaluations.append({
                     "seed": trial_seed,
                     "windows": windows,
@@ -2189,6 +2201,7 @@ def _tune_tree_hyperparameters(
         n_trials=n_trials,
         callbacks=[report_trial],
         show_progress_bar=False,
+        gc_after_trial=True,
     )
     completed = [
         trial for trial in study.trials
@@ -2653,6 +2666,13 @@ def _create_model(kind: str, source: dict[str, Any], feature_count: int) -> tupl
 
 def _prepare_model_for_serialization(kind: str, model: Any) -> None:
     """Make a remotely trained model loadable by the CPU inference service."""
+    if kind == "lightgbm":
+        booster = getattr(model, "model", None)
+        if booster is not None and hasattr(booster, "free_dataset"):
+            # keep_training_booster=True retains native train/valid matrices.
+            # Only tree state is needed for inference and immutable artifacts.
+            booster.free_dataset()
+        return
     if kind != "xgboost":
         return
     booster = getattr(model, "model", None)

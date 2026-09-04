@@ -23,6 +23,7 @@ from factor_service.research.industry_feature import (
 )
 from factor_service.research.job import CancellationToken, ProgressCallback
 from factor_service.research.preprocessing import (
+    DATASET_PIPELINE_VERSION,
     normalize_feature_preprocessing,
     preprocess_feature_panel,
 )
@@ -241,6 +242,10 @@ class DailyInferenceRunner:
         features = membership[["trade_date", "instrument"]].drop_duplicates()
         coverages: dict[str, float] = {}
         expected_count = max(1, len(features))
+        deterministic_factor_quantiles = (
+            str(dataset_spec.get("pipeline_version") or "")
+            == DATASET_PIPELINE_VERSION
+        )
         for index, (factor, feature_name) in enumerate(
             zip(factors, factor_feature_names), start=1,
         ):
@@ -252,6 +257,7 @@ class DailyInferenceRunner:
             })
             values = self.dataset_builder._factor_values(
                 factor, cutoff_for_clickhouse, feature_date_start, trade_date,
+                deterministic_quantiles=deterministic_factor_quantiles,
             ).rename(columns={"value": feature_name})
             eligible_values = values.merge(
                 features[["trade_date", "instrument"]],

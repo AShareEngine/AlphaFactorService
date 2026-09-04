@@ -26,6 +26,8 @@ from factor_service.research.industry_feature import (
 )
 from factor_service.research.preprocessing import (
     DATASET_PIPELINE_VERSION,
+    FROZEN_DATA_BINDING_PIPELINE_VERSIONS,
+    REQUIRED_PREPROCESSING_PIPELINE_VERSIONS,
     normalize_feature_preprocessing,
 )
 from factor_service.research.sample_filter_formula import (
@@ -262,9 +264,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
     preprocessing = spec.get("preprocessing")
     pipeline_version = str(spec.get("pipeline_version") or "")
     if preprocessing is None:
-        if pipeline_version in {
-            "alphablocks.dataset-pipeline.v6", DATASET_PIPELINE_VERSION,
-        }:
+        if pipeline_version in REQUIRED_PREPROCESSING_PIPELINE_VERSIONS:
             version_label = pipeline_version.rsplit(".", 1)[-1]
             raise PermanentJobError(
                 f"{version_label}数据集缺少冻结的preprocessing规格"
@@ -283,8 +283,11 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
             raise PermanentJobError("dataset_spec.preprocessing不是规范化冻结规格")
     industry_feature = spec.get("industry_feature")
     if industry_feature is None:
-        if pipeline_version == DATASET_PIPELINE_VERSION:
-            raise PermanentJobError("v8数据集缺少冻结的industry_feature规格")
+        if pipeline_version in FROZEN_DATA_BINDING_PIPELINE_VERSIONS:
+            version_label = pipeline_version.rsplit(".", 1)[-1]
+            raise PermanentJobError(
+                f"{version_label}数据集缺少冻结的industry_feature规格"
+            )
         normalized_industry_feature = normalize_industry_feature(
             None, default_enabled=False,
         )
@@ -340,7 +343,7 @@ def validate_job(payload: dict[str, Any]) -> dict[str, Any]:
         spec.get("research_target") or "stock_selection"
     ) != "stock_selection":
         raise PermanentJobError("大小盘轮动特征仅支持个股选股训练目标")
-    if pipeline_version == DATASET_PIPELINE_VERSION:
+    if pipeline_version in FROZEN_DATA_BINDING_PIPELINE_VERSIONS:
         try:
             data_bindings = normalize_frozen_training_data_bindings(
                 spec.get("data_bindings"),

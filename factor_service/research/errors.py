@@ -31,6 +31,18 @@ class TrainingTimeout(PermanentJobError):
     code = "training_timeout"
 
 
+class NodeMemoryBudgetExceeded(PermanentJobError):
+    code = "node_memory_budget_exceeded"
+
+
+class NodeOutOfMemory(PermanentJobError):
+    code = "node_out_of_memory"
+
+
+class NodeResourceUnavailable(PermanentJobError):
+    code = "node_resource_unavailable"
+
+
 class WorkerShutdown(RetryableJobError):
     code = "worker_shutdown"
 
@@ -58,4 +70,5 @@ def error_payload(exc: BaseException) -> dict[str, Any]:
 __all__ = [
     "JobCanceled", "JobError", "PermanentJobError", "RetryableJobError",
     "TrainingTimeout", "WorkerShutdown", "classify_exception", "error_payload",
+    "NodeMemoryBudgetExceeded", "NodeOutOfMemory", "NodeResourceUnavailable",
 ]

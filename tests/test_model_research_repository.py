@@ -348,7 +348,7 @@ def test_dataset_contract_locks_versions_and_lookahead_guards() -> None:
     assert spec["split"]["embargo_days"] == 5
     assert spec["availability"]["event_available_at_lte_signal_close"] is True
     assert spec["availability"]["source_available_at_lte_data_cutoff"] is True
-    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v8"
+    assert spec["pipeline_version"] == "alphablocks.dataset-pipeline.v9"
     assert spec["data_bindings"]["settings_revision"] == 0
     assert spec["sample_filters"] == {
         "minimum_listing_trading_days": 60,

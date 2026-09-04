@@ -21,7 +21,10 @@ from factor_service.research.industry_feature import (
     industry_feature_names,
     normalize_industry_feature,
 )
-from factor_service.research.preprocessing import normalize_feature_preprocessing
+from factor_service.research.preprocessing import (
+    DATASET_PIPELINE_VERSION,
+    normalize_feature_preprocessing,
+)
 from tests.research.utils import valid_inference_job
 
 
@@ -44,6 +47,7 @@ class _DatasetBuilder:
         self.industry_entities = industry_entities
         self.membership_calls = 0
         self.membership_kwargs: list[dict[str, Any]] = []
+        self.factor_kwargs: list[dict[str, Any]] = []
         self.industry_calls = 0
 
     def _membership(self, *_args: Any, **kwargs: Any) -> pd.DataFrame:
@@ -54,7 +58,8 @@ class _DatasetBuilder:
             "instrument": [f"{index:06d}.SZ" for index in range(len(self.values))],
         })
 
-    def _factor_values(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+    def _factor_values(self, *_args: Any, **kwargs: Any) -> pd.DataFrame:
+        self.factor_kwargs.append(kwargs)
         return pd.DataFrame({
             "trade_date": pd.to_datetime(["2024-12-31"] * len(self.values)),
             "instrument": [f"{index:06d}.SZ" for index in range(len(self.values))],
@@ -215,6 +220,7 @@ def test_daily_inference_applies_preprocessing_frozen_in_training_manifest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     job = valid_inference_job()
+    job["dataset_spec"]["pipeline_version"] = DATASET_PIPELINE_VERSION
     # The inference request intentionally omits the new field. The immutable
     # training manifest remains the source of truth for old scheduled jobs.
     manifest = _training_manifest(job, enabled=True)
@@ -250,6 +256,9 @@ def test_daily_inference_applies_preprocessing_frozen_in_training_manifest(
     assert {
         item["data_cutoff"] for item in runner.dataset_builder.membership_kwargs
     } == {"2024-12-31T08:00:00+00:00"}
+    assert runner.dataset_builder.factor_kwargs == [{
+        "deterministic_quantiles": True,
+    }]
     assert result.result["manifest"]["preprocessing"] == manifest["preprocessing"]
     assert (
         "training-identical same-date cross-sectional median, 1/99 winsorization and z-score"

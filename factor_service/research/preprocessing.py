@@ -10,7 +10,15 @@ import pandas as pd
 FEATURE_PREPROCESSING_SCHEMA_VERSION = (
     "alphablocks.cross-sectional-feature-preprocessing.v1"
 )
-DATASET_PIPELINE_VERSION = "alphablocks.dataset-pipeline.v8"
+DATASET_PIPELINE_VERSION = "alphablocks.dataset-pipeline.v9"
+FROZEN_DATA_BINDING_PIPELINE_VERSIONS = frozenset({
+    "alphablocks.dataset-pipeline.v8",
+    DATASET_PIPELINE_VERSION,
+})
+REQUIRED_PREPROCESSING_PIPELINE_VERSIONS = frozenset({
+    "alphablocks.dataset-pipeline.v6",
+    *FROZEN_DATA_BINDING_PIPELINE_VERSIONS,
+})
 LEGACY_DATASET_PIPELINE_VERSIONS = frozenset({
     "alphablocks.dataset-pipeline.v1",
     "alphablocks.dataset-pipeline.v2",
@@ -218,7 +226,9 @@ def _finite_fallback(value: Any) -> float:
 __all__ = [
     "DATASET_PIPELINE_VERSION",
     "FEATURE_PREPROCESSING_SCHEMA_VERSION",
+    "FROZEN_DATA_BINDING_PIPELINE_VERSIONS",
     "LEGACY_DATASET_PIPELINE_VERSIONS",
+    "REQUIRED_PREPROCESSING_PIPELINE_VERSIONS",
     "normalize_feature_preprocessing",
     "preprocess_feature_panel",
     "preprocess_qlib_frame",

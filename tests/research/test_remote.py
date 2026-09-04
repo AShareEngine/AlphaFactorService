@@ -11,13 +11,16 @@ import pytest
 from factor_service.research import remote as remote_module
 from factor_service.research.config import Settings
 from factor_service.research.job import CancellationToken
+from factor_service.research.errors import NodeMemoryBudgetExceeded, classify_exception
 from factor_service.research.remote import (
     RemoteResearchExecutor,
     RemoteTransport,
+    _effective_memory_usage_mb,
     _effective_remote_thread_count,
     _load_remote_result,
     _requested_job_threads,
     _remote_result_is_complete,
+    _raise_remote_resource_failure,
     _source_fingerprint,
     load_remote_nodes,
     remote_node_storage_payload,
@@ -229,6 +232,19 @@ def test_remote_transport_uses_portable_utf8_locale() -> None:
     assert completed.stdout.splitlines() == ["C.UTF-8", "C.UTF-8"]
 
 
+def test_effective_memory_usage_prefers_smaller_cgroup_limit() -> None:
+    total, used = _effective_memory_usage_mb(
+        [514_631, 34_669], [17_179_869_184, 1_073_741_824],
+    )
+
+    assert total == 16_384
+    assert used == 1_024
+
+
+def test_effective_memory_usage_uses_host_when_cgroup_is_unlimited() -> None:
+    assert _effective_memory_usage_mb([32_768, 2_048], [0, 0]) == (32_768, 2_048)
+
+
 def test_remote_transport_rsync_is_compatible_with_macos_openrsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -308,6 +324,48 @@ def test_remote_progress_reads_only_unseen_lines() -> None:
     assert "tail -n +1 --" in executor.transport.commands[0]
     assert "tail -n +3 --" in executor.transport.commands[1]
     assert [event[2]["step"] for event in events] == [1, 2, 3]
+
+
+def test_remote_resource_heartbeat_preserves_window_and_fresh_failure_details():
+    events = [
+        {"stage": "walk_forward_training", "percent": 66, "details": {"window_index": 19}},
+        {"stage": "resource_heartbeat", "percent": 0, "details": {"resources": {"available": 3}}},
+        {"stage": "node_memory_budget_exceeded", "percent": 66, "details": {"resources": {"available": 1}}},
+    ]
+    executor = object.__new__(RemoteResearchExecutor)
+    executor.node = SimpleNamespace(node_id="test")
+    executor.transport = SimpleNamespace(ssh=lambda *a, **k: subprocess.CompletedProcess(
+        [], 0, "\n".join(json.dumps(event) for event in events), "",
+    ))
+    forwarded = []
+    executor._forward_progress("/root/run", 0, cancellation=CancellationToken(), progress=lambda *args: forwarded.append(args))
+    assert forwarded[1][0] == "remote.walk_forward_training"
+    assert forwarded[1][1] == 66
+    assert forwarded[1][2]["window_index"] == 19
+    assert forwarded[1][2]["resources"]["available"] == 3
+    assert forwarded[2][2]["resources"]["available"] == 1
+
+
+def test_remote_memory_failure_has_nonretryable_actionable_code():
+    transport = SimpleNamespace(ssh=lambda *a, **k: subprocess.CompletedProcess(
+        [], 0, json.dumps({"error_code": "node_memory_budget_exceeded", "message": "内存预算不足"}), "",
+    ))
+    with pytest.raises(NodeMemoryBudgetExceeded, match="内存预算不足") as caught:
+        _raise_remote_resource_failure(transport, "/root/run", None)
+    assert classify_exception(caught.value) == (False, "node_memory_budget_exceeded")
+
+
+def test_remote_cpu_probe_prefers_affinity_aware_nproc():
+    commands = []
+    executor = object.__new__(RemoteResearchExecutor)
+
+    def ssh(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, "8\n", "")
+
+    executor.transport = SimpleNamespace(ssh=ssh)
+    assert executor._remote_cpu_cores(CancellationToken()) == 8
+    assert commands[0].startswith("nproc ")
 
 
 def test_remote_poll_recovers_from_one_timeout(

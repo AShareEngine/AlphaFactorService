@@ -7,9 +7,12 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import weakref
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from factor_service.research.dataset import PreparedDataset, walk_forward_segments
 from factor_service.research.models import _validation_indices
@@ -32,6 +35,8 @@ from factor_service.research.trainer import (
     _tune_tree_hyperparameters,
     _walk_forward_optuna_segments,
     _walk_forward_frame,
+    _run_walk_forward,
+    _prepare_model_for_serialization,
     predict_feature_frame,
 )
 
@@ -1258,7 +1263,7 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
                 "valid_sessions": 21, "test_sessions": 21, "step_sessions": 21,
                 "embargo_sessions": 5,
                 "oos_date_start": dates[300].date().isoformat(),
-                "oos_date_end": dates[320].date().isoformat(),
+                "oos_date_end": dates[362].date().isoformat(),
             },
             work_dir=root, model_id="walk_forward_test", model_version=1,
             model_kind="lightgbm",
@@ -1269,12 +1274,18 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
         )
         prediction = result.prediction
         report = result.report
-        assert len(prediction) == 84
+        assert len(prediction) == 252
         assert not prediction.index.duplicated().any()
-        assert report["window_count"] == 1
-        assert report["aggregate"]["test_days"] == 21
-        assert report["stability"]["status"] == "insufficient_windows"
-        assert report["stability"]["passed"] is False
+        assert report["window_count"] == 3
+        assert report["aggregate"]["test_days"] == 63
+        assert result.latest_model_params["num_threads"] == 1
+        for window in report["windows"]:
+            import pickle
+            folder = root / window["artifact"]["path"]
+            saved = pd.read_parquet(folder / "prediction.parquet")["prediction"]
+            pd.testing.assert_series_equal(saved, prediction.reindex(saved.index))
+            with (folder / "model.pkl").open("rb") as source:
+                assert pickle.load(source).model is not None
         assert report["orchestration"]["task_generator"].endswith("RollingGen")
         assert report["orchestration"]["trainer"].endswith("TrainerR")
         assert report["windows"][0]["qlib_recorder_id"]
@@ -1284,3 +1295,101 @@ def test_walk_forward_lightgbm_produces_real_oos_predictions() -> None:
         check=False, capture_output=True, text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+class _WindowObject:
+    pass
+
+
+@pytest.mark.parametrize("fail_at", [None, 19])
+def test_walk_forward_releases_old_windows_and_persists_before_next(
+    tmp_path, monkeypatch, fail_at,
+) -> None:
+    import qlib.model.trainer
+    import qlib.workflow
+    from factor_service.research import trainer
+
+    dates = pd.date_range("2020-01-01", periods=50)
+    index = pd.MultiIndex.from_product([dates, ["A", "B"]], names=["datetime", "instrument"])
+    raw = pd.DataFrame({("feature", "f"): 1.0, ("label", "LABEL0"): 0.1}, index=index)
+    windows = [{
+        "train": (str(dates[0].date()), str(dates[1].date())),
+        "valid": (str(dates[2].date()), str(dates[2].date())),
+        "test": (str(dates[i + 4].date()), str(dates[i + 4].date())),
+    } for i in range(37)]
+    prepared = PreparedDataset(raw, {}, ["f"], {}, {}, {}, raw_frame=raw)
+    refs = []
+    calls = []
+
+    def make_dataset(frame, segments, *args):
+        # A live reference to ANY older DatasetH fails before the next allocation.
+        assert all(ref() is None for ref in refs)
+        if calls:
+            previous = tmp_path / "walk_forward" / f"window_{len(calls):04d}"
+            assert (previous / "model.pkl").is_file()
+            assert (previous / "prediction.parquet").is_file()
+            assert (previous / "manifest.json").is_file()
+        dataset = _WindowObject()
+        dataset.frame, dataset.segments = frame, segments
+        refs.append(weakref.ref(dataset))
+        calls.append(segments)
+        return dataset
+
+    def fit(*args, **kwargs):
+        if len(calls) == fail_at:
+            raise RuntimeError("simulated training failure")
+
+    def predict(_model, _kind, dataset, segment, **kwargs):
+        start, end = dataset.segments[segment]
+        selected = dataset.frame.loc[pd.IndexSlice[start:end, :], :]
+        return pd.Series(0.1, index=selected.index)
+
+    class FakeTrainer:
+        def __init__(self, *, train_func, **kwargs):
+            self.train_func = train_func
+
+        def train(self, tasks):
+            return [self.train_func(task, "test") for task in tasks]
+
+        def end_train(self, recorders):
+            pass
+
+    recorder = SimpleNamespace(
+        start=lambda **kwargs: nullcontext(), uri_context=lambda _: nullcontext(),
+        log_params=lambda **kwargs: None, save_objects=lambda **kwargs: None,
+        get_recorder=lambda: SimpleNamespace(id=f"recorder-{len(calls)}"),
+    )
+    monkeypatch.setattr(qlib.model.trainer, "TrainerR", FakeTrainer)
+    monkeypatch.setattr(qlib.workflow, "R", recorder)
+    monkeypatch.setattr(trainer, "walk_forward_segments", lambda *a, **k: windows)
+    monkeypatch.setattr(trainer, "_walk_forward_frame", lambda *a: (raw.copy(), {"f": 1.0}))
+    monkeypatch.setattr(trainer, "_dataset_for_model", make_dataset)
+    monkeypatch.setattr(trainer, "_create_model", lambda *a: (_WindowObject(), {"n_estimators": 2}))
+    monkeypatch.setattr(trainer, "_fit_model", fit)
+    monkeypatch.setattr(trainer, "_predict_dataset", predict)
+    monkeypatch.setattr(trainer, "_metrics", lambda *a, **k: {"ic": 0.1, "rank_ic": 0.1, "rank_icir": 0.3, "test_days": 37})
+    kwargs = dict(
+        work_dir=tmp_path, model_id="memory-test", model_version=1,
+        model_kind="lightgbm", raw_params={},
+        DataHandlerLP=SimpleNamespace(from_df=lambda frame: frame), DatasetH=object,
+        recorder_uri="unused", experiment_name="test", cancellation=None, progress=None,
+    )
+    if fail_at:
+        with pytest.raises(RuntimeError, match="simulated training failure"):
+            _run_walk_forward(prepared, {}, **kwargs)
+        assert len(list((tmp_path / "walk_forward").glob("*/manifest.json"))) == 18
+    else:
+        result = _run_walk_forward(prepared, {}, **kwargs)
+        assert len(result.prediction) == 74
+        assert len(result.report["windows"]) == 37
+        assert sum(ref() is not None for ref in refs) == 1
+        assert refs[-1]() is result.latest_dataset
+
+
+def test_lightgbm_serialization_releases_native_dataset_without_changing_model():
+    calls = []
+    booster = SimpleNamespace(free_dataset=lambda: calls.append("freed"))
+    model = SimpleNamespace(model=booster)
+    _prepare_model_for_serialization("lightgbm", model)
+    assert calls == ["freed"]
+    assert model.model is booster

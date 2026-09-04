@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 from factor_service import repository
 from factor_service.clickhouse import client, settings
@@ -44,6 +44,18 @@ class FactorQueryPlan:
     date_start: date
     date_end: date
     params_hash: str
+
+
+@dataclass(frozen=True)
+class FactorScoreBatchPlan:
+    """One wide score query for factors sharing the same physical source."""
+
+    sql: str
+    params: dict
+    date_start: date
+    date_end: date
+    value_columns: tuple[str, ...]
+    params_hashes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -277,6 +289,7 @@ def build_factor_query_plan(
     date_end: Optional[date],
     job_id: str,
     source_binding: FactorSourceBinding | None = None,
+    deterministic_quantiles: bool = False,
 ) -> FactorQueryPlan:
     """Build the canonical factor SELECT without persisting factor values."""
     if factor.frequency != "daily":
@@ -305,6 +318,7 @@ def build_factor_query_plan(
     stock_type_column = _identifier(config.stock_basic_type_column, "stock basic type column")
 
     params = _formula_params(factor, overrides)
+    params_hash = _params_hash(factor.factor_id, factor.version, params)
     window = _positive_int(params.get("window", 20), "window")
     source = f"{source_db}.{source_table}"
     stock_basic = f"{stock_basic_db}.{stock_basic_table}"
@@ -328,10 +342,31 @@ def build_factor_query_plan(
         value_plan.sql,
         output_type=factor.output_type,
         processing=processing,
+        deterministic_quantiles=deterministic_quantiles,
+        deterministic_quantile_salt=params_hash,
     )
     if source_binding is not None:
-        date_start = source_binding.date_start
-        date_end = source_binding.date_end
+        # A source binding describes the physical range available to the
+        # query, but callers may intentionally request a smaller output
+        # window from that shared source.  In particular DatasetBuild stages
+        # one complete source range and then evaluates bounded output chunks.
+        # Overwriting the explicit chunk here makes every chunk recalculate
+        # the complete dataset and duplicates all returned factor rows.
+        date_start = date_start or source_binding.date_start
+        date_end = date_end or source_binding.date_end
+        if (
+            date_start < source_binding.date_start
+            or date_end > source_binding.date_end
+        ):
+            raise ValueError(
+                "因子查询日期超出暂存数据范围: "
+                f"{date_start.isoformat()} 至 {date_end.isoformat()}，"
+                "暂存范围为"
+                f"{source_binding.date_start.isoformat()} 至 "
+                f"{source_binding.date_end.isoformat()}"
+            )
+        if date_start > date_end:
+            raise ValueError("开始日期不能晚于结束日期")
     else:
         date_start, date_end = _resolve_date_range(
             date_start, date_end, source_db, source_table, date_column,
@@ -340,7 +375,6 @@ def build_factor_query_plan(
     source_start = date_start - timedelta(days=lookback_days)
     _ensure_source_columns(source_db, source_table, [code_column, date_column, *value_plan.fields])
     _ensure_source_has_rows(source, date_column, source_start, date_end)
-    params_hash = _params_hash(factor.factor_id, factor.version, params)
     source_vintage = (
         f"{source_binding.source_vintage}#{job_id}"
         if source_binding is not None
@@ -374,6 +408,312 @@ def build_factor_query_plan(
         date_end=date_end,
         params_hash=params_hash,
     )
+
+
+def build_factor_score_batch_plan(
+    items: Sequence[tuple[FactorOut, dict[str, Any]]],
+    *,
+    entity_type: str,
+    date_start: Optional[date],
+    date_end: Optional[date],
+    source_binding: FactorSourceBinding,
+) -> FactorScoreBatchPlan:
+    """Compile multiple model-input scores into one source scan.
+
+    Every factor retains its own formula, winsorization and standardization.
+    The only shared work is the physical source scan and output key columns.
+    """
+
+    if not items:
+        raise ValueError("批量因子查询至少需要一个因子")
+    config = settings()
+    source_db = _identifier(source_binding.database, "source database")
+    source_table = _identifier(source_binding.table, "stock daily table")
+    code_column = _identifier(source_binding.code_column, "stock code column")
+    date_column = _identifier(source_binding.date_column, "stock date column")
+    stock_basic_db = _identifier(config.source_database, "stock basic database")
+    stock_basic_table = _identifier(config.stock_basic_table, "stock basic table")
+    stock_type_column = _identifier(
+        config.stock_basic_type_column, "stock basic type column",
+    )
+    resolved_start = date_start or source_binding.date_start
+    resolved_end = date_end or source_binding.date_end
+    if (
+        resolved_start < source_binding.date_start
+        or resolved_end > source_binding.date_end
+    ):
+        raise ValueError(
+            "批量因子查询日期超出暂存数据范围: "
+            f"{resolved_start.isoformat()} 至 {resolved_end.isoformat()}，"
+            "暂存范围为"
+            f"{source_binding.date_start.isoformat()} 至 "
+            f"{source_binding.date_end.isoformat()}"
+        )
+    if resolved_start > resolved_end:
+        raise ValueError("开始日期不能晚于结束日期")
+
+    compiled_items: list[dict[str, Any]] = []
+    required_fields: set[str] = set()
+    max_window = 1
+    for index, (factor, overrides) in enumerate(items):
+        if factor.frequency != "daily":
+            raise ValueError(
+                "分钟因子必须由分钟计算器写入，批量查询只接受daily因子"
+            )
+        if factor.entity_type != entity_type:
+            raise ValueError(
+                f"批量因子{factor.factor_id}的实体类型不是{entity_type}"
+            )
+        formula_params = _formula_params(factor, overrides)
+        window = _positive_int(formula_params.get("window", 20), "window")
+        compiled = compile_qlib_formula(
+            factor.expression,
+            params={**formula_params, "window": window},
+            code_column=code_column,
+            date_column=date_column,
+        )
+        processing = _postprocess_config(factor)
+        params_hash = _params_hash(
+            factor.factor_id, factor.version, formula_params,
+        )
+        required_fields.update(compiled.fields)
+        max_window = max(max_window, compiled.max_window)
+        compiled_items.append({
+            "alias": f"factor_{index}",
+            "sql": compiled.sql,
+            "output_type": factor.output_type,
+            "processing": processing,
+            "params_hash": params_hash,
+        })
+
+    source = f"{source_db}.{source_table}"
+    stock_basic = f"{stock_basic_db}.{stock_basic_table}"
+    source_start = resolved_start - timedelta(
+        days=max(max_window * 4 + 20, 90),
+    )
+    _ensure_source_columns(
+        source_db, source_table,
+        [code_column, date_column, *sorted(required_fields)],
+    )
+    _ensure_source_has_rows(source, date_column, source_start, resolved_end)
+    sql = _build_factor_score_batch_sql(
+        compiled_items,
+        source=source,
+        stock_basic=stock_basic,
+        code_column=code_column,
+        date_column=date_column,
+        stock_type_column=stock_type_column,
+    )
+    return FactorScoreBatchPlan(
+        sql=sql,
+        params={
+            "date_start": resolved_start,
+            "date_end": resolved_end,
+            "source_start": source_start,
+            "stock_type_value": config.stock_basic_stock_type_value,
+        },
+        date_start=resolved_start,
+        date_end=resolved_end,
+        value_columns=tuple(item["alias"] for item in compiled_items),
+        params_hashes=tuple(item["params_hash"] for item in compiled_items),
+    )
+
+
+def _build_factor_score_batch_sql(
+    items: Sequence[dict[str, Any]],
+    *,
+    source: str,
+    stock_basic: str,
+    code_column: str,
+    date_column: str,
+    stock_type_column: str,
+) -> str:
+    raw_columns = ",\n            ".join(
+        f"toFloat64({item['sql']}) AS raw_{index}"
+        for index, item in enumerate(items)
+    )
+    clean_columns = ",\n            ".join(
+        f"if(isNull(raw_{index}) OR NOT isFinite(raw_{index}), "
+        f"NULL, raw_{index}) AS raw_{index}"
+        for index in range(len(items))
+    )
+    center_columns: list[str] = []
+    for index, item in enumerate(items):
+        processing = item["processing"]
+        if processing.winsorize == "quantile":
+            determinator = (
+                "cityHash64(entity_code, "
+                f"'{item['params_hash']}')"
+            )
+            center_columns.extend([
+                f"quantileDeterministic(0.01)(raw_{index}, "
+                f"{determinator}) OVER "
+                f"(PARTITION BY trade_date) AS lower_{index}",
+                f"quantileDeterministic(0.99)(raw_{index}, "
+                f"{determinator}) OVER "
+                f"(PARTITION BY trade_date) AS upper_{index}",
+            ])
+        elif processing.winsorize in {"median", "mad"}:
+            center_columns.append(
+                f"median(raw_{index}) OVER "
+                f"(PARTITION BY trade_date) AS center_{index}"
+            )
+    centers_projection = (
+        "*,\n            " + ",\n            ".join(center_columns)
+        if center_columns else "*"
+    )
+    dispersion_columns = [
+        f"median(abs(raw_{index} - center_{index})) OVER "
+        f"(PARTITION BY trade_date) * 1.4826 AS robust_sigma_{index}"
+        for index, item in enumerate(items)
+        if item["processing"].winsorize in {"median", "mad"}
+    ]
+    dispersions_projection = (
+        "*,\n            " + ",\n            ".join(dispersion_columns)
+        if dispersion_columns else "*"
+    )
+    processed_columns: list[str] = []
+    for index, item in enumerate(items):
+        processing = item["processing"]
+        if item["output_type"] == "boolean" or processing.winsorize == "none":
+            expression = f"raw_{index}"
+        elif processing.winsorize == "quantile":
+            expression = (
+                f"least(greatest(raw_{index}, lower_{index}), upper_{index})"
+            )
+        else:
+            multiple = 5.0 if processing.winsorize == "median" else 3.0
+            expression = (
+                f"if(robust_sigma_{index} = 0, raw_{index}, "
+                f"least(greatest(raw_{index}, center_{index} - "
+                f"{multiple} * robust_sigma_{index}), center_{index} + "
+                f"{multiple} * robust_sigma_{index}))"
+            )
+        processed_columns.append(
+            f"if(isNull(raw_{index}), NULL, {expression}) "
+            f"AS processed_{index}"
+        )
+    rank_columns: list[str] = []
+    for index, item in enumerate(items):
+        processing = item["processing"]
+        if processing.standardize not in {"rank", "quantile"}:
+            continue
+        order = "ASC" if processing.direction == "asc" else "DESC"
+        rank_columns.extend([
+            f"rank() OVER (PARTITION BY trade_date ORDER BY raw_{index} "
+            f"{order} NULLS LAST) AS percentile_rank_{index}",
+            f"count(raw_{index}) OVER "
+            f"(PARTITION BY trade_date) AS valid_count_{index}",
+        ])
+    ranked_projection = (
+        "*,\n            " + ",\n            ".join(rank_columns)
+        if rank_columns else "*"
+    )
+    statistic_columns: list[str] = []
+    for index, item in enumerate(items):
+        if (
+            item["output_type"] != "boolean"
+            and item["processing"].standardize == "zscore"
+        ):
+            statistic_columns.extend([
+                f"avg(processed_{index}) OVER "
+                f"(PARTITION BY trade_date) AS processed_mean_{index}",
+                f"stddevPop(processed_{index}) OVER "
+                f"(PARTITION BY trade_date) AS processed_stddev_{index}",
+            ])
+    statistics_projection = (
+        "*,\n            " + ",\n            ".join(statistic_columns)
+        if statistic_columns else "*"
+    )
+    score_columns: list[str] = []
+    for index, item in enumerate(items):
+        processing = item["processing"]
+        percentile = (
+            f"if(valid_count_{index} <= 1, 0.0, "
+            f"(percentile_rank_{index} - 1) / (valid_count_{index} - 1))"
+        )
+        if item["output_type"] == "boolean":
+            score = f"raw_{index}"
+        elif processing.standardize == "quantile":
+            score = (
+                f"least(floor(({percentile}) * {processing.quantiles}) + 1, "
+                f"{processing.quantiles})"
+            )
+        elif processing.standardize == "rank":
+            score = percentile
+        elif processing.standardize == "none":
+            score = f"processed_{index}"
+        else:
+            score = (
+                f"if(processed_stddev_{index} = 0, 0.0, "
+                f"(processed_{index} - processed_mean_{index}) / "
+                f"processed_stddev_{index})"
+            )
+        score_columns.append(
+            f"if(isNull(raw_{index}), NULL, toFloat64({score})) AS "
+            f"{item['alias']}"
+        )
+    any_value = " OR ".join(
+        f"raw_{index} IS NOT NULL" for index in range(len(items))
+    )
+    return f"""
+    WITH
+    raw_values AS (
+        SELECT
+            {date_column} AS trade_date,
+            {code_column} AS entity_code,
+            {raw_columns}
+        FROM {source}
+        WHERE {date_column} >= {{source_start:Date}}
+          AND {date_column} <= {{date_end:Date}}
+          AND {code_column} IN (
+              SELECT {code_column}
+              FROM {stock_basic}
+              WHERE {stock_type_column} = {{stock_type_value:String}}
+          )
+    ),
+    clean_values AS (
+        SELECT
+            trade_date,
+            entity_code,
+            {clean_columns}
+        FROM raw_values
+    ),
+    center_values AS (
+        SELECT
+            {centers_projection}
+        FROM clean_values
+    ),
+    dispersion_values AS (
+        SELECT
+            {dispersions_projection}
+        FROM center_values
+    ),
+    processed_values AS (
+        SELECT
+            *,
+            {', '.join(processed_columns)}
+        FROM dispersion_values
+    ),
+    ranked_values AS (
+        SELECT
+            {ranked_projection}
+        FROM processed_values
+    ),
+    statistic_values AS (
+        SELECT
+            {statistics_projection}
+        FROM ranked_values
+    )
+    SELECT
+        trade_date,
+        entity_code,
+        {', '.join(score_columns)}
+    FROM statistic_values
+    WHERE trade_date >= {{date_start:Date}}
+      AND trade_date <= {{date_end:Date}}
+      AND ({any_value})
+    """
 
 
 def _postprocess_config(factor: FactorOut) -> PostprocessConfig:
@@ -444,6 +784,8 @@ def _build_postprocessed_sql(
     *,
     output_type: str,
     processing: PostprocessConfig,
+    deterministic_quantiles: bool = False,
+    deterministic_quantile_salt: str = "",
 ) -> str:
     """Add daily cross-sectional rank, percentile and model-ready score."""
     raw_cte = f"""
@@ -462,14 +804,29 @@ def _build_postprocessed_sql(
         )
         """
     elif processing.winsorize == "quantile":
-        winsor_ctes = """
+        salt = re.sub(
+            r"[^A-Za-z0-9_-]", "", deterministic_quantile_salt,
+        )
+        determinator = (
+            f"cityHash64(entity_code, '{salt}')"
+            if salt else "cityHash64(entity_code)"
+        )
+        lower_quantile = (
+            f"quantileDeterministic(0.01)(raw_value, {determinator})"
+            if deterministic_quantiles else "quantile(0.01)(raw_value)"
+        )
+        upper_quantile = (
+            f"quantileDeterministic(0.99)(raw_value, {determinator})"
+            if deterministic_quantiles else "quantile(0.99)(raw_value)"
+        )
+        winsor_ctes = f"""
         bounds AS (
             SELECT
                 trade_date,
                 entity_code,
                 raw_value,
-                quantile(0.01)(raw_value) OVER (PARTITION BY trade_date) AS lower_bound,
-                quantile(0.99)(raw_value) OVER (PARTITION BY trade_date) AS upper_bound
+                {lower_quantile} OVER (PARTITION BY trade_date) AS lower_bound,
+                {upper_quantile} OVER (PARTITION BY trade_date) AS upper_bound
             FROM raw_values
         ),
         processed_values AS (

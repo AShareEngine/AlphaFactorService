@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from factor_service.research import dataset as dataset_module
 from factor_service.research.dataset import (
     DatasetBuilder,
+    _assemble_factor_feature_matrix,
     _future_direction_label,
     _future_rank_label,
     _industry_features,
@@ -973,7 +974,9 @@ def test_factor_query_chunks_long_ranges_without_losing_boundaries(monkeypatch) 
     assert len(frame) == 6
 
 
-def test_entity_asset_batch_stages_same_source_once(monkeypatch) -> None:
+def test_entity_asset_batch_stages_same_source_once_across_output_chunks(
+    monkeypatch,
+) -> None:
     class _Client:
         def query(self, query, parameters):
             if "SELECT DISTINCT toDate(trade_time)" in query:
@@ -981,9 +984,11 @@ def test_entity_asset_batch_stages_same_source_once(monkeypatch) -> None:
                     (pd.Timestamp("2024-01-02"),),
                     (pd.Timestamp("2024-01-03"),),
                 ])
-            score = float(parameters["score"])
             return SimpleNamespace(result_rows=[
-                (pd.Timestamp("2024-01-03"), "000001.SZ", score),
+                (
+                    pd.Timestamp(parameters["output_date"]),
+                    "000001.SZ", 1.0, 2.0,
+                ),
             ])
 
     builder = DatasetBuilder.__new__(DatasetBuilder)
@@ -1018,13 +1023,21 @@ def test_entity_asset_batch_stages_same_source_once(monkeypatch) -> None:
         dataset_module, "compile_qlib_formula",
         lambda *_args, **_kwargs: SimpleNamespace(max_window=20),
     )
-    monkeypatch.setattr(
-        dataset_module, "build_factor_query_plan",
-        lambda factor, **_kwargs: SimpleNamespace(
+    planned_ranges = []
+
+    def fake_plan(factors, **kwargs):
+        planned_ranges.append((
+            kwargs["date_start"], kwargs["date_end"],
+        ))
+        return SimpleNamespace(
             sql="SELECT score",
-            params={"score": 1 if factor.factor_id == "factor_a" else 2},
-            params_hash="a" * 64 if factor.factor_id == "factor_a" else "b" * 64,
-        ),
+            params={"output_date": kwargs["date_start"]},
+            value_columns=("factor_0", "factor_1"),
+            params_hashes=("a" * 64, "b" * 64),
+        )
+
+    monkeypatch.setattr(
+        dataset_module, "build_factor_score_batch_plan", fake_plan,
     )
     factors = [
         SimpleNamespace(
@@ -1040,26 +1053,35 @@ def test_entity_asset_batch_stages_same_source_once(monkeypatch) -> None:
     ]
     items = [
         ({
-            "factor_id": "factor_a", "params": {},
+            "factor_id": "factor_a", "factor_version": 1, "params": {},
             "params_hash": "a" * 64,
         }, factors[0]),
         ({
-            "factor_id": "factor_b", "params": {},
+            "factor_id": "factor_b", "factor_version": 1, "params": {},
             "params_hash": "b" * 64,
         }, factors[1]),
     ]
 
-    frames = builder._factor_values_batch(
+    frame = builder._factor_values_batch(
         items,
-        pd.Timestamp("2024-01-03 15:00:00").to_pydatetime(),
+        pd.Timestamp("2025-01-03 15:00:00").to_pydatetime(),
         "2024-01-02",
-        "2024-01-03",
+        "2025-01-03",
+        deterministic_wide=True,
     )
 
     assert len(staged_calls) == 1
     assert staged_calls[0]["fields"] == ["amount", "close", "volume"]
-    assert frames[("factor_a", "a" * 64)]["value"].tolist() == [1.0]
-    assert frames[("factor_b", "b" * 64)]["value"].tolist() == [2.0]
+    assert staged_calls[0]["date_end"].isoformat() == "2025-01-03"
+    assert planned_ranges == [
+        (pd.Timestamp("2024-01-02").date(), pd.Timestamp("2025-01-01").date()),
+        (pd.Timestamp("2025-01-02").date(), pd.Timestamp("2025-01-03").date()),
+    ]
+    assert frame["factor_a__v1__aaaaaaaa"].tolist() == [1.0, 1.0]
+    assert frame["factor_b__v1__bbbbbbbb"].tolist() == [2.0, 2.0]
+    assert frame["trade_date"].tolist() == [
+        pd.Timestamp("2024-01-02"), pd.Timestamp("2025-01-02"),
+    ]
 
 
 def test_entity_asset_batch_groups_stock_composite_assets() -> None:
@@ -1074,6 +1096,57 @@ def test_entity_asset_batch_groups_stock_composite_assets() -> None:
 
     assert dataset_module._entity_asset_batch_key(daily) == "stock"
     assert dataset_module._entity_asset_batch_key(fundamentals) == "stock"
+
+
+def test_factor_feature_matrix_joins_all_columns_once_in_expected_order() -> None:
+    expected = pd.DataFrame([
+        {"trade_date": pd.Timestamp("2024-01-02"), "instrument": "A"},
+        {"trade_date": pd.Timestamp("2024-01-02"), "instrument": "B"},
+        {"trade_date": pd.Timestamp("2024-01-03"), "instrument": "A"},
+    ])
+    first = pd.DataFrame([
+        {
+            "trade_date": pd.Timestamp("2024-01-02"),
+            "instrument": "A", "factor_a": 1.0,
+        },
+        {
+            "trade_date": pd.Timestamp("2024-01-03"),
+            "instrument": "A", "factor_a": 3.0,
+        },
+    ])
+    second = pd.DataFrame([
+        {
+            "trade_date": pd.Timestamp("2024-01-02"),
+            "instrument": "B", "factor_b": 2.0,
+        },
+    ])
+
+    result = _assemble_factor_feature_matrix(expected, [first, second])
+
+    assert result[["trade_date", "instrument"]].equals(expected)
+    assert result["factor_a"].tolist()[:1] == [1.0]
+    assert pd.isna(result.loc[1, "factor_a"])
+    assert result.loc[1, "factor_b"] == 2.0
+    assert pd.isna(result.loc[2, "factor_b"])
+
+
+def test_factor_feature_matrix_rejects_duplicate_factor_keys() -> None:
+    expected = pd.DataFrame([{
+        "trade_date": pd.Timestamp("2024-01-02"), "instrument": "A",
+    }])
+    duplicated = pd.DataFrame([
+        {
+            "trade_date": pd.Timestamp("2024-01-02"),
+            "instrument": "A", "factor_a": 1.0,
+        },
+        {
+            "trade_date": pd.Timestamp("2024-01-02"),
+            "instrument": "A", "factor_a": 2.0,
+        },
+    ])
+
+    with pytest.raises(ValueError, match="重复日期与股票键"):
+        _assemble_factor_feature_matrix(expected, [duplicated])
 
 
 def test_factor_query_rejects_changed_frozen_params(monkeypatch) -> None:

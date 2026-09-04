@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from hashlib import sha256
 import json
 import math
@@ -42,6 +42,7 @@ from factor_service.research.data_binding_source import (
     load_bound_universe_filter_membership,
 )
 from factor_service.research.preprocessing import (
+    DATASET_PIPELINE_VERSION,
     LEGACY_DATASET_PIPELINE_VERSIONS,
     normalize_feature_preprocessing,
     preprocess_feature_panel,
@@ -72,7 +73,11 @@ from factor_service.research.universe_field_filter import (
     normalize_universe_field_filters,
 )
 from factor_service.schemas import FactorOut
-from factor_service.worker import build_factor_query_plan, factor_query_source
+from factor_service.worker import (
+    build_factor_query_plan,
+    build_factor_score_batch_plan,
+    factor_query_source,
+)
 
 
 FACTOR_COMPUTED_CUTOFF = "computed_at <= {cutoff:DateTime}"
@@ -269,6 +274,10 @@ class DatasetBuilder:
             and str(spec.get("pipeline_version") or "")
             in LEGACY_DATASET_PIPELINE_VERSIONS
         )
+        deterministic_factor_batch = (
+            str(spec.get("pipeline_version") or "")
+            == DATASET_PIPELINE_VERSION
+        )
         _checkpoint(cancellation)
         _progress(progress, "building_membership", 6, {})
         universe_id = str(spec.get("universe_id") or "csi500")
@@ -307,7 +316,7 @@ class DatasetBuilder:
             group_key = _entity_asset_batch_key(factor)
             if group_key:
                 entity_asset_groups.setdefault(group_key, []).append((item, factor))
-        batched_frames: dict[tuple[str, str], pd.DataFrame] = {}
+        batched_frames: dict[str, pd.DataFrame] = {}
         loaded_groups: set[str] = set()
         for index, item in enumerate(factors, start=1):
             _checkpoint(cancellation)
@@ -318,10 +327,9 @@ class DatasetBuilder:
             factor = resolved_factors[index - 1]
             group_key = _entity_asset_batch_key(factor)
             group = entity_asset_groups.get(group_key, [])
-            frame_key = (name, str(item.get("params_hash") or ""))
             if group_key and len(group) > 1:
                 if group_key not in loaded_groups:
-                    batched_frames.update(self._factor_values_batch(
+                    batched_frames[group_key] = self._factor_values_batch(
                         group,
                         cutoff_for_clickhouse,
                         date_start,
@@ -335,14 +343,20 @@ class DatasetBuilder:
                         ),
                         cancellation=cancellation,
                         progress=progress,
-                    ))
+                        deterministic_wide=deterministic_factor_batch,
+                    )
                     loaded_groups.add(group_key)
-                frame = batched_frames[frame_key]
+                feature_name = _feature_name(item)
+                frame = batched_frames[group_key][
+                    ["trade_date", "instrument", feature_name]
+                ].rename(columns={feature_name: "value"})
+                frame = frame.dropna(subset=["value"])
             else:
                 frame = self._factor_values(
                     item, cutoff_for_clickhouse, date_start, date_end,
                     cancellation=cancellation,
                     resolved_factor=factor,
+                    deterministic_quantiles=deterministic_factor_batch,
                 )
             frame = frame.merge(expected, on=["trade_date", "instrument"], how="inner")
             actual_coverage = frame[["trade_date", "instrument"]].drop_duplicates().shape[0] / expected_count
@@ -360,9 +374,7 @@ class DatasetBuilder:
                 preprocessing_excluded_features.append(feature_name)
             feature_frames.append(frame.rename(columns={"value": feature_name}))
         _checkpoint(cancellation)
-        features = expected.copy()
-        for frame in feature_frames:
-            features = features.merge(frame, on=["trade_date", "instrument"], how="left")
+        features = _assemble_factor_feature_matrix(expected, feature_frames)
         if size_rotation_feature["enabled"]:
             if str(spec.get("research_target") or "stock_selection") != "stock_selection":
                 raise ValueError("大小盘轮动特征仅支持个股选股训练目标")
@@ -621,6 +633,7 @@ class DatasetBuilder:
             )
         manifest = {
             "schema_version": "alphablocks.qlib-dataset.v1",
+            "pipeline_version": str(spec.get("pipeline_version") or ""),
             "dataset_hash": str(job.get("dataset_hash") or ""),
             "row_count": len(indexed),
             "instrument_count": int(indexed.index.get_level_values("instrument").nunique()),
@@ -1495,6 +1508,7 @@ class DatasetBuilder:
         *,
         cancellation: CancellationToken | None = None,
         resolved_factor: FactorOut | None = None,
+        deterministic_quantiles: bool = False,
     ) -> pd.DataFrame:
         signal_close = datetime.combine(
             pd.Timestamp(date_end).date(), datetime.min.time(),
@@ -1534,6 +1548,7 @@ class DatasetBuilder:
                     date_end=chunk_end,
                     job_id="model-dataset",
                     source_binding=source_binding,
+                    deterministic_quantiles=deterministic_quantiles,
                 )
                 if not entity_field and plan.params_hash != expected_hash:
                     raise ValueError(
@@ -1571,7 +1586,8 @@ class DatasetBuilder:
         stage_key: str = "model-dataset",
         cancellation: CancellationToken | None = None,
         progress: ProgressCallback | None = None,
-    ) -> dict[tuple[str, str], pd.DataFrame]:
+        deterministic_wide: bool = False,
+    ) -> pd.DataFrame:
         """Stage one composite entity asset once for all same-source factors."""
         signal_close = datetime.combine(
             pd.Timestamp(date_end).date(), datetime.min.time(),
@@ -1600,17 +1616,13 @@ class DatasetBuilder:
             lookback_days = max(
                 lookback_days, compiled.max_window * 4 + 20,
             )
-        rows_by_factor: dict[tuple[str, str], list[tuple[Any, ...]]] = {
-            (
-                str(item["factor_id"]),
-                str(item.get("params_hash") or ""),
-            ): []
-            for item, _factor in items
-        }
+        output_frames: list[pd.DataFrame] = []
         chunk_start = pd.Timestamp(date_start).date()
         final_end = pd.Timestamp(date_end).date()
-        # A wider chunk keeps rolling lookback overlap bounded while the
-        # staged table remains small enough for one year of all-A daily data.
+        # Query output remains chunked, but the governed source is staged once
+        # for the complete dataset range. The range stage stores financial
+        # state changes sparsely and is therefore no longer multiplied by the
+        # number of yearly output chunks.
         chunk_days = max(366, int(self.factor_query_chunk_days))
         chunk_count = max(
             1,
@@ -1624,97 +1636,205 @@ class DatasetBuilder:
         source_table = _sql_identifier(
             str(factor_settings.stock_daily_table), "stock_daily_table",
         )
-        while chunk_start <= final_end:
-            _checkpoint(cancellation)
-            chunk_index += 1
-            chunk_end = min(
-                chunk_start + timedelta(days=chunk_days - 1), final_end,
+        source_start = chunk_start - timedelta(days=lookback_days)
+        trading_rows = self.client.query(
+            f"""
+            SELECT DISTINCT toDate(trade_time) AS trade_date
+            FROM {source_database}.{source_table}
+            WHERE toDate(trade_time) >= {{date_start:Date}}
+              AND toDate(trade_time) <= {{date_end:Date}}
+            ORDER BY trade_date
+            """,
+            parameters={
+                "date_start": source_start,
+                "date_end": final_end,
+            },
+        ).result_rows
+        trading_dates = [pd.Timestamp(row[0]).date() for row in trading_rows]
+        _progress(progress, "loading_factor_source_batch", 8, {
+            "factor_ids": [
+                str(item["factor_id"]) for item, _factor in items
+            ],
+            "field_count": len(fields),
+            "chunk_index": 0,
+            "chunk_count": chunk_count,
+            "source_stage_count": 1,
+        })
+        with staged_entity_asset_source(
+            db_client=self.client,
+            database=self.settings.factor_database,
+            api_base_url=self.settings.data_sdk_api_base_url,
+            timeout_seconds=self.settings.data_sdk_query_timeout_seconds,
+            concurrency=self.settings.data_sdk_query_concurrency,
+            entity_id="stock",
+            fields=fields,
+            trading_dates=trading_dates,
+            date_start=pd.Timestamp(date_start).date(),
+            date_end=final_end,
+            job_id="model-dataset-batch",
+            data_cutoff=data_cutoff,
+            stage_key=f"{stage_key}:{date_start}:{date_end}",
+        ) as source_binding:
+            while chunk_start <= final_end:
+                _checkpoint(cancellation)
+                chunk_index += 1
+                chunk_end = min(
+                    chunk_start + timedelta(days=chunk_days - 1), final_end,
+                )
+                _progress(progress, "loading_factor_source_batch", 8, {
+                    "factor_ids": [
+                        str(item["factor_id"]) for item, _factor in items
+                    ],
+                    "field_count": len(fields),
+                    "chunk_index": chunk_index,
+                    "chunk_count": chunk_count,
+                    "source_stage_count": 1,
+                })
+                _checkpoint(cancellation)
+                if deterministic_wide:
+                    output_frames.append(self._factor_values_wide_chunk(
+                        items,
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        source_binding=source_binding,
+                    ))
+                else:
+                    output_frames.append(self._factor_values_legacy_chunk(
+                        items,
+                        chunk_start=chunk_start,
+                        chunk_end=chunk_end,
+                        source_binding=source_binding,
+                        cancellation=cancellation,
+                    ))
+                chunk_start = chunk_end + timedelta(days=1)
+        columns = [
+            "trade_date", "instrument",
+            *(_feature_name(item) for item, _factor in items),
+        ]
+        frame = (
+            pd.concat(output_frames, ignore_index=True, sort=False)
+            if output_frames else pd.DataFrame(columns=columns)
+        )
+        if frame.empty:
+            return frame
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+        for column in columns[2:]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        duplicated = frame.duplicated(
+            ["trade_date", "instrument"], keep=False,
+        )
+        if duplicated.any():
+            sample = frame.loc[
+                duplicated, ["trade_date", "instrument"]
+            ].head(5)
+            raise ValueError(
+                "批量因子查询返回重复日期与股票键: "
+                + ", ".join(
+                    f"{row.trade_date.date().isoformat()}/{row.instrument}"
+                    for row in sample.itertuples(index=False)
+                )
             )
-            source_start = chunk_start - timedelta(days=lookback_days)
-            trading_rows = self.client.query(
-                f"""
-                SELECT DISTINCT toDate(trade_time) AS trade_date
-                FROM {source_database}.{source_table}
-                WHERE toDate(trade_time) >= {{date_start:Date}}
-                  AND toDate(trade_time) <= {{date_end:Date}}
-                ORDER BY trade_date
-                """,
-                parameters={
-                    "date_start": source_start,
-                    "date_end": chunk_end,
-                },
-            ).result_rows
-            trading_dates = [
-                pd.Timestamp(row[0]).date() for row in trading_rows
+        return frame[columns]
+
+    def _factor_values_wide_chunk(
+        self,
+        items: list[tuple[dict[str, Any], FactorOut]],
+        *,
+        chunk_start: date,
+        chunk_end: date,
+        source_binding: Any,
+    ) -> pd.DataFrame:
+        plan = build_factor_score_batch_plan(
+            [
+                (factor, dict(item["params"]))
+                for item, factor in items
+            ],
+            entity_type="stock",
+            date_start=chunk_start,
+            date_end=chunk_end,
+            source_binding=source_binding,
+        )
+        expected_hashes = tuple(
+            str(item.get("params_hash") or "").strip().lower()
+            for item, _factor in items
+        )
+        if plan.params_hashes != expected_hashes:
+            changed = [
+                str(item["factor_id"])
+                for (item, _factor), actual, expected in zip(
+                    items, plan.params_hashes, expected_hashes,
+                    strict=True,
+                )
+                if actual != expected
             ]
-            _progress(progress, "loading_factor_source_batch", 8, {
-                "factor_ids": [
-                    str(item["factor_id"]) for item, _factor in items
-                ],
-                "field_count": len(fields),
-                "chunk_index": chunk_index,
-                "chunk_count": chunk_count,
-            })
-            with staged_entity_asset_source(
-                db_client=self.client,
-                database=self.settings.factor_database,
-                api_base_url=self.settings.data_sdk_api_base_url,
-                timeout_seconds=self.settings.data_sdk_query_timeout_seconds,
-                concurrency=self.settings.data_sdk_query_concurrency,
-                entity_id="stock",
-                fields=fields,
-                trading_dates=trading_dates,
+            raise ValueError(
+                "冻结因子的params_hash与公式参数不一致: "
+                + ", ".join(changed)
+            )
+        values = self.client.query(
+            plan.sql, parameters=plan.params,
+        ).result_rows
+        return pd.DataFrame(
+            values,
+            columns=["trade_date", "instrument", *plan.value_columns],
+        ).rename(columns={
+            column: _feature_name(item)
+            for column, (item, _factor) in zip(
+                plan.value_columns, items, strict=True,
+            )
+        })
+
+    def _factor_values_legacy_chunk(
+        self,
+        items: list[tuple[dict[str, Any], FactorOut]],
+        *,
+        chunk_start: date,
+        chunk_end: date,
+        source_binding: Any,
+        cancellation: CancellationToken | None,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for item, factor in items:
+            _checkpoint(cancellation)
+            plan = build_factor_query_plan(
+                factor,
+                overrides=dict(item["params"]),
+                entity_type="stock",
                 date_start=chunk_start,
                 date_end=chunk_end,
-                job_id="model-dataset-batch",
-                data_cutoff=data_cutoff,
-                stage_key=(
-                    f"{stage_key}:{chunk_start.isoformat()}:{chunk_end.isoformat()}"
-                ),
-            ) as source_binding:
-                for item, factor in items:
-                    _checkpoint(cancellation)
-                    params = dict(item["params"])
-                    plan = build_factor_query_plan(
-                        factor,
-                        overrides=params,
-                        entity_type="stock",
-                        date_start=chunk_start,
-                        date_end=chunk_end,
-                        job_id="model-dataset",
-                        source_binding=source_binding,
-                    )
-                    expected_hash = str(
-                        item.get("params_hash") or ""
-                    ).strip().lower()
-                    if plan.params_hash != expected_hash:
-                        raise ValueError(
-                            f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
-                        )
-                    values = self.client.query(
-                        f"""
-                        SELECT trade_date, entity_code, score AS value
-                        FROM ({plan.sql})
-                        """,
-                        parameters=plan.params,
-                    ).result_rows
-                    rows_by_factor[(
-                        str(item["factor_id"]), expected_hash,
-                    )].extend(values)
-            chunk_start = chunk_end + timedelta(days=1)
-        frames: dict[tuple[str, str], pd.DataFrame] = {}
-        for key, rows in rows_by_factor.items():
-            frame = pd.DataFrame(
-                rows, columns=["trade_date", "instrument", "value"],
+                job_id="model-dataset",
+                source_binding=source_binding,
             )
-            if not frame.empty:
-                frame["trade_date"] = pd.to_datetime(frame["trade_date"])
-                frame["value"] = pd.to_numeric(
-                    frame["value"], errors="coerce",
+            expected_hash = str(
+                item.get("params_hash") or ""
+            ).strip().lower()
+            if plan.params_hash != expected_hash:
+                raise ValueError(
+                    f"冻结因子{item['factor_id']}的params_hash与公式参数不一致"
                 )
-                frame = frame.dropna(subset=["value"])
-            frames[key] = frame
-        return frames
+            values = self.client.query(
+                f"""
+                SELECT trade_date, entity_code, score AS value
+                FROM ({plan.sql})
+                """,
+                parameters=plan.params,
+            ).result_rows
+            feature_name = _feature_name(item)
+            frames.append(pd.DataFrame(
+                values,
+                columns=["trade_date", "instrument", feature_name],
+            ))
+        key_frames = [
+            frame[["trade_date", "instrument"]]
+            for frame in frames if not frame.empty
+        ]
+        expected = (
+            pd.concat(key_frames, ignore_index=True).drop_duplicates()
+            if key_frames else pd.DataFrame(
+                columns=["trade_date", "instrument"],
+            )
+        )
+        return _assemble_factor_feature_matrix(expected, frames)
 
     @staticmethod
     def _factor_definition(item: dict[str, Any]) -> FactorOut:
@@ -2475,6 +2595,40 @@ def _sql_identifier(value: str, label: str) -> str:
 
 def _feature_name(item: dict[str, Any]) -> str:
     return f"{item['factor_id']}__v{int(item['factor_version'])}__{str(item['params_hash'])[:8]}"
+
+
+def _assemble_factor_feature_matrix(
+    expected: pd.DataFrame,
+    feature_frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    """Join factor columns once instead of repeatedly copying the full panel."""
+
+    keys = ["trade_date", "instrument"]
+    if expected.duplicated(keys).any():
+        raise ValueError("训练股票池包含重复日期与股票键")
+    if not feature_frames:
+        return expected.copy()
+    series: list[pd.Series] = []
+    for frame in feature_frames:
+        value_columns = [column for column in frame.columns if column not in keys]
+        if len(value_columns) != 1:
+            raise ValueError("因子结果必须且只能包含一个值列")
+        if frame.duplicated(keys).any():
+            raise ValueError("因子结果包含重复日期与股票键")
+        value_column = value_columns[0]
+        series.append(
+            frame.set_index(keys, verify_integrity=True)[value_column].rename(
+                value_column
+            )
+        )
+    matrix = pd.concat(series, axis=1, join="outer", sort=False)
+    return expected.merge(
+        matrix.reset_index(),
+        on=keys,
+        how="left",
+        sort=False,
+        validate="one_to_one",
+    )
 
 
 def _frame_fingerprint(frame: pd.DataFrame) -> str:

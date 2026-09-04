@@ -21,7 +21,10 @@ from factor_service.research.autodl import (
     validate_instance_uuid,
 )
 from factor_service.research.dataset import DatasetBuilder
-from factor_service.research.errors import RetryableJobError
+from factor_service.research.errors import (
+    NodeMemoryBudgetExceeded, NodeOutOfMemory, NodeResourceUnavailable,
+    RetryableJobError,
+)
 from factor_service.research.job import CancellationToken
 from factor_service.research.remote_node_repository import (
     get_remote_node_repository,
@@ -253,6 +256,16 @@ class RemoteTransport:
             "printf 'cpu_cores='; nproc 2>/dev/null || printf 0; "
             "printf '\\nload='; awk '{print $1}' /proc/loadavg 2>/dev/null || printf 0; "
             "printf '\\nmem='; free -m 2>/dev/null | awk '/^Mem:/{print $2\",\"$3}'; "
+            "printf '\\nmem_cgroup='; "
+            "if test -r /sys/fs/cgroup/memory.max; then "
+            "limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null); "
+            "used=$(cat /sys/fs/cgroup/memory.current 2>/dev/null); "
+            "test \"$limit\" = max && limit=0; printf '%s,%s' \"${limit:-0}\" \"${used:-0}\"; "
+            "elif test -r /sys/fs/cgroup/memory/memory.limit_in_bytes; then "
+            "limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null); "
+            "used=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null); "
+            "printf '%s,%s' \"${limit:-0}\" \"${used:-0}\"; "
+            "else printf '0,0'; fi; "
             "printf '\\ndisk='; df -Pk / 2>/dev/null | awk 'NR==2{print $2\",\"$3}'; "
             "printf '\\ngpu='; if command -v nvidia-smi >/dev/null 2>&1; then "
             "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu "
@@ -287,13 +300,18 @@ class RemoteTransport:
                 name, status = line.split("|", 1)
                 containers.append({"name": name, "status": status})
         mem = [_int(item) for item in str(parsed.get("mem") or "").split(",")]
+        cgroup_mem = [
+            _int(item)
+            for item in str(parsed.get("mem_cgroup") or "").split(",")
+        ]
+        mem_total_mb, mem_used_mb = _effective_memory_usage_mb(mem, cgroup_mem)
         disk = [_int(item) for item in str(parsed.get("disk") or "").split(",")]
         return {
             **self.node.public(), "online": True,
             "cpu_cores": _int(parsed.get("cpu_cores")),
             "cpu_load": _float(parsed.get("load")),
-            "mem_total_mb": mem[0] if mem else 0,
-            "mem_used_mb": mem[1] if len(mem) > 1 else 0,
+            "mem_total_mb": mem_total_mb,
+            "mem_used_mb": mem_used_mb,
             "disk_total_kb": disk[0] if disk else 0,
             "disk_used_kb": disk[1] if len(disk) > 1 else 0,
             "gpus": gpus, "containers": containers, "runner": self.node.runner,
@@ -687,7 +705,7 @@ class RemoteResearchExecutor:
 
     def _remote_cpu_cores(self, cancellation: CancellationToken) -> int:
         completed = self.transport.ssh(
-            "getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '4\\n'",
+            "nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4\\n'",
             timeout=30, cancellation=cancellation,
         )
         if completed.returncode != 0:
@@ -933,6 +951,8 @@ class RemoteResearchExecutor:
             exit_code = values[1] if len(values) > 1 else "-1"
             if process_state == "exited" and exit_code == "0":
                 return
+            if process_state in {"exited", "missing"}:
+                _raise_remote_resource_failure(self.transport, remote_root, cancellation)
             if (
                 process_state == "exited"
                 and _remote_result_is_complete(
@@ -1003,6 +1023,7 @@ class RemoteResearchExecutor:
             if status in {"exited", "dead", "missing"}:
                 if status == "exited" and exit_code == "0":
                     return
+                _raise_remote_resource_failure(self.transport, remote_root, cancellation)
                 if (
                     status == "exited"
                     and _remote_result_is_complete(
@@ -1088,13 +1109,51 @@ class RemoteResearchExecutor:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 break
+            if item.get("stage") == "resource_heartbeat":
+                # A supervisor heartbeat must not move training backwards if it
+                # raced with a newer child progress event.
+                self._remote_resource_details = dict(item.get("details") or {})
+                item = getattr(self, "_last_remote_training_progress", {
+                    "stage": "training", "percent": 63, "details": {},
+                })
+                details = {**dict(item.get("details") or {}), **self._remote_resource_details}
+            else:
+                self._last_remote_training_progress = item
+                details = {**getattr(self, "_remote_resource_details", {}), **dict(item.get("details") or {})}
             progress(
                 f"remote.{item.get('stage') or 'training'}",
                 min(88, max(63, int(item.get("percent") or 0))),
-                {"node_id": self.node.node_id, **dict(item.get("details") or {})},
+                {
+                    "node_id": self.node.node_id,
+                    **details,
+                },
             )
             consumed += 1
         return seen + consumed
+
+
+def _raise_remote_resource_failure(
+    transport: RemoteTransport, remote_root: str,
+    cancellation: CancellationToken | None,
+) -> None:
+    path = shlex.quote(f"{remote_root}/remote_failure.json")
+    result = transport.ssh(
+        f"if test -s {path}; then cat {path}; fi",
+        timeout=30, cancellation=cancellation,
+    )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+    error_type = {
+        "node_memory_budget_exceeded": NodeMemoryBudgetExceeded,
+        "node_out_of_memory": NodeOutOfMemory,
+        "node_resource_unavailable": NodeResourceUnavailable,
+    }.get(payload.get("error_code"))
+    if error_type is not None:
+        raise error_type(str(payload.get("message") or payload["error_code"]))
 
 
 def _remote_result_is_complete(
@@ -1150,6 +1209,20 @@ def _effective_remote_thread_count(cpu_cores: int, requested: int) -> int:
     configured = max(1, int(requested or 1))
     automatic = max(4, available // 2)
     return min(available, _REMOTE_MAX_THREADS, max(configured, automatic))
+
+
+def _effective_memory_usage_mb(
+    host_memory_mb: list[int], cgroup_memory_bytes: list[int],
+) -> tuple[int, int]:
+    host_total = host_memory_mb[0] if host_memory_mb else 0
+    host_used = host_memory_mb[1] if len(host_memory_mb) > 1 else 0
+    cgroup_limit = cgroup_memory_bytes[0] if cgroup_memory_bytes else 0
+    cgroup_used = cgroup_memory_bytes[1] if len(cgroup_memory_bytes) > 1 else 0
+    limit_mb = cgroup_limit // (1024 * 1024) if cgroup_limit > 0 else 0
+    used_mb = cgroup_used // (1024 * 1024) if cgroup_used > 0 else 0
+    if limit_mb and (not host_total or limit_mb < host_total):
+        return limit_mb, min(used_mb, limit_mb)
+    return host_total, host_used
 
 
 def _normalize_node(source: dict[str, Any]) -> RemoteNode:

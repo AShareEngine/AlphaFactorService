@@ -15,6 +15,7 @@ from factor_service.worker import (
     _formula_params,
     _cleanup_superseded_values,
     build_factor_query_plan,
+    build_factor_score_batch_plan,
     factor_query_source,
     factor_params_hash,
     _postprocess_config,
@@ -354,3 +355,113 @@ def test_factor_query_plan_reads_staged_source_but_keeps_stock_universe(monkeypa
     assert plan.params["source_vintage"] == (
         "entity-asset:stock/daily@test#job-composite"
     )
+
+
+def test_factor_query_plan_keeps_explicit_chunk_inside_shared_stage(monkeypatch):
+    item = factor()
+    item.expression = "Mean($roe, $window)"
+    binding = FactorSourceBinding(
+        database="ab_factor",
+        table="factor_entity_asset_stage_test",
+        code_column="code",
+        date_column="trade_time",
+        source_vintage="entity-asset:stock/daily@test",
+        date_start=date(2024, 1, 2),
+        date_end=date(2025, 12, 31),
+    )
+    monkeypatch.setattr("factor_service.worker.settings", factor_source_settings)
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_columns", lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_has_rows", lambda *args: None,
+    )
+
+    plan = build_factor_query_plan(
+        item,
+        overrides={},
+        entity_type="stock",
+        date_start=date(2025, 1, 2),
+        date_end=date(2025, 6, 30),
+        job_id="job-shared-stage",
+        source_binding=binding,
+    )
+
+    assert plan.date_start == date(2025, 1, 2)
+    assert plan.date_end == date(2025, 6, 30)
+    assert plan.params["date_start"] == date(2025, 1, 2)
+    assert plan.params["date_end"] == date(2025, 6, 30)
+    assert plan.params["source_start"] < plan.params["date_start"]
+
+
+def test_factor_query_plan_rejects_chunk_outside_shared_stage(monkeypatch):
+    item = factor()
+    binding = FactorSourceBinding(
+        database="ab_factor",
+        table="factor_entity_asset_stage_test",
+        code_column="code",
+        date_column="trade_time",
+        source_vintage="entity-asset:stock/daily@test",
+        date_start=date(2024, 1, 2),
+        date_end=date(2024, 12, 31),
+    )
+    monkeypatch.setattr("factor_service.worker.settings", factor_source_settings)
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_columns", lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_has_rows", lambda *args: None,
+    )
+
+    with pytest.raises(ValueError, match="超出暂存数据范围"):
+        build_factor_query_plan(
+            item,
+            overrides={},
+            entity_type="stock",
+            date_start=date(2024, 12, 1),
+            date_end=date(2025, 1, 2),
+            job_id="job-outside-stage",
+            source_binding=binding,
+        )
+
+
+def test_factor_score_batch_plan_scans_shared_source_once(monkeypatch):
+    first = factor()
+    second = factor()
+    second.factor_id = "second"
+    second.expression = "$close / NullIf($volume, 0)"
+    binding = FactorSourceBinding(
+        database="ab_factor",
+        table="factor_entity_asset_stage_test",
+        code_column="code",
+        date_column="trade_time",
+        source_vintage="entity-asset:stock/daily@test",
+        date_start=date(2024, 1, 2),
+        date_end=date(2025, 12, 31),
+    )
+    monkeypatch.setattr("factor_service.worker.settings", factor_source_settings)
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_columns", lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "factor_service.worker._ensure_source_has_rows", lambda *args: None,
+    )
+
+    plan = build_factor_score_batch_plan(
+        [(first, {}), (second, {})],
+        entity_type="stock",
+        date_start=date(2025, 1, 2),
+        date_end=date(2025, 6, 30),
+        source_binding=binding,
+    )
+
+    assert plan.value_columns == ("factor_0", "factor_1")
+    assert len(plan.params_hashes) == 2
+    assert plan.sql.count(
+        "FROM ab_factor.factor_entity_asset_stage_test"
+    ) == 1
+    assert "quantileDeterministic(0.01)" in plan.sql
+    assert "if(isNull(raw_0), NULL" in plan.sql
+    assert "if(isNull(raw_1), NULL" in plan.sql
+    assert plan.params["date_start"] == date(2025, 1, 2)
+    assert plan.params["date_end"] == date(2025, 6, 30)

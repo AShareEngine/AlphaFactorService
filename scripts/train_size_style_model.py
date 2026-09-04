@@ -276,7 +276,7 @@ def build_training_payload(
         "title": "大小盘风格选股 Qlib LightGBM",
         "model_id": "size_style_stock_selection_lgbm",
         "dataset": {
-            "pipeline_version": "alphablocks.dataset-pipeline.v8",
+            "pipeline_version": "alphablocks.dataset-pipeline.v9",
             "name": "全A大小盘风格选股因子数据集",
             "universe_id": "all_a",
             "sample_filters": {
