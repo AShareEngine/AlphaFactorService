@@ -31,6 +31,7 @@ from factor_service.research.remote_node_repository import (
 )
 from factor_service.research.remote_node_secrets import REMOTE_NODE_SECRET_KEY_ENV
 from factor_service.research.snapshot import DatasetSnapshotStore
+from factor_service.research.dataset_archive import archive_for_settings
 from factor_service.research.trainer import TrainingResult
 from factor_service.runtime_config import section
 
@@ -478,7 +479,9 @@ class RemoteResearchExecutor:
         self.node = node
         self.transport = RemoteTransport(node)
         self.lifecycle = autodl_client(node) if node.lifecycle_provider else None
-        self.snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
+        self.snapshot_store = DatasetSnapshotStore(
+            settings.model_artifacts_root, archive=archive_for_settings(settings),
+        )
 
     def train(
         self,
@@ -494,9 +497,8 @@ class RemoteResearchExecutor:
         cache_root = f"{self.node.work_dir}/cache"
         container = f"ab-research-{job_id[-32:]}-{attempt:03d}"
         progress("remote_materializing_dataset", 4, {"node_id": self.node.node_id})
-        builder = DatasetBuilder(self.settings)
         snapshot = self.snapshot_store.get_or_create(
-            job, work_dir, builder,
+            job, work_dir, None, builder_factory=lambda: DatasetBuilder(self.settings),
             cancellation=cancellation, progress=progress,
         )
         progress("remote_dataset_staged", 56, {

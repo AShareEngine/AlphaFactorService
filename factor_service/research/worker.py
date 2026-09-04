@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import ExitStack
 import importlib.metadata
 import json
 import os
@@ -29,6 +30,7 @@ from factor_service.research.job import (
 )
 from factor_service.research.state import JobStateStore
 from factor_service.research.snapshot import prune_stale_dataset_staging
+from factor_service.research.dataset_archive import archive_for_settings, DATASET_FILES
 from factor_service.research.trainer import QlibTrainer, TrainingResult
 
 
@@ -38,6 +40,8 @@ ACTIVE_STATUSES = {"leased", "running", "uploading"}
 # heartbeats event-free. This makes the upload/queue chronology available after
 # the user leaves and reopens the training page.
 PERSISTED_PROGRESS_STAGES = frozenset({
+    "archiving_dataset",
+    "dataset_archived",
     "checking_dataset_snapshot",
     "loading_factors",
     "loading_prices",
@@ -84,6 +88,9 @@ class ResearchWorker:
             getattr(self.settings, "model_object_store", ModelObjectStoreConfig()),
         )
         self.repository = ModelResearchRepository()
+        self.dataset_archive = archive_for_settings(
+            settings, active_hashes=self.repository.active_dataset_hashes,
+        )
         self.control = ResearchControl(
             self.repository,
             self.artifact_store,
@@ -298,6 +305,10 @@ class ResearchWorker:
                     "last_result": dict(self.scheduler_last_result),
                 },
                 "dataset_cache": {
+                    "storage_mode": (
+                        "minio_with_temporary_local_files" if self.dataset_archive is not None
+                        else "local_cache"
+                    ),
                     "retention_hours": float(getattr(
                         self.settings, "dataset_cache_retention_hours", 24.0,
                     )),
@@ -375,14 +386,19 @@ class ResearchWorker:
             self.settings, "dataset_cache_retention_hours", 24.0,
         ))
         protected_hashes = self.repository.active_dataset_hashes()
-        result = self.artifact_store.prune_dataset_cache(
-            retention_seconds=retention_hours * 60 * 60,
-            protected_hashes=protected_hashes,
-        )
-        result["staging"] = prune_stale_dataset_staging(
-            self.settings.work_root,
-            retention_seconds=retention_hours * 60 * 60,
-        )
+        if self.dataset_archive is not None:
+            result = self.dataset_archive.cleanup(protected_hashes=protected_hashes)
+            # Failed uploads/registrations retain their only local recovery copy.
+            result["storage_mode"] = "minio_with_temporary_local_files"
+        else:
+            result = self.artifact_store.prune_dataset_cache(
+                retention_seconds=retention_hours * 60 * 60,
+                protected_hashes=protected_hashes,
+            )
+            result["staging"] = prune_stale_dataset_staging(
+                self.settings.work_root,
+                retention_seconds=retention_hours * 60 * 60,
+            )
         with self._state_lock:
             self.dataset_cache_last_cleanup_at = datetime.now(
                 timezone.utc,
@@ -455,7 +471,10 @@ class ResearchWorker:
             last_job_status="running", _active_cancellation=cancellation,
         )
         monitor_thread.start()
+        dataset_use = ExitStack()
         try:
+            if job_kind == "train":
+                dataset_use.enter_context(self.artifact_store.dataset_usage(str(job["dataset_hash"])))
             self._report_progress(job, cancellation, "validating", 2, {})
             progress_callback = lambda stage, percent, details: self._report_progress(
                 job, cancellation, stage, percent, details,
@@ -509,7 +528,14 @@ class ResearchWorker:
                     dataset_hash=str(job.get("dataset_hash") or ""),
                 )
                 remote = None
-                if self.model_object_store.enabled_for(kind):
+                if self.dataset_archive is not None and kind in DATASET_FILES.values():
+                    record = self.dataset_archive.record(str(job["dataset_hash"]))
+                    if record is None:
+                        raise ValueError("训练数据集尚未完成MinIO归档与登记")
+                    remote = record["files_json"][path.name]
+                    if str(remote["sha256"]) != str(saved["sha256"]):
+                        raise ValueError("训练产物与MinIO冻结数据集不一致")
+                elif self.model_object_store.enabled_for(kind):
                     self._report_progress(
                         job,
                         cancellation,
@@ -617,6 +643,9 @@ class ResearchWorker:
                         flush=True,
                     )
         finally:
+            dataset_use.close()
+            if self.dataset_archive is not None and job_kind == "train":
+                self.dataset_archive.try_evict(str(job["dataset_hash"]))
             monitor_stop.set()
             if monitor_thread.is_alive():
                 monitor_thread.join(timeout=6)

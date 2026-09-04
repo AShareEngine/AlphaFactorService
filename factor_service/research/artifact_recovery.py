@@ -20,6 +20,7 @@ from factor_service.research.errors import classify_exception
 from factor_service.research.job import CancellationToken, safe_job_dir
 from factor_service.research.remote import _load_remote_result
 from factor_service.research.trainer import QlibTrainer, TrainingResult
+from factor_service.research.dataset_archive import archive_for_settings, DATASET_FILES
 
 
 def recover_training_artifacts(
@@ -29,11 +30,35 @@ def recover_training_artifacts(
     settings: Settings | None = None,
     repository: ModelResearchRepository | None = None,
 ) -> dict[str, Any]:
+    active_settings = settings or load_settings()
+    active_repository = repository or ModelResearchRepository()
+    archive = archive_for_settings(active_settings)
+    if archive is None:
+        return _recover_training_artifacts(
+            job_id, source_attempt=source_attempt, settings=active_settings,
+            repository=active_repository,
+        )
+    current = active_repository.get_job(job_id)
+    dataset_hash = str(current['dataset_hash'])
+    with archive.use(dataset_hash):
+        with archive.artifacts.dataset_lock(dataset_hash):
+            archive.archive_locked(dataset_hash, spec=dict(current.get('dataset_spec') or {}))
+        return _recover_training_artifacts(
+            job_id, source_attempt=source_attempt, settings=active_settings,
+            repository=active_repository,
+        )
+
+
+def _recover_training_artifacts(
+    job_id: str, *, source_attempt: int,
+    settings: Settings, repository: ModelResearchRepository,
+) -> dict[str, Any]:
     """Publish a verified remote result without rerunning model training."""
     active_settings = settings or load_settings()
     active_repository = repository or ModelResearchRepository()
     artifact_store = ModelArtifactStore(active_settings.model_artifacts_root)
     object_store = ModelObjectStore(active_settings.model_object_store)
+    dataset_archive = archive_for_settings(active_settings)
     control = ResearchControl(active_repository, artifact_store, object_store)
 
     current = active_repository.get_job(job_id)
@@ -99,7 +124,14 @@ def recover_training_artifacts(
                 dataset_hash=str(job.get("dataset_hash") or ""),
             )
             remote = None
-            if object_store.enabled_for(kind):
+            if dataset_archive is not None and kind in DATASET_FILES.values():
+                record = dataset_archive.record(str(job['dataset_hash']))
+                if record is None:
+                    raise ValueError("恢复数据集缺少MinIO归档登记")
+                remote = record['files_json'][path.name]
+                if remote['sha256'] != saved['sha256']:
+                    raise ValueError("恢复数据集与MinIO归档摘要不一致")
+            elif object_store.enabled_for(kind):
                 remote = object_store.publish_file(
                     job_id=job_id,
                     model_id=str(job["model_id"]),
@@ -356,4 +388,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

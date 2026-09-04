@@ -9,7 +9,7 @@ import tempfile
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from factor_service.research.errors import PermanentJobError, RetryableJobError
+from factor_service.research.errors import JobError, PermanentJobError, RetryableJobError
 
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -84,8 +84,10 @@ class ModelObjectStore:
         source_path: str | Path,
         digest: str,
         size_bytes: int,
+        dataset_hash: str = "",
+        checkpoint: Any = None,
     ) -> dict[str, object] | None:
-        if not self.enabled_for(artifact_kind):
+        if not (self.enabled if dataset_hash else self.enabled_for(artifact_kind)):
             return None
         source = Path(source_path)
         if not source.is_file():
@@ -102,7 +104,7 @@ class ModelObjectStore:
         clean_kind = self._component(artifact_kind, "artifact_kind")
         clean_file = self._component(source.name, "file_name")
         version = int(model_version)
-        if version <= 0:
+        if version <= 0 and not dataset_hash:
             raise ModelObjectStoreConfigurationError("模型归档缺少有效model_version")
         object_key = "/".join(filter(None, (
             self.config.prefix.strip("/"), clean_model,
@@ -115,6 +117,18 @@ class ModelObjectStore:
             "model-version": str(version),
             "artifact-kind": clean_kind,
         }
+        if dataset_hash:
+            if not re.fullmatch(r"[0-9a-f]{64}", dataset_hash):
+                raise ModelObjectStoreConfigurationError("数据集归档缺少有效Dataset Hash")
+            if clean_kind not in {"dataset", "dataset_raw", "dataset_manifest"}:
+                raise ModelObjectStoreConfigurationError("数据集归档类型无效")
+            # Dataset Spec hash is not a file hash. Include both, preventing a
+            # failed/concurrent rebuild from overwriting previously archived bytes.
+            object_key = "/".join((
+                self.config.prefix.strip("/"), "datasets", dataset_hash,
+                expected_digest, clean_file,
+            ))
+            metadata["dataset-hash"] = dataset_hash
 
         try:
             current = self._stat_or_none(object_key)
@@ -131,6 +145,7 @@ class ModelObjectStore:
                 str(source),
                 content_type=_content_type(clean_file),
                 metadata=metadata,
+                **({"progress": _UploadCheckpoint(checkpoint)} if checkpoint else {}),
             )
             stored = self.client.stat_object(self.config.bucket, object_key)
             if not self._matches(
@@ -148,7 +163,7 @@ class ModelObjectStore:
                 object_key, stored, expected_digest, expected_size,
                 uploaded=True, version_id=version_id,
             )
-        except (ModelObjectStoreIntegrityError, ModelObjectStoreConfigurationError):
+        except JobError:
             raise
         except Exception as exc:
             if _is_s3_error(exc) and str(exc.code or "") in _PERMANENT_S3_CODES:
@@ -163,6 +178,43 @@ class ModelObjectStore:
                 f"MinIO模型归档连接失败: {type(exc).__name__}",
             ) from exc
 
+    def verify_file(
+        self, identity: dict[str, Any], *, content: bool = False,
+        checkpoint: Any = None,
+    ) -> None:
+        """Verify the exact registered version; optionally read back all bytes."""
+        if not self.enabled:
+            raise ModelObjectStoreConfigurationError("MinIO存储未启用")
+        key = self._object_key(str(identity["object_uri"]))
+        version = str(identity.get("version_id") or "") or None
+        digest = str(identity["sha256"])
+        size = int(identity["size_bytes"])
+        response = None
+        try:
+            stored = self.client.stat_object(self.config.bucket, key, version_id=version)
+            if not self._matches(stored, digest=digest, size_bytes=size):
+                raise ModelObjectStoreIntegrityError("MinIO数据集大小或SHA256元数据不一致")
+            if content:
+                response = self.client.get_object(self.config.bucket, key, version_id=version)
+                actual = sha256()
+                count = 0
+                while True:
+                    if checkpoint:
+                        checkpoint()
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    if count > size:
+                        raise ModelObjectStoreIntegrityError("MinIO数据集大小超过登记值")
+                    actual.update(chunk)
+                if count != size or actual.hexdigest() != digest:
+                    raise ModelObjectStoreIntegrityError("MinIO数据集内容SHA256校验失败")
+        finally:
+            if response is not None:
+                response.close()
+                response.release_conn()
+
     def download_file(
         self,
         *,
@@ -171,6 +223,7 @@ class ModelObjectStore:
         destination: str | Path,
         digest: str,
         size_bytes: int,
+        checkpoint: Any = None,
     ) -> Path:
         """Download one immutable model object and verify its durable identity."""
         if not self.enabled:
@@ -207,6 +260,8 @@ class ModelObjectStore:
             with os.fdopen(descriptor, "wb") as output:
                 descriptor = -1
                 while True:
+                    if checkpoint:
+                        checkpoint()
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
@@ -225,7 +280,7 @@ class ModelObjectStore:
                 )
             os.replace(temporary_name, target)
             return target
-        except (ModelObjectStoreIntegrityError, ModelObjectStoreConfigurationError):
+        except JobError:
             raise
         except Exception as exc:
             if _is_s3_error(exc) and str(exc.code or "") in _PERMANENT_S3_CODES:
@@ -366,6 +421,17 @@ class ModelObjectStore:
         if not _SAFE_COMPONENT.fullmatch(clean) or clean in {".", ".."}:
             raise ModelObjectStoreConfigurationError(f"MinIO {field_name}包含非法字符")
         return clean
+
+
+class _UploadCheckpoint:
+    def __init__(self, checkpoint: Any) -> None:
+        self.checkpoint = checkpoint
+
+    def set_meta(self, **kwargs: Any) -> None:
+        self.checkpoint()
+
+    def update(self, length: int) -> None:
+        self.checkpoint()
 
 
 def _is_s3_error(exc: BaseException) -> bool:

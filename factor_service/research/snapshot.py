@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import time
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -27,8 +27,9 @@ class DatasetSnapshot:
 class DatasetSnapshotStore:
     """Materialize once in work_root, then train only from artifact-root Parquet."""
 
-    def __init__(self, artifact_root: str | Path) -> None:
+    def __init__(self, artifact_root: str | Path, *, archive: Any = None) -> None:
         self.artifacts = ModelArtifactStore(artifact_root)
+        self.archive = archive
 
     def get_or_create(
         self,
@@ -38,6 +39,7 @@ class DatasetSnapshotStore:
         *,
         cancellation: CancellationToken | None = None,
         progress: ProgressCallback | None = None,
+        builder_factory: Callable[[], DatasetBuilder] | None = None,
     ) -> DatasetSnapshot:
         dataset_hash = str(job.get("dataset_hash") or "").strip().lower()
         canonical_dir = self.artifacts.root / "datasets" / dataset_hash
@@ -47,11 +49,16 @@ class DatasetSnapshotStore:
         _checkpoint(cancellation)
         _progress(progress, "checking_dataset_snapshot", 4, {"dataset_hash": dataset_hash})
         with self.artifacts.dataset_lock(dataset_hash):
+            if self.archive is not None:
+                self.archive.restore_locked(
+                    dataset_hash, checkpoint=lambda: _checkpoint(cancellation),
+                )
             if manifest_path.is_file():
                 prepared = self._load(
                     dataset_hash, dataset_path, raw_dataset_path, manifest_path,
                 )
                 self.artifacts.touch_dataset(dataset_hash)
+                self._archive(job, cancellation, progress)
                 _progress(progress, "dataset_ready", 56, {
                     "dataset_hash": dataset_hash,
                     "row_count": len(prepared.frame),
@@ -62,6 +69,8 @@ class DatasetSnapshotStore:
                     prepared, dataset_path, raw_dataset_path, manifest_path, True,
                 )
 
+            if builder is None and builder_factory is not None:
+                builder = builder_factory()
             if builder is None:
                 raise ValueError("冻结数据集快照不存在，且当前执行器不能访问源数据")
 
@@ -113,11 +122,24 @@ class DatasetSnapshotStore:
             # immutable artifact, never the in-memory frame used to create it.
             loaded = self._load(dataset_hash, dataset_path, raw_dataset_path, manifest_path)
             self.artifacts.touch_dataset(dataset_hash)
+            self._archive(job, cancellation, progress)
             try:
                 shutil.rmtree(staging_dir)
             except OSError:
                 pass
             return DatasetSnapshot(loaded, dataset_path, raw_dataset_path, manifest_path, False)
+
+    def _archive(self, job: dict, cancellation: Any, progress: Any) -> None:
+        if self.archive is None:
+            return
+        dataset_hash = str(job["dataset_hash"])
+        _progress(progress, "archiving_dataset", 55, {"dataset_hash": dataset_hash})
+        self.archive.archive_locked(
+            dataset_hash,
+            spec=dict(job.get("dataset_spec") or (job.get("config_json") or {}).get("dataset") or {}),
+            checkpoint=lambda: _checkpoint(cancellation),
+        )
+        _progress(progress, "dataset_archived", 56, {"dataset_hash": dataset_hash})
 
     @staticmethod
     def _load(

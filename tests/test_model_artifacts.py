@@ -206,6 +206,22 @@ def test_dataset_cache_skips_snapshot_held_by_active_file_lock(tmp_path) -> None
     assert (store.root / "datasets" / dataset_hash).is_dir()
 
 
+def test_legacy_cleanup_and_model_deletion_preserve_pinned_dataset(tmp_path) -> None:
+    store = ModelArtifactStore(tmp_path / "artifacts")
+    dataset_hash = "e" * 64
+    directory = store.root / "datasets" / dataset_hash
+    directory.mkdir(parents=True)
+    (directory / "dataset.parquet").write_bytes(b"pinned data")
+    store.touch_dataset(dataset_hash, used_at=100)
+    with store.dataset_usage(dataset_hash):
+        assert store.delete_dataset_artifacts(dataset_hash) is False
+        result = store.prune_dataset_cache(retention_seconds=100, now=250)
+        assert result["deleted"] == []
+        assert result["locked"] == 1
+        assert directory.exists()
+    assert store.delete_dataset_artifacts(dataset_hash) is True
+
+
 def test_resolving_dataset_artifact_refreshes_last_used_marker(tmp_path) -> None:
     store = ModelArtifactStore(tmp_path / "artifacts")
     dataset_hash = "7" * 64

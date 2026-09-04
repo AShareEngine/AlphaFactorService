@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from contextlib import ExitStack
 from http import HTTPStatus
 from typing import Any
 
@@ -11,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from factor_service import model_repository
 from factor_service.config import load_settings as load_service_settings
 from factor_service.model_artifacts import ArtifactError, ModelArtifactStore
+from factor_service.research.dataset_archive import dataset_files, DATASET_FILES
 from factor_service.model_backtest import run_model_backtest_job
 from factor_service.model_diagnostics import (
     architecture_walk_forward_attribution,
@@ -1097,15 +1099,39 @@ def list_artifacts(job_id: str) -> dict[str, Any]:
 
 @router.get("/artifacts/{artifact_id}/download")
 def download_artifact(request: Request, artifact_id: str) -> FileResponse:
+    usage = ExitStack()
     try:
         artifact = repository.get_artifact(artifact_id)
+        if artifact.get("artifact_kind") in DATASET_FILES.values():
+            usage.enter_context(dataset_files(
+                str(artifact["dataset_hash"]), load_service_settings().model_artifacts_root,
+            ))
         path = _worker(request).control.resolve_artifact(
             artifact_id,
             str(artifact.get("sha256") or ""),
         )
-        return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+        return _PinnedDatasetFileResponse(
+            path, media_type="application/octet-stream", filename=path.name, usage=usage,
+        )
     except Exception as exc:
+        usage.close()
         _raise(exc)
+
+
+class _PinnedDatasetFileResponse(FileResponse):
+    def __init__(self, *args, usage: ExitStack, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.usage = usage
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Includes client disconnect / streaming failure, not only success.
+            import anyio
+            from starlette.concurrency import run_in_threadpool
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self.usage.close)
 
 
 @router.get("/models")
@@ -2203,22 +2229,23 @@ def get_model_permutation_importance(
             key=lambda item: (importance_order.get(item, len(feature_names)), item),
         )[:effective_limit]
         dataset_hash = str(model.get("dataset_hash") or "")
-        dataset_path = ModelArtifactStore(artifact_root).resolve(
-            f"datasets/{dataset_hash}/dataset.parquet",
-        )
         diagnostics_runner = (
             isolated_artifact_model_permutation_importance
             if is_sequence_model
             else artifact_model_permutation_importance
         )
-        diagnostics = diagnostics_runner(
-            bundle_path,
-            dataset_path,
-            model_kind=model_kind,
-            segments=dict(manifest.get("segments") or {}),
-            model_params=model_params,
-            feature_names=selected,
-        )
+        with dataset_files(dataset_hash, artifact_root):
+            dataset_path = ModelArtifactStore(artifact_root).resolve(
+                f"datasets/{dataset_hash}/dataset.parquet",
+            )
+            diagnostics = diagnostics_runner(
+                bundle_path,
+                dataset_path,
+                model_kind=model_kind,
+                segments=dict(manifest.get("segments") or {}),
+                model_params=model_params,
+                feature_names=selected,
+            )
         return {
             "ok": True,
             "diagnostics": {
@@ -2263,16 +2290,17 @@ def get_model_shap_summary(
         store = ModelArtifactStore(artifact_root)
         bundle_path = store.resolve(str(bundle.get("relative_path") or ""))
         dataset_hash = str(model.get("dataset_hash") or "")
-        dataset_path = store.resolve(f"datasets/{dataset_hash}/dataset.parquet")
-        diagnostics = artifact_model_shap_summary(
-            bundle_path,
-            dataset_path,
-            model_kind=model_kind,
-            segments=dict(manifest.get("segments") or {}),
-            feature_names=feature_names,
-            split=split,
-            sample_rows=sample_rows,
-        )
+        with dataset_files(dataset_hash, artifact_root):
+            dataset_path = store.resolve(f"datasets/{dataset_hash}/dataset.parquet")
+            diagnostics = artifact_model_shap_summary(
+                bundle_path,
+                dataset_path,
+                model_kind=model_kind,
+                segments=dict(manifest.get("segments") or {}),
+                feature_names=feature_names,
+                split=split,
+                sample_rows=sample_rows,
+            )
         return {
             "ok": True,
             "diagnostics": {**diagnostics, "dataset_hash": dataset_hash},

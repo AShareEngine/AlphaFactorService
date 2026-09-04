@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import lru_cache, wraps
 import gc
 import json
 from pathlib import Path
@@ -17,6 +17,15 @@ import pandas as pd
 
 
 _DATASET_HASH = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _with_dataset_files(function):
+    @wraps(function)
+    def run(dataset_hash, artifact_root, *args, **kwargs):
+        from factor_service.research.dataset_archive import dataset_files
+        with dataset_files(dataset_hash, artifact_root):
+            return function(dataset_hash, artifact_root, *args, **kwargs)
+    return run
 
 
 def dataset_feature_drift(
@@ -254,6 +263,7 @@ def dataset_factor_validation_audit(
 
 
 @lru_cache(maxsize=64)
+@_with_dataset_files
 def _cached_dataset_factor_validation_audit(
     dataset_hash: str,
     artifact_root: str,
@@ -419,6 +429,7 @@ def _factor_rank_ic_metrics(
 
 
 @lru_cache(maxsize=64)
+@_with_dataset_files
 def _cached_dataset_feature_redundancy(
     dataset_hash: str,
     artifact_root: str,
@@ -1110,6 +1121,7 @@ def _stable_seed(feature: str, index: int) -> int:
 
 
 @lru_cache(maxsize=64)
+@_with_dataset_files
 def _cached_dataset_feature_drift(
     dataset_hash: str,
     artifact_root: str,
@@ -1214,6 +1226,7 @@ def _cached_dataset_feature_drift(
 
 
 @lru_cache(maxsize=64)
+@_with_dataset_files
 def _cached_dataset_walk_forward_attribution(
     dataset_hash: str,
     artifact_root: str,

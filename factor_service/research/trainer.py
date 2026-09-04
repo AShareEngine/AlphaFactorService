@@ -32,6 +32,7 @@ from factor_service.research.preprocessing import (
     preprocess_qlib_frame,
 )
 from factor_service.research.snapshot import DatasetSnapshotStore
+from factor_service.research.dataset_archive import archive_for_settings
 from factor_service.research.runtime_resources import release_training_memory
 from factor_service.research.training_diagnostics import build_training_diagnostics
 
@@ -91,7 +92,9 @@ class QlibTrainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.dataset_builder: DatasetBuilder | None = None
-        self.snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
+        self.snapshot_store = DatasetSnapshotStore(
+            settings.model_artifacts_root, archive=archive_for_settings(settings),
+        )
 
     def train(
         self,
@@ -109,17 +112,12 @@ class QlibTrainer:
             raise RuntimeError("Qlib模型环境尚未安装，请执行uv sync") from exc
         work_dir.mkdir(parents=True, exist_ok=True)
         _checkpoint(cancellation)
-        dataset_hash = str(job.get("dataset_hash") or "").strip().lower()
-        snapshot_manifest = (
-            self.snapshot_store.artifacts.root / "datasets" / dataset_hash
-            / "dataset_manifest.json"
-        )
-        builder = None
-        if not snapshot_manifest.is_file():
+        def create_builder() -> DatasetBuilder:
             self.dataset_builder = self.dataset_builder or DatasetBuilder(self.settings)
-            builder = self.dataset_builder
+            return self.dataset_builder
+
         snapshot = self.snapshot_store.get_or_create(
-            job, work_dir, builder,
+            job, work_dir, None, builder_factory=create_builder,
             cancellation=cancellation, progress=progress,
         )
         prepared = snapshot.prepared

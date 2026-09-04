@@ -34,9 +34,12 @@ class _MemoryMinio:
 
     def fput_object(
         self, bucket: str, object_key: str, source: str,
-        *, content_type: str, metadata: dict[str, str],
+        *, content_type: str, metadata: dict[str, str], progress=None,
     ):
         size = Path(source).stat().st_size
+        if progress is not None:
+            progress.set_meta(object_name=object_key, total_length=size)
+            progress.update(size)
         self.bodies[(bucket, object_key)] = Path(source).read_bytes()
         stored = SimpleNamespace(
             size=size,
@@ -216,3 +219,54 @@ def test_download_rejects_uri_from_another_bucket(tmp_path: Path) -> None:
             digest="a" * 64,
             size_bytes=1,
         )
+
+
+def test_upload_cancellation_preserves_error_and_local_source(tmp_path: Path) -> None:
+    from factor_service.research.errors import JobCanceled
+
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"frozen dataset")
+    client = _MemoryMinio()
+    store = ModelObjectStore(_config(), client=client)
+
+    def cancel():
+        raise JobCanceled("canceled")
+
+    with pytest.raises(JobCanceled):
+        store.publish_file(
+            job_id="job-1", model_id="datasets", model_version=0,
+            artifact_kind="dataset", source_path=source,
+            digest=sha256(source.read_bytes()).hexdigest(), size_bytes=source.stat().st_size,
+            dataset_hash="a" * 64, checkpoint=cancel,
+        )
+    assert source.read_bytes() == b"frozen dataset"
+    assert client.uploads == []
+
+
+def test_download_cancellation_does_not_publish_partial_file(tmp_path: Path) -> None:
+    from factor_service.research.errors import JobCanceled
+
+    source = tmp_path / "dataset.parquet"
+    source.write_bytes(b"frozen dataset")
+    client = _MemoryMinio()
+    store = ModelObjectStore(_config(), client=client)
+    identity = store.publish_file(
+        job_id="job-1", model_id="datasets", model_version=0,
+        artifact_kind="dataset", source_path=source,
+        digest=sha256(source.read_bytes()).hexdigest(), size_bytes=source.stat().st_size,
+        dataset_hash="a" * 64,
+    )
+    destination = tmp_path / "restore" / source.name
+
+    def cancel():
+        raise JobCanceled("canceled")
+
+    with pytest.raises(JobCanceled):
+        store.download_file(
+            object_uri=identity["object_uri"], version_id=identity["version_id"],
+            destination=destination, digest=identity["sha256"],
+            size_bytes=identity["size_bytes"], checkpoint=cancel,
+        )
+    assert not destination.exists()
+    assert list(destination.parent.iterdir()) == []
+    assert source.read_bytes() == b"frozen dataset"

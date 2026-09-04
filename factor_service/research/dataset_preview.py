@@ -24,6 +24,7 @@ from factor_service.research.dataset import DatasetBuilder, PreparedDataset
 from factor_service.research.errors import JobCanceled
 from factor_service.research.job import CancellationToken
 from factor_service.research.snapshot import DatasetSnapshotStore
+from factor_service.research.dataset_archive import archive_for_settings
 
 
 MAX_PREVIEW_ROWS = 500
@@ -183,6 +184,8 @@ class DatasetPreviewService:
         return self.get(preview_id)
 
     def run(self, preview_id: str) -> None:
+        archive = None
+        usage = None
         try:
             job = self._preview_job(preview_id)
             cancellation = CancellationToken()
@@ -196,18 +199,15 @@ class DatasetPreviewService:
 
             settings = load_settings()
             work_dir = Path(settings.work_root) / preview_id
-            snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root)
-            manifest_path = (
-                snapshot_store.artifacts.root
-                / "datasets"
-                / str(job["dataset_hash"])
-                / "dataset_manifest.json"
-            )
-            builder = None if manifest_path.is_file() else DatasetBuilder(settings)
+            archive = archive_for_settings(settings)
+            snapshot_store = DatasetSnapshotStore(settings.model_artifacts_root, archive=archive)
+            usage = snapshot_store.artifacts.dataset_usage(str(job["dataset_hash"]))
+            usage.__enter__()
             snapshot = snapshot_store.get_or_create(
                 job,
                 work_dir,
-                builder,
+                None,
+                builder_factory=lambda: DatasetBuilder(settings),
                 cancellation=cancellation,
                 progress=progress,
             )
@@ -260,6 +260,11 @@ class DatasetPreviewService:
             self._fail(preview_id, str(exc), canceled=True)
         except Exception as exc:
             self._fail(preview_id, str(exc))
+        finally:
+            if usage is not None:
+                usage.__exit__(None, None, None)
+            if archive is not None:
+                archive.try_evict(str(job["dataset_hash"]))
 
     def get(self, preview_id: str) -> dict[str, Any]:
         return _preview_view(self._preview_job(preview_id))

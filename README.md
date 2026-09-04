@@ -202,10 +202,28 @@ python -m factor_service.research.artifact_recovery <job_id> --source-attempt <o
 Attempt的审计记录；不会把原Attempt改写为成功，也不会再次训练模型。
 
 `research.storage.model_artifacts_root`保存经过SHA256校验并原子发布的正式模型产物，以及
-`datasets/{dataset_hash}`下按内容寻址的训练Parquet缓存。Qlib训练只读取已校验快照，不读取暂存文件。
-数据集成功生成或复用时会刷新最后使用时间；默认连续24小时未被使用后由后台任务删除，排队中和
-执行中的任务会保护其数据集不被清理。下次训练仍按PostgreSQL中的冻结Dataset Spec和相同Hash重新
-生成。成功发布后的`dataset_staging`重复副本会立即删除；异常中断遗留的暂存副本也会在24小时后清理。
+`datasets/{dataset_hash}`下的训练Parquet临时副本。启用MinIO后，`dataset.parquet`、
+`dataset_raw.parquet`和`dataset_manifest.json`在数据构建完成时就归档，不等待训练成功。
+对象键使用`{prefix}/datasets/{dataset_hash}/{file_sha256}/{file_name}`，跨任务与模型版本复用。
+上传后完整流式回读并校验大小和SHA256，三份文件全部通过后原子登记到PostgreSQL
+`model_dataset_archives`，并补齐历史`model_artifacts`中的对象身份。必须先应用AlphaBlocks控制库
+迁移`0041_model_dataset_archives.sql`。归档独立于模型任务，删除单个模型不会删除共享数据归档。
+
+Qlib、远程推送、数据预览、模型诊断和数据下载只读取校验过的临时快照。缺失时优先按数据库记录的
+精确对象版本从MinIO恢复，不能因对象损坏、网络失败或权限错误悄悄重算。首次没有归档、也没有
+本地文件时才按冻结Dataset Spec生成。训练/预览完成或最后一个诊断/下载读取者退出后清理本地副本；
+跨进程使用锁和排队/执行任务保护避免删除仍被使用的数据。未归档、上传或登记失败的本地数据绝不
+按TTL删除；异常遗留的已归档副本由后台清理。源ClickHouse范围暂存的24小时TTL不变。
+未启用MinIO的独立离线部署保留原24小时本地缓存策略。
+
+已有数据可以使用以下维护命令归档、清理并测试按需恢复；它不会创建训练任务、重新计算因子或
+重新登记模型。`--evict`只删除通过远端校验、没有活动使用者的本地数据集副本：
+
+```bash
+python -m factor_service.research.dataset_archive <existing_job_id> --evict --verify-restore
+```
+
+成功发布后的`dataset_staging`重复副本会删除；上传或登记中断时保留本地恢复文件。
 模型Bundle继续自动归档到对象存储，不受数据集缓存清理影响。相对路径从项目根目录解析；需要
 放到外置磁盘或指定数据盘时建议直接填写绝对路径。AlphaBlocks只保存产物元数据。
 

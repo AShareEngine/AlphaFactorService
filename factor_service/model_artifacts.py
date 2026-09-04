@@ -168,10 +168,37 @@ class ModelArtifactStore:
         """Delete one local dataset snapshot without racing an active reader."""
 
         clean_hash = self._dataset_hash(dataset_hash)
-        with self.dataset_lock(clean_hash):
-            return self._remove_directory(
-                (self.root / "datasets" / clean_hash).resolve(),
-            )
+        try:
+            with self.dataset_usage(clean_hash, exclusive=True, blocking=False):
+                with self.dataset_lock(clean_hash):
+                    return self._remove_directory(
+                        (self.root / "datasets" / clean_hash).resolve(),
+                    )
+        except BlockingIOError:
+            return False
+
+    @contextmanager
+    def dataset_usage(
+        self, dataset_hash: str, *, exclusive: bool = False, blocking: bool = True,
+    ) -> Iterator[None]:
+        """Pin files for a whole operation, not just while resolving their path.
+
+        This is separate from the publication lock: multiple readers can hydrate
+        one snapshot, while eviction must wait for every reader/runner to exit.
+        Always acquire usage before publication when both are needed.
+        """
+        clean_hash = self._dataset_hash(dataset_hash)
+        lock_root = self.root / ".dataset-users"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        with (lock_root / f"{clean_hash}.lock").open("a+b") as descriptor:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(descriptor.fileno(), operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
 
     @contextmanager
     def dataset_lock(
@@ -242,7 +269,8 @@ class ModelArtifactStore:
                 result["protected"] = int(result["protected"]) + 1
                 continue
             try:
-                with self.dataset_lock(dataset_hash, blocking=False):
+                with self.dataset_usage(dataset_hash, exclusive=True, blocking=False), \
+                        self.dataset_lock(dataset_hash, blocking=False):
                     if not directory.is_dir():
                         continue
                     if self._dataset_last_used_at(directory) > cutoff:
